@@ -13,8 +13,18 @@ type SyncVector struct {
 	NextBlock *SyncVectorBlock
 }
 
-func (svg *SyncVectorBlock) Max(target SyncVectorBlock) error {
-	return nil
+func (svg *SyncVectorBlock) Max(target SyncVectorBlock) {
+	cmp := hlc.Compare(svg.VectorClock, target.VectorClock)
+	switch cmp {
+	case 1:
+		svg.VectorClock = target.VectorClock
+		svg.NodeId = target.NodeId
+		svg.LastVisitedHash = target.LastVisitedHash
+	case -1:
+		target.VectorClock = svg.VectorClock
+		target.NodeId = svg.NodeId
+		target.LastVisitedHash = svg.LastVisitedHash
+	}
 }
 
 func NewSyncVectorBlock() *SyncVectorBlock {
