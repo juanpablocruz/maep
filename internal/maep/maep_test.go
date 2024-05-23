@@ -27,23 +27,59 @@ func TestMain(t *testing.T) {
 	var b bytes.Buffer
 	gob.NewEncoder(&b).Encode(args)
 
-	n.AddOperation([]maep.Operation{
-		{
-			Arguments: b.Bytes(),
-			Id:        "1",
-			Data:      []string{"test"},
-			Timestamp: 0,
-		},
-	})
+	o := maep.NewOperation(b.Bytes(), []string{"test"})
+	o2 := maep.NewOperation(b.Bytes(), []string{"test 2"})
+	op_list := []maep.Operation{o}
 
-	mr := n.VersionTree.Root()
-	log.Println(mr)
+	ob1, err := n.AddOperation(op_list)
+	if err != nil {
+		t.Errorf("Error adding operation: %s", err)
+	}
+	mr1 := n.VersionTree.ShortRoot()
+	log.Println(mr1)
+
+	ob2, err := n.AddOperation([]maep.Operation{o2})
+	if err != nil {
+		t.Errorf("Error adding operation: %s", err)
+	}
+	mr2 := n.VersionTree.ShortRoot()
+	log.Println(mr2)
+
 	// Verify the tree
-	vt, err := n.VersionTree.VerifyTree()
+	_, err = n.VersionTree.VerifyTree()
 	if err != nil {
 		t.Errorf("Error verifying tree: %s", err)
 	}
-	log.Println("Verified tree: ", vt)
 
-	log.Println(n.VersionTree.Print())
+	log.Println("OP1")
+
+	hash_str := ob1.GetHash()
+	block, path, err := n.FindHash(hash_str)
+	if err != nil {
+		t.Errorf("Error finding hash: %s", err)
+	}
+
+	if block != nil {
+		ops := n.OperationMap[hash_str]
+
+		log.Printf("%v\n", ops)
+	}
+	log.Printf("%s\n", path)
+
+	log.Println("OP2")
+
+	hash_str = ob2.GetHash()
+	block, path, err = n.FindHash(hash_str)
+	if err != nil {
+		t.Errorf("Error finding hash: %s", err)
+	}
+	if block != nil {
+		ops := n.OperationMap[hash_str]
+
+		if len(ops) > 0 {
+			log.Printf("%v\n", ops[0])
+		}
+
+	}
+	log.Printf("%s\n", path)
 }

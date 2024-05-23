@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/gob"
+	"fmt"
 	"time"
 
 	"github.com/cbergoon/merkletree"
+	"github.com/google/uuid"
 )
 
-type OperationNode struct {
+type OperationBlock struct {
 	Id        string
 	Hash      []byte
+	PrevBlock *OperationBlock
 	Timestamp int64
 }
 
@@ -22,21 +25,31 @@ type Operation struct {
 	Timestamp int64
 }
 
+func NewOperation(args []byte, data []string) Operation {
+	return Operation{
+		Arguments: args,
+		Data:      data,
+		Timestamp: time.Now().Unix(),
+		Id:        uuid.New().String(),
+	}
+}
+
 type Node struct {
 	OperationMap map[string][]Operation
 	VersionTree  *VersionTree
+	Block        *OperationBlock
 }
 
-func (on OperationNode) CalculateHash() ([]byte, error) {
+func (on OperationBlock) CalculateHash() ([]byte, error) {
 	return on.Hash, nil
 }
 
-func (on OperationNode) Equals(other merkletree.Content) (bool, error) {
-	otherONId := other.(OperationNode).Id
+func (on OperationBlock) Equals(other merkletree.Content) (bool, error) {
+	otherONId := other.(OperationBlock).Id
 	return on.Id == otherONId, nil
 }
 
-func (n *Node) AddOperation(ops []Operation) (string, error) {
+func (n *Node) AddOperation(ops []Operation) (*OperationBlock, error) {
 	hasher := sha256.New()
 
 	var b bytes.Buffer
@@ -45,32 +58,64 @@ func (n *Node) AddOperation(ops []Operation) (string, error) {
 
 	_, err := hasher.Write(s)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
+
 	bc := hasher.Sum(nil)
-	hash := string(bc)
+	hash := fmt.Sprintf("%x", bc)
 	n.OperationMap[hash] = ops
 
-	on := &OperationNode{
+	ob := &OperationBlock{
 		Id:        hash,
 		Hash:      bc,
+		PrevBlock: n.Block,
 		Timestamp: time.Now().Unix(),
 	}
 
 	// recalculate the version tree
-	err = n.AddLeaf(on)
+	err = n.AddLeaf(ob)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	return hash, nil
+	return ob, nil
 }
 
-func (n *Node) AddLeaf(on *OperationNode) error {
+func (n *Node) AddLeaf(ob *OperationBlock) error {
 	if n.VersionTree == nil {
-		n.VersionTree = NewVersionTree(on)
+		n.VersionTree = NewVersionTree(ob)
 		return nil
 	}
 
-	return n.VersionTree.AddLeaf(on)
+	n.Block = ob
+	return n.VersionTree.AddLeaf(ob)
+}
+
+func (n *OperationBlock) Next() (*OperationBlock, error) {
+	return n.PrevBlock, nil
+}
+
+func (ob *OperationBlock) GetHash() string {
+	return fmt.Sprintf("%x", ob.Hash)
+}
+
+func (n *Node) FindHash(hash string) (*OperationBlock, []string, error) {
+	block := n.Block
+	paths := []string{}
+
+	for block != nil {
+		blockId := block.GetHash()
+		shortBlockId := firstN(blockId, 7)
+
+		if blockId == hash || shortBlockId == hash {
+			return block, []string{}, nil
+		}
+		b, err := block.Next()
+		if err != nil {
+			return nil, []string{}, err
+		}
+		paths = append(paths, shortBlockId)
+		block = b
+	}
+	return block, paths, nil
 }

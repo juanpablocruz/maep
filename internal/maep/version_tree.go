@@ -1,13 +1,14 @@
 package maep
 
 import (
+	"fmt"
 	"log"
 
 	"github.com/cbergoon/merkletree"
 )
 
 type VersionTree struct {
-	tree *merkletree.MerkleTree
+	Tree *merkletree.MerkleTree
 }
 
 func NewVersionTree(c merkletree.Content) *VersionTree {
@@ -21,25 +22,40 @@ func NewVersionTree(c merkletree.Content) *VersionTree {
 	}
 
 	return &VersionTree{
-		tree: tree,
+		Tree: tree,
 	}
 }
 
 func (v *VersionTree) Print() string {
-	return v.tree.String()
+	return v.Tree.String()
 }
 
 func (v *VersionTree) Root() []byte {
-	return v.tree.MerkleRoot()
+	return v.Tree.MerkleRoot()
 }
 
 func (v *VersionTree) VerifyTree() (bool, error) {
-	return v.tree.VerifyTree()
+	return v.Tree.VerifyTree()
 }
 
 func (v *VersionTree) AddLeaf(leaf merkletree.Content) error {
 	var list []merkletree.Content
 	list = append(list, leaf)
 
-	return v.tree.RebuildTreeWith(list)
+	return v.Tree.RebuildTreeWith(list)
+}
+
+func (v *VersionTree) ShortRoot() string {
+	return firstN(fmt.Sprintf("%x", v.Root()), 7)
+}
+
+func firstN(s string, n int) string {
+	i := 0
+	for j := range s {
+		if i == n {
+			return s[:j]
+		}
+		i++
+	}
+	return s
 }
