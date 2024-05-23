@@ -1,12 +1,9 @@
 package main
 
-import "github.com/juanpablocruz/maep/internal/network"
+import (
+	"github.com/juanpablocruz/maep/internal/gui"
+)
 
 func main() {
-	nn := network.NewNetworkNode()
-
-	err := nn.Join("/ip4/127.0.0.1/tcp/61092")
-	if err != nil {
-		panic(err)
-	}
+	gui.MainGui()
 }

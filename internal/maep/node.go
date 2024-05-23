@@ -12,9 +12,9 @@ import (
 )
 
 type OperationBlock struct {
+	PrevBlock *OperationBlock
 	Id        string
 	Hash      []byte
-	PrevBlock *OperationBlock
 	Timestamp int64
 }
 
@@ -97,6 +97,10 @@ func (n *OperationBlock) Next() (*OperationBlock, error) {
 
 func (ob *OperationBlock) GetHash() string {
 	return fmt.Sprintf("%x", ob.Hash)
+}
+
+func (ob *OperationBlock) GetShortHash() string {
+	return firstN(fmt.Sprintf("%x", ob.GetHash()), 7)
 }
 
 func (n *Node) FindHash(hash string) (*OperationBlock, []string, error) {
