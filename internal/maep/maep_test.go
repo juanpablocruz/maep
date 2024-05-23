@@ -3,6 +3,7 @@ package maep_test
 import (
 	"bytes"
 	"encoding/gob"
+	"fmt"
 	"log"
 	"testing"
 
@@ -82,4 +83,37 @@ func TestMain(t *testing.T) {
 
 	}
 	log.Printf("%s\n", path)
+}
+
+func TestPrint(t *testing.T) {
+	n := maep.NewNode()
+	args := Argument{
+		Args: map[string]interface{}{
+			"test":  "test",
+			"test2": "test2",
+		},
+	}
+	var b bytes.Buffer
+	gob.NewEncoder(&b).Encode(args)
+	o := maep.NewOperation(b.Bytes(), []string{"test"})
+	o2 := maep.NewOperation(b.Bytes(), []string{"test 2"})
+	o3 := maep.NewOperation(b.Bytes(), []string{"test 3"})
+
+	op_list := []maep.Operation{o}
+
+	_, err := n.AddOperation(op_list)
+	if err != nil {
+		t.Errorf("Error adding operation: %s", err)
+	}
+	_, err = n.AddOperation([]maep.Operation{o2})
+	if err != nil {
+		t.Errorf("Error adding operation: %s", err)
+	}
+	_, err = n.AddOperation([]maep.Operation{o3})
+	if err != nil {
+		t.Errorf("Error adding operation: %s", err)
+	}
+
+	fmt.Printf("Clock: %d\n", n.Clock.Now().Ticks)
+	fmt.Printf("\n%s\n\n", n.Print())
 }
