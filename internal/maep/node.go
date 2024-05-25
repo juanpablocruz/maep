@@ -61,7 +61,7 @@ func (n *Node) AddLeaf(op Operation) (*OperationBlock, error) {
 	return ob, nil
 }
 
-func (n *Node) FindHash(hash string) (*OperationBlock, []string, error) {
+func (n *Node) FindHash(hash string, shorted bool) (*OperationBlock, []string, error) {
 	block := n.Block
 	paths := []string{}
 
@@ -76,7 +76,11 @@ func (n *Node) FindHash(hash string) (*OperationBlock, []string, error) {
 		if err != nil {
 			return nil, []string{}, err
 		}
-		paths = append(paths, shortBlockId)
+		if shorted {
+			paths = append(paths, shortBlockId)
+		} else {
+			paths = append(paths, blockId)
+		}
 		block = b
 	}
 	return block, paths, nil
@@ -107,7 +111,7 @@ func (n *Node) Print() string {
 }
 
 func (n *Node) GetDiff(hash string) (string, error) {
-	_, paths, err := n.FindHash(hash)
+	_, paths, err := n.FindHash(hash, true)
 	if err != nil {
 		return "", err
 	}
@@ -160,4 +164,20 @@ func (n *Node) JoinNetwork() error {
 
 func (n *Node) Sync() error {
 	return nil
+}
+
+func (n *Node) GetOperationsFromDiff(hash string) ([]Operation, error) {
+	_, paths, err := n.FindHash(hash, false)
+	if err != nil {
+		return nil, err
+	}
+
+	ops := make([]Operation, 0)
+	for _, path := range paths {
+		op, ok := n.OperationMap[path]
+		if ok {
+			ops = append(ops, op)
+		}
+	}
+	return ops, nil
 }

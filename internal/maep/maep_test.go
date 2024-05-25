@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/juanpablocruz/maep/internal/maep"
@@ -67,7 +68,7 @@ func TestGetDiff(t *testing.T) {
 
 	fmt.Printf("Get diff since %s\n", op_list[3].GetShortHash())
 
-	_, path, err := n.FindHash(op_list[3].GetHash())
+	_, path, err := n.FindHash(op_list[3].GetHash(), true)
 	if err != nil {
 		t.Errorf("Error finding hash: %s", err)
 	}
@@ -80,4 +81,44 @@ func TestGetDiff(t *testing.T) {
 		t.Errorf("Error getting diff: %s", err)
 	}
 	fmt.Println(diff)
+}
+
+func TestExtractOperationsDiff(t *testing.T) {
+	n := maep.NewNode()
+	args := Argument{
+		Args: map[string]interface{}{
+			"test":  "test",
+			"test2": "test2",
+		},
+	}
+	var b bytes.Buffer
+	gob.NewEncoder(&b).Encode(args)
+
+	op_list := make([]*maep.OperationBlock, 0)
+	for i := 0; i < 10; i++ {
+		o := maep.NewOperation(b.Bytes(), []string{fmt.Sprintf("test %d", i)})
+		ob, err := n.AddOperation(o)
+		if err != nil {
+			t.Errorf("Error adding operation: %s", err)
+		}
+		op_list = append(op_list, ob)
+	}
+
+	fmt.Printf("Get operations diff since %s\n", op_list[3].GetShortHash())
+
+	op, err := n.GetOperationsFromDiff(op_list[3].GetHash())
+	if err != nil {
+		t.Errorf("Error extracting operations diff: %s", err)
+	}
+
+	var decodedArgs Argument
+	for _, o := range op {
+		gob.NewDecoder(bytes.NewReader(o.Arguments)).Decode(&decodedArgs)
+
+		argstr := make([]string, 0)
+		for _, v := range decodedArgs.Args {
+			argstr = append(argstr, fmt.Sprintf("%s", v))
+		}
+		fmt.Printf("`%s`(%s)\n", strings.Join(o.Data, ""), strings.Join(argstr, ", "))
+	}
 }
