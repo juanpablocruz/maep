@@ -1,7 +1,6 @@
 package maep
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/gob"
 	"fmt"
@@ -37,62 +36,60 @@ func NewOperation(args []byte, data []string) Operation {
 }
 
 type Node struct {
-	OperationMap map[string][]Operation
+	OperationMap map[string]Operation
 	VersionTree  *VersionTree
 	Block        *OperationBlock
 	SyncVector   *SyncVector
 	Clock        *hlc.Hybrid
 }
 
-func (on OperationBlock) CalculateHash() ([]byte, error) {
-	return on.Hash, nil
+func (on Operation) CalculateHash() ([]byte, error) {
+	h := sha256.New()
+	e := gob.NewEncoder(h)
+	err := e.Encode(on)
+	if err != nil {
+		return nil, err
+	}
+	return h.Sum(nil), nil
 }
 
-func (on OperationBlock) Equals(other merkletree.Content) (bool, error) {
-	otherONId := other.(OperationBlock).Id
+func (on Operation) Equals(other merkletree.Content) (bool, error) {
+	otherONId := other.(Operation).Id
 	return on.Id == otherONId, nil
 }
 
-func (n *Node) AddOperation(ops []Operation) (*OperationBlock, error) {
-	hasher := sha256.New()
-
-	var b bytes.Buffer
-	gob.NewEncoder(&b).Encode(ops)
-	s := b.Bytes()
-
-	_, err := hasher.Write(s)
+func (n *Node) AddOperation(ops Operation) (*OperationBlock, error) {
+	// recalculate the version tree
+	ob, err := n.AddLeaf(ops)
 	if err != nil {
 		return nil, err
 	}
 
-	bc := hasher.Sum(nil)
-	hash := fmt.Sprintf("%x", bc)
-	n.OperationMap[hash] = ops
+	n.OperationMap[ob.GetHash()] = ops
+	return ob, nil
+}
+
+func (n *Node) AddLeaf(op Operation) (*OperationBlock, error) {
+	if n.VersionTree == nil {
+		n.VersionTree = NewVersionTree(op)
+	}
+
+	n.Clock.AddTicks(1)
+	err := n.VersionTree.AddLeaf(op)
+	if err != nil {
+		return nil, err
+	}
+	newHash := n.VersionTree.Root()
 
 	ob := &OperationBlock{
-		Id:        hash,
-		Hash:      bc,
+		Id:        uuid.New().String(),
+		Hash:      newHash,
 		PrevBlock: n.Block,
 		Timestamp: time.Now().Unix(),
 	}
 
-	// recalculate the version tree
-	err = n.AddLeaf(ob)
-	if err != nil {
-		return nil, err
-	}
-
-	return ob, nil
-}
-
-func (n *Node) AddLeaf(ob *OperationBlock) error {
-	if n.VersionTree == nil {
-		n.VersionTree = NewVersionTree(ob)
-	}
-
 	n.Block = ob
-	n.Clock.AddTicks(1)
-	return n.VersionTree.AddLeaf(ob)
+	return ob, nil
 }
 
 func (n *OperationBlock) Next() (*OperationBlock, error) {
