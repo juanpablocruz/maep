@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
-	"log"
 	"testing"
 
 	"github.com/juanpablocruz/maep/internal/maep"
@@ -12,74 +11,6 @@ import (
 
 type Argument struct {
 	Args map[string]interface{}
-}
-
-func TestMain(t *testing.T) {
-	// This is a test function
-
-	n := maep.NewNode()
-
-	args := Argument{
-		Args: map[string]interface{}{
-			"test":  "test",
-			"test2": "test2",
-		},
-	}
-	var b bytes.Buffer
-	gob.NewEncoder(&b).Encode(args)
-
-	o := maep.NewOperation(b.Bytes(), []string{"test"})
-	o2 := maep.NewOperation(b.Bytes(), []string{"test 2"})
-
-	ob1, err := n.AddOperation(o)
-	if err != nil {
-		t.Errorf("Error adding operation: %s", err)
-	}
-	mr1 := n.VersionTree.ShortRoot()
-	log.Println(mr1)
-
-	ob2, err := n.AddOperation(o2)
-	if err != nil {
-		t.Errorf("Error adding operation: %s", err)
-	}
-	mr2 := n.VersionTree.ShortRoot()
-	log.Println(mr2)
-
-	// Verify the tree
-	_, err = n.VersionTree.VerifyTree()
-	if err != nil {
-		t.Errorf("Error verifying tree: %s", err)
-	}
-
-	log.Println("OP1")
-
-	hash_str := ob1.GetHash()
-	block, path, err := n.FindHash(hash_str)
-	if err != nil {
-		t.Errorf("Error finding hash: %s", err)
-	}
-
-	if block != nil {
-		ops := n.OperationMap[hash_str]
-
-		log.Printf("%v\n", ops)
-	}
-	log.Printf("%s\n", path)
-
-	log.Println("OP2")
-
-	hash_str = ob2.GetHash()
-	block, path, err = n.FindHash(hash_str)
-	if err != nil {
-		t.Errorf("Error finding hash: %s", err)
-	}
-	if block != nil {
-		ops := n.OperationMap[hash_str]
-
-		log.Printf("%v\n", ops)
-
-	}
-	log.Printf("%s\n", path)
 }
 
 func TestPrint(t *testing.T) {
@@ -111,4 +42,42 @@ func TestPrint(t *testing.T) {
 
 	fmt.Printf("Clock: %d\n", n.Clock.Now().Ticks)
 	fmt.Printf("\n%s\n\n", n.Print())
+}
+
+func TestGetDiff(t *testing.T) {
+	n := maep.NewNode()
+	args := Argument{
+		Args: map[string]interface{}{
+			"test":  "test",
+			"test2": "test2",
+		},
+	}
+	var b bytes.Buffer
+	gob.NewEncoder(&b).Encode(args)
+
+	op_list := make([]*maep.OperationBlock, 0)
+	for i := 0; i < 10; i++ {
+		o := maep.NewOperation(b.Bytes(), []string{fmt.Sprintf("test %d", i)})
+		ob, err := n.AddOperation(o)
+		if err != nil {
+			t.Errorf("Error adding operation: %s", err)
+		}
+		op_list = append(op_list, ob)
+	}
+
+	fmt.Printf("Get diff since %s\n", op_list[3].GetShortHash())
+
+	_, path, err := n.FindHash(op_list[3].GetHash())
+	if err != nil {
+		t.Errorf("Error finding hash: %s", err)
+	}
+	if len(path) != 6 {
+		t.Errorf("Error finding hash: %s", err)
+	}
+
+	diff, err := n.GetDiff(op_list[3].GetHash())
+	if err != nil {
+		t.Errorf("Error getting diff: %s", err)
+	}
+	fmt.Println(diff)
 }

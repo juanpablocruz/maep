@@ -24,11 +24,10 @@ func initialModel(op *maep.Operation) model {
 	var tree *maep.Node
 	if op != nil {
 		tree = maep.NewNode()
-		ob, err := tree.AddOperation([]maep.Operation{*op})
+		_, err := tree.AddOperation(*op)
 		if err != nil {
 			panic(err)
 		}
-		tree.AddLeaf(ob)
 	}
 
 	return model{

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/gob"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -110,10 +111,10 @@ func (n *Node) FindHash(hash string) (*OperationBlock, []string, error) {
 
 	for block != nil {
 		blockId := block.GetHash()
-		shortBlockId := firstN(blockId, 7)
+		shortBlockId := block.GetShortHash()
 
 		if blockId == hash || shortBlockId == hash {
-			return block, []string{}, nil
+			return block, paths, nil
 		}
 		b, err := block.Next()
 		if err != nil {
@@ -147,6 +148,42 @@ func (n *Node) Print() string {
 		}
 	}
 	return strings.Join(str, fmt.Sprintf("\n%s   | \n", padding))
+}
+
+func (n *Node) GetDiff(hash string) (string, error) {
+	_, paths, err := n.FindHash(hash)
+	if err != nil {
+		return "", err
+	}
+	str := make([]string, 0)
+	block := n.Block
+
+	if slices.Contains(paths, block.GetShortHash()) {
+		str = append(str, fmt.Sprintf("\033[1;31m(HEAD) %s\033[0m", block.GetShortHash()))
+	} else {
+		str = append(str, fmt.Sprintf("(HEAD) %s", block.GetShortHash()))
+	}
+
+	block, err = block.Next()
+	if err != nil {
+		block = nil
+	}
+
+	padding := strings.Repeat(" ", 7)
+	for block != nil {
+		if slices.Contains(paths, block.GetShortHash()) {
+			str = append(str, fmt.Sprintf("%s\033[1;31m%s\033[0m", padding, block.GetShortHash()))
+		} else {
+			str = append(str, fmt.Sprintf("%s%s", padding, block.GetShortHash()))
+		}
+		b, err := block.Next()
+		if err != nil {
+			block = nil
+		} else {
+			block = b
+		}
+	}
+	return strings.Join(str, fmt.Sprintf("\n%s   | \n", padding)), nil
 }
 
 func (n *Node) JoinNetwork() error {
