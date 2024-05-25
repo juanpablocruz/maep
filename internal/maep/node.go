@@ -1,40 +1,14 @@
 package maep
 
 import (
-	"crypto/sha256"
-	"encoding/gob"
 	"fmt"
 	"slices"
 	"strings"
 	"time"
 
-	"github.com/cbergoon/merkletree"
 	"github.com/google/uuid"
 	"github.com/juanpablocruz/maep/internal/maep/hlc"
 )
-
-type OperationBlock struct {
-	PrevBlock *OperationBlock
-	Id        string
-	Hash      []byte
-	Timestamp int64
-}
-
-type Operation struct {
-	Arguments []byte
-	Id        string
-	Data      []string
-	Timestamp int64
-}
-
-func NewOperation(args []byte, data []string) Operation {
-	return Operation{
-		Arguments: args,
-		Data:      data,
-		Timestamp: time.Now().Unix(),
-		Id:        uuid.New().String(),
-	}
-}
 
 type Node struct {
 	OperationMap map[string]Operation
@@ -44,19 +18,13 @@ type Node struct {
 	Clock        *hlc.Hybrid
 }
 
-func (on Operation) CalculateHash() ([]byte, error) {
-	h := sha256.New()
-	e := gob.NewEncoder(h)
-	err := e.Encode(on)
-	if err != nil {
-		return nil, err
-	}
-	return h.Sum(nil), nil
-}
+func NewNode() *Node {
+	n := &Node{}
+	n.OperationMap = make(map[string]Operation)
+	n.SyncVector = NewSyncVector()
+	n.Clock = hlc.NewNow(0)
 
-func (on Operation) Equals(other merkletree.Content) (bool, error) {
-	otherONId := other.(Operation).Id
-	return on.Id == otherONId, nil
+	return n
 }
 
 func (n *Node) AddOperation(ops Operation) (*OperationBlock, error) {
@@ -91,18 +59,6 @@ func (n *Node) AddLeaf(op Operation) (*OperationBlock, error) {
 
 	n.Block = ob
 	return ob, nil
-}
-
-func (n *OperationBlock) Next() (*OperationBlock, error) {
-	return n.PrevBlock, nil
-}
-
-func (ob *OperationBlock) GetHash() string {
-	return fmt.Sprintf("%x", ob.Hash)
-}
-
-func (ob *OperationBlock) GetShortHash() string {
-	return firstN(fmt.Sprintf("%x", ob.GetHash()), 7)
 }
 
 func (n *Node) FindHash(hash string) (*OperationBlock, []string, error) {
