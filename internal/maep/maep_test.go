@@ -10,13 +10,9 @@ import (
 	"github.com/juanpablocruz/maep/internal/maep"
 )
 
-type Argument struct {
-	Args map[string]interface{}
-}
-
 func TestPrint(t *testing.T) {
 	n := maep.NewNode()
-	args := Argument{
+	args := maep.Argument{
 		Args: map[string]interface{}{
 			"test":  "test",
 			"test2": "test2",
@@ -47,7 +43,7 @@ func TestPrint(t *testing.T) {
 
 func TestGetDiff(t *testing.T) {
 	n := maep.NewNode()
-	args := Argument{
+	args := maep.Argument{
 		Args: map[string]interface{}{
 			"test":  "test",
 			"test2": "test2",
@@ -85,7 +81,7 @@ func TestGetDiff(t *testing.T) {
 
 func TestExtractOperationsDiff(t *testing.T) {
 	n := maep.NewNode()
-	args := Argument{
+	args := maep.Argument{
 		Args: map[string]interface{}{
 			"test":  "test",
 			"test2": "test2",
@@ -111,7 +107,7 @@ func TestExtractOperationsDiff(t *testing.T) {
 		t.Errorf("Error extracting operations diff: %s", err)
 	}
 
-	var decodedArgs Argument
+	var decodedArgs maep.Argument
 	for _, o := range op {
 		gob.NewDecoder(bytes.NewReader(o.Arguments)).Decode(&decodedArgs)
 

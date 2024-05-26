@@ -1,0 +1,8 @@
+1;INSERT INTO test (name, age) VALUES (?,?); "John"; 30
+2;UPDATE test SET age = ? WHERE name = ?; 31; "John"
+3;INSERT INTO test (name, age) VALUES (?,?); "Jane"; 29
+4;INSERT INTO test (name, age) VALUES (?,?); "Jim"; 28
+5;INSERT INTO test (name, age) VALUES (?,?); "Jill"; 27
+6;UPDATE test SET age = ? WHERE name = ?; 32; "John"
+7;UPDATE test SET age = ? WHERE name = ?; 19; "Jill"
+8;UPDATE test SET age = ? WHERE name = ?; 22; "Jill"

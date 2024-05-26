@@ -9,15 +9,13 @@ import (
 )
 
 type model struct {
+	selected map[int]struct{}
+	styles   *Styles
+	lg       *lipgloss.Renderer
+	tree     *maep.Node
 	choices  []string
 	cursor   int
-	selected map[int]struct{}
-
-	styles *Styles
-	width  int
-	lg     *lipgloss.Renderer
-
-	tree *maep.Node
+	width    int
 }
 
 func initialModel(op *maep.Operation) model {

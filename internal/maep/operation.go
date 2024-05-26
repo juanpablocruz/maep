@@ -1,14 +1,17 @@
 package maep
 
 import (
-	"crypto/sha256"
 	"encoding/gob"
 	"time"
 
 	"github.com/cbergoon/merkletree"
 	"github.com/google/uuid"
+	"lukechampine.com/blake3"
 )
 
+type Argument struct {
+	Args map[string]interface{}
+}
 type Operation struct {
 	Arguments []byte
 	Id        string
@@ -26,7 +29,7 @@ func NewOperation(args []byte, data []string) Operation {
 }
 
 func (on Operation) CalculateHash() ([]byte, error) {
-	h := sha256.New()
+	h := blake3.New(32, nil)
 	e := gob.NewEncoder(h)
 	err := e.Encode(on)
 	if err != nil {

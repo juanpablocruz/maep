@@ -1,13 +1,18 @@
 package maep
 
 import (
+	"bytes"
+	"context"
+	"encoding/gob"
 	"fmt"
+	"log"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/juanpablocruz/maep/internal/maep/hlc"
+	"github.com/juanpablocruz/maep/internal/network"
 )
 
 type Node struct {
@@ -16,6 +21,15 @@ type Node struct {
 	Block        *OperationBlock
 	SyncVector   *SyncVector
 	Clock        *hlc.Hybrid
+	ctx          context.Context
+	targetF      *string
+	networkNode  *network.NetworkNode
+}
+
+type NodeConfig struct {
+	Listen     *int
+	Target     *string
+	Standalone bool
 }
 
 func NewNode() *Node {
@@ -23,7 +37,6 @@ func NewNode() *Node {
 	n.OperationMap = make(map[string]Operation)
 	n.SyncVector = NewSyncVector()
 	n.Clock = hlc.NewNow(0)
-
 	return n
 }
 
@@ -146,7 +159,7 @@ func (n *Node) GetDiff(hash string) (string, error) {
 	return strings.Join(str, fmt.Sprintf("\n%s   | \n", padding)), nil
 }
 
-func (n *Node) JoinNetwork() error {
+func (n *Node) JoinNetwork(config NodeConfig) error {
 	// Call the seed node to retrieve the the target node ip address and port
 	//
 	// Connect to the target node
@@ -159,10 +172,30 @@ func (n *Node) JoinNetwork() error {
 	// This node will set its SyncVector.NextBlock to previous target node's SyncVector.NextBlock
 	// This will join this node to the ring network
 
-	return nil
+	// Parse options from the command line
+
+	n.networkNode = network.NewNetworkNode(config.Listen, config.Standalone)
+	_, err := n.networkNode.SelectPeer(*config.Target)
+	log.Printf("Selected peer: %s\n", n.networkNode.Peer.ID)
+	return err
 }
 
-func (n *Node) Sync() error {
+func (n *Node) Sync(transmitData []byte) error {
+	log.Println("Syncing with network")
+
+	n.networkNode.RunSender(transmitData, func(b []byte) ([]byte, error) {
+		buf := bytes.NewBuffer(b)
+		dec := gob.NewDecoder(buf)
+		decodedVector := NewSyncVector()
+		if err := dec.Decode(&decodedVector); err != nil {
+			log.Println(err)
+			return []byte{}, err
+		}
+
+		log.Printf("received sync vector: %v\n", decodedVector)
+		return b, nil
+	})
+
 	return nil
 }
 
