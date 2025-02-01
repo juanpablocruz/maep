@@ -11,8 +11,7 @@ This project implements a prototype of the **Merkle Anti-Entropy Protocol (MAEP)
 - [Installation](#installation)
 - [Usage](#usage)
 - [Testing](#testing)
-- [TUI Interface](#tui-interface)
-- [Next Steps and Future Improvements](#next-steps-and-future-improvements)
+- [Next Steps to Improve the Code](#next-steps-to-improve-the-code)
 
 ## Features
 
@@ -29,10 +28,6 @@ This project implements a prototype of the **Merkle Anti-Entropy Protocol (MAEP)
   - Monitor neighbor connectivity using a ping mechanism.
   - Initiate a (simulated) network reconfiguration when neighbors go offline.
 
-- **Terminal User Interface (TUI):**  
-  A TUI (built with [gocui](https://github.com/jroimartin/gocui)) displays:
-  - A live network graph (listing each node’s online status, predecessor, and successor).
-  - A scrolling log view of recent events.
 
 ## Project Structure
 ```
