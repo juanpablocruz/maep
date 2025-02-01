@@ -28,36 +28,36 @@ This project implements a prototype of the **Merkle Anti-Entropy Protocol (MAEP)
   - Monitor neighbor connectivity using a ping mechanism.
   - Initiate a (simulated) network reconfiguration when neighbors go offline.
 
-
 ## Project Structure
+
 ```
 . 
 ├── cmd 
 │ └── maepsim 
-│		├── main.go
+│ ├── main.go
 ├── internal 
-│ 	├── protocol 
-│ 	│	├── protocol.go  
-│ 	│	└── protocol_test.go 
-│ 	├── merkle 
-│ 	│	├── merkle.go  
-│ 	│	└── merkle_test.go 
-│ 	├── node 
-│ 	│	├── node.go 
-│ 	│	└── node_test.go 
-│ 	└── tui 
-│ 		└── state.go 
+│ ├── protocol 
+│ │ ├── protocol.go  
+│ │ └── protocol_test.go 
+│ ├── merkle 
+│ │ ├── merkle.go  
+│ │ └── merkle_test.go 
+│ ├── node 
+│ │ ├── node.go 
+│ │ └── node_test.go 
+│ └── tui 
+│  └── state.go 
 └── go.mod
 ```
-
 
 ## Installation
 
 1. **Clone the Repository:**
 
-   ```bash
-   git clone https://github.com/juanpablocruz/maepsim.git
-   cd maepsim```
+```bash
+git clone https://github.com/juanpablocruz/maepsim.git
+cd maepsim
+```
 
 2. **Install Dependencies:**
 This project uses Go modules. Ensure your Go version is 1.16 or newer, then run:
