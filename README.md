@@ -2,7 +2,7 @@
 
 This project implements a prototype of the **Merkle Anti-Entropy Protocol (MAEP)** — a distributed synchronization and reconciliation mechanism that uses Merkle trees to track node state and detect conflicts. The protocol is designed for an AP (Availability/Partition Tolerance) environment (per the CAP theorem) by allowing nodes to operate independently, reconcile differences asynchronously, and reconfigure the network when nodes go offline.
 
-> **Disclaimer:** This project is an experimental prototype. While it includes basic JOIN, SYNC, DELTA SYNC, and PING operations, as well as a simple reconfiguration stub, it is not yet production‑ready.
+> **Disclaimer:** This project is an experimental prototype currently in development. While it includes basic JOIN, SYNC, DELTA SYNC, and PING operations, as well as a simple reconfiguration stub, it is not yet production‑ready.
 
 ## Table of Contents
 
