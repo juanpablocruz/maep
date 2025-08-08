@@ -21,6 +21,7 @@ import (
 	"github.com/juanpablocruz/maep/pkg/segment"
 	"github.com/juanpablocruz/maep/pkg/syncproto"
 	"github.com/juanpablocruz/maep/pkg/transport"
+	"github.com/juanpablocruz/maep/pkg/wire"
 )
 
 // ---------- layout & widths ----------
@@ -62,13 +63,26 @@ func main() {
 	// epA, _ := sw.Listen("A")
 	// epB, _ := sw.Listen("B")
 
-	epATCP, _ := transport.ListenTCP("127.0.0.1:9001")
-	epBTCP, _ := transport.ListenTCP("127.0.0.1:9002")
-	epAUDP, _ := transport.ListenUDP("127.0.0.1:9001")
-	epBUDP, _ := transport.ListenUDP("127.0.0.1:9002")
+	epATCP, err := transport.ListenTCP("127.0.0.1:9001")
+	if err != nil {
+		panic(err)
+	}
+	epBTCP, err := transport.ListenTCP("127.0.0.1:9002")
+	if err != nil {
+		panic(err)
+	}
+	epAUDP, err := transport.ListenUDP("127.0.0.1:9001")
+	if err != nil {
+		panic(err)
+	}
+	epBUDP, err := transport.ListenUDP("127.0.0.1:9002")
+	if err != nil {
+		panic(err)
+	}
 
 	nA := node.New("A", epATCP, transport.MemAddr("127.0.0.1:9002"), 500*time.Millisecond)
 	nB := node.New("B", epBTCP, transport.MemAddr("127.0.0.1:9001"), 500*time.Millisecond)
+
 	defer epATCP.Close()
 	defer epBTCP.Close()
 	defer epAUDP.Close()
@@ -76,9 +90,6 @@ func main() {
 
 	nA.AttachHB(epAUDP)
 	nB.AttachHB(epBUDP)
-
-	// nA := node.New("A", epA, "B", 500*time.Millisecond)
-	// nB := node.New("B", epB, "A", 500*time.Millisecond)
 
 	// Events
 	evCh := make(chan node.Event, 256)
@@ -111,7 +122,8 @@ func main() {
 	installUI()
 	defer restoreUI()
 
-	events := make([]node.Event, 0, 128)
+	events := make([]node.Event, 0, 256)
+	wireLog := make([]node.Event, 0, 256)
 	input := "" // live command buffer
 
 	// key/command reader
@@ -132,18 +144,24 @@ func main() {
 		select {
 		case e := <-evCh:
 			if e.Type == node.EventHB {
-				// Optionally: keep a counter/timestamp if you want to show a tiny pulse elsewhere.
 				break
 			}
-			events = append(events, e)
-			if len(events) > maxEvents {
-				events = events[len(events)-maxEvents:]
+			if e.Type == node.EventWire {
+				wireLog = append(wireLog, e)
+				if len(wireLog) > maxEvents {
+					wireLog = wireLog[len(wireLog)-maxEvents:]
+				}
+			} else {
+				events = append(events, e)
+				if len(events) > maxEvents {
+					events = events[len(events)-maxEvents:]
+				}
 			}
 		case <-tick.C:
-			render(nA, nB, events, input)
+			render(nA, nB, events, wireLog, input)
 		case s := <-inputEditCh:
 			input = s
-			render(nA, nB, events, input) // immediate prompt redraw
+			render(nA, nB, events, wireLog, input)
 		case line := <-cmdCh:
 			input = ""
 			if handleCmd(strings.TrimSpace(line), nA, nB, actA, actB, &events) {
@@ -300,7 +318,7 @@ func readKeys(editOut chan<- string, lineOut chan<- string, quit chan<- struct{}
 
 // -------- Rendering --------
 
-func render(nA, nB *node.Node, events []node.Event, input string) {
+func render(nA, nB *node.Node, events []node.Event, wireLog []node.Event, input string) {
 	clearScreen()
 
 	screenW, rightPanelX, leftW, rightW := calcLayout()
@@ -352,16 +370,24 @@ func render(nA, nB *node.Node, events []node.Event, input string) {
 
 	evStart := row + usedRows + 1
 	printFull(evStart, stringsRepeat("─", screenW))
-	printFull(evStart+1, " Events (latest first):")
 
-	lines := formatEvents(events)
-	// Normalize to maxEvents lines and clear stale content
+	printBox(0, evStart+1, leftW, " Events (latest first):")
+	printBox(rightPanelX, evStart+1, rightW, " Wire (latest first):")
+
+	linesEv := formatEvents(events)
+	linesWire := formatWire(wireLog)
 	for i := range maxEvents {
 		y := evStart + 2 + i
-		if i < len(lines) {
-			printFull(y, "  "+lines[len(lines)-1-i]) // newest first
+		if i < len(linesEv) {
+			printBox(0, y, leftW, " "+linesEv[len(linesEv)-1-i])
 		} else {
-			printFull(y, "")
+			printBox(0, y, leftW, "")
+		}
+
+		if i < len(linesWire) {
+			printBox(rightPanelX, y, rightW, " "+linesWire[len(linesWire)-1-i])
+		} else {
+			printBox(rightPanelX, y, rightW, "")
 		}
 	}
 
@@ -489,6 +515,58 @@ func formatEvents(ev []node.Event) []string {
 		}
 	}
 	return out
+}
+
+func formatWire(ev []node.Event) []string {
+	out := make([]string, 0, len(ev))
+	for _, e := range ev {
+		proto, _ := e.Fields["proto"].(string) // tcp or udp
+		dir, _ := e.Fields["dir"].(string)     // <- or ->
+		mt, _ := e.Fields["mt"].(int)          // wire protocol type
+		bytes, _ := e.Fields["bytes"].(int)    // wire protocol payload size
+
+		name := mtName(byte(mt))
+		line := fmt.Sprintf("%-3s  %2s  %-12s %4dB", proto, dir, name, bytes)
+
+		if name == "PING" || name == "PONG" {
+			line = clrGray + line + clrReset
+		}
+
+		if proto == "udp" {
+			line = colorize(line, clrBlue)
+		} else if proto == "tcp" {
+			line = colorize(line, clrCyan)
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+func mtName(mt byte) string {
+	switch mt {
+	case wire.MT_SYNC_SUMMARY:
+		return "SUMMARY"
+	case wire.MT_SYNC_REQ:
+		return "REQ"
+	case wire.MT_SYNC_DELTA:
+		return "DELTA"
+	case wire.MT_PING:
+		return "PING"
+	case wire.MT_PONG:
+		return "PONG"
+	case wire.MT_SEG_AD:
+		return "SEG_AD"
+	case wire.MT_SEG_KEYS_REQ:
+		return "SEG_KEYS_REQ"
+	case wire.MT_SEG_KEYS:
+		return "SEG_KEYS"
+	case wire.MT_SYNC_BEGIN:
+		return "BEGIN"
+	case wire.MT_SYNC_END:
+		return "END"
+	default:
+		return fmt.Sprintf("MT_%d", mt)
+	}
 }
 
 func fmtNeeds(v any) string {
