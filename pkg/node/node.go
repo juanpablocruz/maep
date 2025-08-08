@@ -119,6 +119,15 @@ func (n *Node) SetPaused(p bool) {
 		n.emit(EventPauseChange, map[string]any{"paused": p})
 	}
 }
+
+func (n *Node) SetHeartbeatEvery(d time.Duration) { n.HBSetEvery(d) }
+func (n *Node) SetSuspectThreshold(k int)         { n.HBSetMissK(k) }
+func (n *Node) SetDeltaMaxBytes(b int)            { n.DeltaMaxBytes = b }
+func (n *Node) HBSetEvery(d time.Duration)        { n.hbEvery = d } // or n.hbEvery = d if field is unexported
+func (n *Node) HBSetMissK(k int)                  { n.hbMissK = k } // or n.hbMissK = k if unexported
+
+func (n *Node) GetEvents() <-chan Event { return n.Events } // if you prefer not to export field
+
 func (n *Node) IsPaused() bool { return n.paused.Load() }
 
 func (n *Node) Put(key string, val []byte, actor model.ActorID) {
