@@ -39,6 +39,8 @@ type Node struct {
 
 	Events chan Event
 
+	DeltaMaxBytes int
+
 	conn   atomic.Bool
 	paused atomic.Bool
 
@@ -60,15 +62,16 @@ type Node struct {
 func New(name string, ep *transport.Endpoint, peer transport.MemAddr, tickEvery time.Duration) *Node {
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &Node{
-		Name:    name,
-		Peer:    peer,
-		EP:      ep,
-		Log:     oplog.New(),
-		Clock:   hlc.New(),
-		Ticker:  tickEvery,
-		hbEvery: 350 * time.Millisecond,
-		hbMissK: 6,
-		ctx:     ctx, cancel: cancel,
+		Name:          name,
+		Peer:          peer,
+		EP:            ep,
+		Log:           oplog.New(),
+		Clock:         hlc.New(),
+		Ticker:        tickEvery,
+		DeltaMaxBytes: 32,
+		hbEvery:       350 * time.Millisecond,
+		hbMissK:       6,
+		ctx:           ctx, cancel: cancel,
 	}
 
 	n.conn.Store(true)
@@ -313,15 +316,16 @@ func (n *Node) onReq(b []byte) {
 		return
 	}
 
-	delta := syncproto.BuildDeltaFor(n.Log, req)
+	delta, truncated := syncproto.BuildDeltaForLimited(n.Log, req, n.DeltaMaxBytes)
+
 	ops := 0
 	for _, e := range delta.Entries {
 		ops += len(e.Ops)
 	}
 	enc := syncproto.EncodeDelta(delta)
 
-	slog.Info("send_delta", "node", n.Name, "entries", len(delta.Entries), "ops", ops)
-	n.emit(EventSendDelta, map[string]any{"entries": len(delta.Entries), "ops": ops, "bytes": len(enc)})
+	slog.Info("send_delta", "node", n.Name, "entries", len(delta.Entries), "ops", ops, "bytes", len(enc), "partial", truncated)
+	n.emit(EventSendDelta, map[string]any{"entries": len(delta.Entries), "ops": ops, "bytes": len(enc), "partial": truncated})
 
 	if err := n.send(wire.MT_SYNC_DELTA, enc); err != nil {
 		slog.Warn("send_delta_err", "node", n.Name, "err", err)
@@ -342,6 +346,7 @@ func (n *Node) onDelta(b []byte) {
 	slog.Info("applied_delta", "node", n.Name, "keys", len(d.Entries), "counts_before", before, "counts_after", after)
 	n.emit(EventAppliedDelta, map[string]any{"keys": len(d.Entries), "before": before, "after": after})
 
+	// Use the last remote summary as our equality target.
 	n.sessMu.Lock()
 	lr := n.sess.lastRemote
 	active := n.sess.active
@@ -350,24 +355,37 @@ func (n *Node) onDelta(b []byte) {
 		return
 	}
 
+	// Compare our current visible state to the remote summary.
 	myView := materialize.Snapshot(n.Log)
 	myLeaves := materialize.LeavesFromSnapshot(myView)
 
-	if len(lr.Leaves) != len(myLeaves) {
-		return
-	}
-
-	remote := make(map[string][32]byte, len(lr.Leaves))
-	for _, lf := range lr.Leaves {
-		remote[lf.Key] = lf.Hash
-	}
-
-	for _, lf := range myLeaves {
-		if remote[lf.Key] != lf.Hash {
+	if len(lr.Leaves) == len(myLeaves) {
+		remote := make(map[string][32]byte, len(lr.Leaves))
+		for _, lf := range lr.Leaves {
+			remote[lf.Key] = lf.Hash
+		}
+		equal := true
+		for _, lf := range myLeaves {
+			if remote[lf.Key] != lf.Hash {
+				equal = false
+				break
+			}
+		}
+		if equal {
+			n.endSession(true, "caught_up")
 			return
 		}
 	}
-	n.endSession(true, "caught_up")
+
+	// Not equal yet → send a follow-up REQ to fetch the remaining ops.
+	req := syncproto.DiffForReq(n.Log, lr)
+	if len(req.Needs) > 0 {
+		n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "continue"})
+		if err := n.send(wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
+			slog.Warn("send_req_err", "node", n.Name, "err", err)
+			n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
+		}
+	}
 }
 
 func (n *Node) emit(t EventType, f map[string]any) {

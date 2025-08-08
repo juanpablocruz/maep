@@ -25,14 +25,22 @@ import (
 
 // ---------- layout & widths ----------
 const (
-	screenW       = 200
-	rightPanelX   = 100
-	leftW         = rightPanelX - 2
-	rightW        = 98
 	headerRowsTop = 4 // header + status lines
 	panelHeaderH  = 3 // title + 2 header lines in each panel
 	maxEvents     = 30
 )
+
+func calcLayout() (screenW, rightPanelX, leftW, rightW int) {
+	w, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil || w <= 0 {
+		w = 200
+	}
+	screenW = w
+	rightPanelX = w / 2
+	leftW = rightPanelX - 2
+	rightW = w - rightPanelX - 2
+	return
+}
 
 // ---------- ANSI colors ----------
 const (
@@ -274,6 +282,7 @@ func readKeys(editOut chan<- string, lineOut chan<- string) {
 func render(nA, nB *node.Node, events []node.Event, input string) {
 	clearScreen()
 
+	screenW, rightPanelX, leftW, rightW := calcLayout()
 	// Snapshots + roots
 	viewA := materialize.Snapshot(nA.Log)
 	viewB := materialize.Snapshot(nB.Log)
@@ -305,12 +314,12 @@ func render(nA, nB *node.Node, events []node.Event, input string) {
 
 	// Panels + flags (box prints within columns)
 	row := headerRowsTop
-	drawPanel(0, row,
+	drawPanel(0, row, leftW,
 		fmt.Sprintf("%sNode A%s [link:%s pause:%s health:%s]",
 			clrCyan, clrReset, onOff(nA.IsConnected()), onOff(nA.IsPaused()), healthLabel(nA)),
 		viewA, rootA[:])
 
-	drawPanel(rightPanelX, row,
+	drawPanel(rightPanelX, row, rightW,
 		fmt.Sprintf("%sNode B%s [link:%s pause:%s health:%s]",
 			clrCyan, clrReset, onOff(nB.IsConnected()), onOff(nB.IsPaused()), healthLabel(nB)),
 		viewB, rootB[:])
@@ -321,7 +330,7 @@ func render(nA, nB *node.Node, events []node.Event, input string) {
 	usedRows := panelHeaderH + maxInt(rowsA, rowsB)
 
 	evStart := row + usedRows + 1
-	printFull(evStart, stringsRepeat(" ", 0)+stringsRepeat("─", screenW))
+	printFull(evStart, stringsRepeat("─", screenW))
 	printFull(evStart+1, " Events (latest first):")
 
 	lines := formatEvents(events)
@@ -354,12 +363,7 @@ func render(nA, nB *node.Node, events []node.Event, input string) {
 func panelRows(view map[string]materialize.State) int { return len(view) }
 
 // drawPanel prints a panel strictly inside its column using printBox
-func drawPanel(x, y int, title string, view map[string]materialize.State, root []byte) {
-	// width by column
-	w := leftW
-	if x >= rightPanelX {
-		w = rightW
-	}
+func drawPanel(x, y, w int, title string, view map[string]materialize.State, root []byte) {
 
 	printBox(x, y+0, w, fmt.Sprintf("[%s]  root: %s", title, shortHex(root, 12)))
 	printBox(x, y+1, w, " Key     Present  Value")
