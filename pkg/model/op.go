@@ -13,7 +13,7 @@ const (
 	OpKindDel uint8 = 2 // tombstone
 )
 
-// ActorID is a compact wrter identity (16 bytes)
+// ActorID is a compact writer identity (16 bytes)
 type ActorID [16]byte
 
 // Op is an immutable operation appended to a key's log
@@ -59,14 +59,14 @@ func SortOpsMAEP(ops []Op) {
 			return ai.HLCTicks < aj.HLCTicks
 		}
 		// lexicographical comparison of actor IDs
-		for k := range len(ai.Actor) {
+		for k := range ai.Actor {
 			if ai.Actor[k] != aj.Actor[k] {
 				return ai.Actor[k] < aj.Actor[k]
 			}
 		}
 
 		// tie-break on hash
-		for k := range len(ai.Hash) {
+		for k := range ai.Hash {
 			if ai.Hash[k] != aj.Hash[k] {
 				return ai.Hash[k] < aj.Hash[k]
 			}

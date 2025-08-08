@@ -44,3 +44,27 @@ func TestCloseStopsRecv(t *testing.T) {
 		t.Fatalf("expected closed recv to return ok=false")
 	}
 }
+
+func TestSendInboxFull(t *testing.T) {
+	sw := NewSwitch()
+	a, err := sw.Listen("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := sw.Listen("B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	defer b.Close()
+
+	frame := []byte("x")
+	for i := 0; i < 128; i++ {
+		if err := a.Send("B", frame); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+	}
+	if err := a.Send("B", frame); err == nil || err.Error() != "destination inbox full" {
+		t.Fatalf("expected inbox full error, got %v", err)
+	}
+}
