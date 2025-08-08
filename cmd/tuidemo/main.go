@@ -58,14 +58,19 @@ const (
 
 func main() {
 	// Transport & nodes
-	sw := transport.NewSwitch()
-	epA, _ := sw.Listen("A")
-	epB, _ := sw.Listen("B")
+	// sw := transport.NewSwitch()
+	// epA, _ := sw.Listen("A")
+	// epB, _ := sw.Listen("B")
+
+	epA, _ := transport.ListenTCP("127.0.0.1:9001")
+	epB, _ := transport.ListenTCP("127.0.0.1:9002")
 	defer epA.Close()
 	defer epB.Close()
 
-	nA := node.New("A", epA, "B", 500*time.Millisecond)
-	nB := node.New("B", epB, "A", 500*time.Millisecond)
+	// nA := node.New("A", epA, "B", 500*time.Millisecond)
+	// nB := node.New("B", epB, "A", 500*time.Millisecond)
+	nA := node.New("A", epA, transport.MemAddr("127.0.0.1:9002"), 500*time.Millisecond)
+	nB := node.New("B", epB, transport.MemAddr("127.0.0.1:9001"), 500*time.Millisecond)
 
 	// Events
 	evCh := make(chan node.Event, 256)

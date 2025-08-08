@@ -1,0 +1,178 @@
+package transport
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"net"
+	"sync"
+	"time"
+)
+
+// TCPEndpoint implements EndpointIF over TCP.
+// Address strings are just MemAddr (alias of string).
+type TCPEndpoint struct {
+	ln     net.Listener
+	addr   MemAddr
+	in     chan []byte
+	closed chan struct{}
+
+	mu    sync.Mutex
+	conns map[MemAddr]*tcpPeer // dialed peers by remote address
+}
+
+type tcpPeer struct {
+	addr MemAddr
+	c    net.Conn
+	r    *bufio.Reader
+	wmu  sync.Mutex
+}
+
+func ListenTCP(addr string) (*TCPEndpoint, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	ep := &TCPEndpoint{
+		ln:     ln,
+		addr:   MemAddr(ln.Addr().String()),
+		in:     make(chan []byte, 128),
+		closed: make(chan struct{}),
+		conns:  make(map[MemAddr]*tcpPeer),
+	}
+	go ep.acceptLoop()
+	return ep, nil
+}
+
+func (e *TCPEndpoint) Addr() MemAddr { return e.addr }
+
+func (e *TCPEndpoint) Close() {
+	select {
+	case <-e.closed:
+		return
+	default:
+		close(e.closed)
+		_ = e.ln.Close()
+		e.mu.Lock()
+		for _, p := range e.conns {
+			_ = p.c.Close()
+		}
+		e.conns = map[MemAddr]*tcpPeer{}
+		e.mu.Unlock()
+	}
+}
+
+func (e *TCPEndpoint) Recv(ctx context.Context) ([]byte, bool) {
+	select {
+	case <-e.closed:
+		return nil, false
+	case <-ctx.Done():
+		return nil, false
+	case b := <-e.in:
+		return b, true
+	}
+}
+
+func (e *TCPEndpoint) Send(to MemAddr, frame []byte) error {
+	select {
+	case <-e.closed:
+		return errors.New("endpoint closed")
+	default:
+	}
+
+	p := e.getOrDial(to)
+	if p == nil {
+		return errors.New("dial failed")
+	}
+	p.wmu.Lock()
+	err := writeFrame(p.c, frame)
+	p.wmu.Unlock()
+	if err != nil {
+		// drop broken conn from cache so next Send() will re-dial
+		e.mu.Lock()
+		if cur, ok := e.conns[to]; ok && cur == p {
+			_ = cur.c.Close()
+			delete(e.conns, to)
+		}
+		e.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (e *TCPEndpoint) getOrDial(to MemAddr) *tcpPeer {
+	e.mu.Lock()
+	if p, ok := e.conns[to]; ok {
+		e.mu.Unlock()
+		return p
+	}
+	e.mu.Unlock()
+
+	// dial without holding lock
+	d, err := net.DialTimeout("tcp", string(to), 2*time.Second)
+	if err != nil {
+		return nil
+	}
+	p := &tcpPeer{addr: to, c: d, r: bufio.NewReader(d)}
+
+	// reader goroutine (for replies/unsolicited frames)
+	go func() {
+		defer d.Close()
+		for {
+			b, err := readFrame(p.r)
+			if err != nil {
+				return
+			}
+			select {
+			case e.in <- b:
+			case <-e.closed:
+				return
+			}
+		}
+	}()
+
+	// store in cache
+	e.mu.Lock()
+	// if someone raced and stored a conn, close this one and use the cached
+	if existing, ok := e.conns[to]; ok {
+		e.mu.Unlock()
+		_ = d.Close()
+		return existing
+	}
+	e.conns[to] = p
+	e.mu.Unlock()
+	return p
+}
+
+func (e *TCPEndpoint) acceptLoop() {
+	for {
+		c, err := e.ln.Accept()
+		if err != nil {
+			select {
+			case <-e.closed:
+				return
+			default:
+				// brief sleep to avoid tight loop on transient errors
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+		}
+		go e.handleConn(c)
+	}
+}
+
+func (e *TCPEndpoint) handleConn(c net.Conn) {
+	defer c.Close()
+	r := bufio.NewReader(c)
+	for {
+		b, err := readFrame(r)
+		if err != nil {
+			return
+		}
+		select {
+		case e.in <- b:
+		case <-e.closed:
+			return
+		}
+	}
+}

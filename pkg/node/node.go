@@ -33,7 +33,7 @@ type syncSession struct {
 type Node struct {
 	Name   string
 	Peer   transport.MemAddr
-	EP     *transport.Endpoint
+	EP     transport.EndpointIF
 	Log    *oplog.Log
 	Clock  *hlc.Clock
 	Ticker time.Duration
@@ -64,7 +64,7 @@ type Node struct {
 	cancel context.CancelFunc
 }
 
-func New(name string, ep *transport.Endpoint, peer transport.MemAddr, tickEvery time.Duration) *Node {
+func New(name string, ep transport.EndpointIF, peer transport.MemAddr, tickEvery time.Duration) *Node {
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &Node{
 		Name:          name,
