@@ -1,0 +1,29 @@
+package node
+
+import "time"
+
+type EventType string
+
+const (
+	EventPut          EventType = "put"
+	EventDel          EventType = "del"
+	EventSendSummary  EventType = "send_summary"
+	EventSendReq      EventType = "send_req"
+	EventSendDelta    EventType = "send_delta"
+	EventAppliedDelta EventType = "applied_delta"
+	EventWarn         EventType = "warn"
+	EventConnChange   EventType = "conn_change"
+	EventPauseChange  EventType = "pause_change"
+
+	EventHB        EventType = "hb"
+	EventHealth    EventType = "health"
+	EventSync      EventType = "sync"
+	EventSendSegAd EventType = "send_segad"
+)
+
+type Event struct {
+	Time   time.Time
+	Node   string
+	Type   EventType
+	Fields map[string]any
+}
