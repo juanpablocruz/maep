@@ -163,7 +163,19 @@ func (n *Node) Delete(key string, actor model.ActorID) {
 
 func (n *Node) recvHBLoop() {
 	for {
-		frame, ok := n.HB.Recv(n.ctx)
+		var (
+			from  transport.MemAddr
+			frame []byte
+			ok    bool
+		)
+
+		if fe, okFE := n.HB.(transport.FromEndpoint); okFE {
+			from, frame, ok = fe.RecvFrom(n.ctx)
+		} else {
+			frame, ok = n.HB.Recv(n.ctx)
+			from = n.Peer
+		}
+
 		if !ok {
 			return
 		}
@@ -172,11 +184,11 @@ func (n *Node) recvHBLoop() {
 			n.emit(EventWarn, map[string]any{"msg": "wire_decode_err_hb", "err": err.Error()})
 			continue
 		}
-		n.emit(EventWire, map[string]any{"proto": "udp", "dir": "<-", "mt": int(mt), "bytes": len(frame)})
+		n.emit(EventWire, map[string]any{"proto": "udp", "dir": "<-", "mt": int(mt), "bytes": len(frame), "from": string(from)})
 		switch mt {
 		case wire.MT_PING:
 			n.emit(EventHB, map[string]any{"dir": "<-udp"})
-			if err := n.sendHB(wire.MT_PONG, nil); err != nil {
+			if err := n.sendHBTo(from, wire.MT_PONG, nil); err != nil {
 				n.emit(EventWarn, map[string]any{"msg": "send_pong_err_udp", "err": err.Error()})
 			}
 		case wire.MT_PONG:
@@ -193,7 +205,9 @@ func (n *Node) summaryLoop() {
 	defer t.Stop()
 
 	var lastRoot [32]byte
-	var lastSent time.Time
+	lastSend := time.Time{}
+	maxSilence := 3 * n.Ticker
+
 	backoff := n.backoffBase
 	nextAllowed := time.Now() // earliest time we may try to send
 
@@ -209,14 +223,23 @@ func (n *Node) summaryLoop() {
 		for _, lf := range sum.Leaves {
 			ls = append(ls, merkle.Leaf{Key: lf.Key, Hash: lf.Hash})
 		}
+
+		slices.SortFunc(ls, func(a, b merkle.Leaf) int {
+			switch {
+			case a.Key < b.Key:
+				return -1
+			case a.Key > b.Key:
+				return 1
+			default:
+				return 0
+			}
+		})
+
 		root := merkle.Build(ls)
 
 		// Send if root changed OR we're doing a periodic refresh.
 		// Throttle: at most once per n.Ticker unless root changed.
-		if bytes.Equal(root[:], lastRoot[:]) && !force {
-			return
-		}
-		if !force && time.Since(lastSent) < n.Ticker {
+		if bytes.Equal(root[:], lastRoot[:]) && time.Since(lastSend) < maxSilence && !force {
 			return
 		}
 
@@ -250,7 +273,7 @@ func (n *Node) summaryLoop() {
 		backoff = n.backoffBase
 		nextAllowed = time.Now() // can send again any time root changes
 		lastRoot = root
-		lastSent = time.Now()
+		lastSend = time.Now()
 	}
 
 	for {
@@ -314,33 +337,44 @@ func genSessionID() uint64 {
 	return binary.BigEndian.Uint64(b[:])
 }
 
-func (n *Node) sendHB(mt byte, payload []byte) error {
+func (n *Node) sendHB(mt byte, payload []byte) error { return n.sendHBTo(n.Peer, mt, payload) }
+func (n *Node) sendHBTo(to transport.MemAddr, mt byte, payload []byte) error {
 	enc := wire.Encode(mt, payload)
 	if n.HB != nil {
 		if !n.conn.Load() {
 			return fmt.Errorf("link down")
 		}
-		n.emit(EventWire, map[string]any{"proto": "udp", "dir": "->", "mt": int(mt), "bytes": len(enc)})
-		return n.HB.Send(n.Peer, enc)
+		n.emit(EventWire, map[string]any{"proto": "udp", "dir": "->", "mt": int(mt), "len": len(enc), "to": string(to)})
+		return n.HB.Send(to, enc)
 	}
 
 	return n.send(mt, payload)
 }
 
-func (n *Node) send(mt byte, payload []byte) error {
+func (n *Node) send(mt byte, payload []byte) error { return n.sendTo(n.Peer, mt, payload) }
+func (n *Node) sendTo(to transport.MemAddr, mt byte, payload []byte) error {
 	if !n.conn.Load() {
 		return fmt.Errorf("link down")
 	}
 	enc := wire.Encode(mt, payload)
 	n.emit(EventWire, map[string]any{
-		"proto": "tcp", "dir": "->", "mt": int(mt), "bytes": len(enc),
+		"proto": "tcp", "dir": "->", "mt": int(mt), "bytes": len(enc), "to": string(to),
 	})
-	return n.EP.Send(n.Peer, wire.Encode(mt, payload))
+	return n.EP.Send(to, enc)
 }
 
 func (n *Node) recvLoop() {
 	for {
-		frame, ok := n.EP.Recv(n.ctx)
+		var from transport.MemAddr
+		var frame []byte
+		var ok bool
+
+		if ep, ok2 := n.EP.(transport.FromEndpoint); ok2 {
+			from, frame, ok = ep.RecvFrom(n.ctx)
+		} else {
+			frame, ok = n.EP.Recv(n.ctx)
+			from = n.Peer
+		}
 		if !ok {
 			return
 		}
@@ -353,14 +387,14 @@ func (n *Node) recvLoop() {
 		n.emit(EventWire, map[string]any{"proto": "tcp", "dir": "<-", "mt": int(mt), "bytes": len(frame)})
 		switch mt {
 		case wire.MT_SYNC_SUMMARY:
-			n.onSummary(payload)
+			n.onSummary(from, payload)
 		case wire.MT_SYNC_REQ:
-			n.onReq(payload)
+			n.onReq(from, payload)
 		case wire.MT_SYNC_DELTA:
-			n.onDelta(payload)
+			n.onDelta(from, payload)
 		case wire.MT_PING:
 			n.emit(EventHB, map[string]any{"dir": "<-tcp"})
-			if err := n.send(wire.MT_PONG, nil); err != nil {
+			if err := n.sendTo(from, wire.MT_PONG, nil); err != nil {
 				n.emit(EventWarn, map[string]any{"msg": "send_pong_err", "err": err.Error()})
 			}
 		case wire.MT_PONG:
@@ -378,11 +412,11 @@ func (n *Node) recvLoop() {
 		case wire.MT_SYNC_END:
 			n.endSession(false, "peer_end")
 		case wire.MT_SEG_AD:
-			n.onSegAd(payload)
+			n.onSegAd(from, payload)
 		case wire.MT_SEG_KEYS_REQ:
-			n.onSegKeysReq(payload)
+			n.onSegKeysReq(from, payload)
 		case wire.MT_SEG_KEYS:
-			n.onSegKeys(payload)
+			n.onSegKeys(from, payload)
 		default:
 			slog.Warn("unknown_msg", "node", n.Name, "mt", mt)
 			n.emit(EventWarn, map[string]any{"msg": "unknown_msg", "mt": mt})
@@ -390,7 +424,7 @@ func (n *Node) recvLoop() {
 	}
 }
 
-func (n *Node) onSummary(b []byte) {
+func (n *Node) onSummary(from transport.MemAddr, b []byte) {
 	sum, err := syncproto.DecodeSummary(b)
 	if err != nil {
 		slog.Warn("decode_summary_err", "node", n.Name, "err", err)
@@ -411,13 +445,13 @@ func (n *Node) onSummary(b []byte) {
 
 	slog.Info("send_req", "node", n.Name, "needs", req.Needs)
 	n.emit(EventSendReq, map[string]any{"needs": req.Needs})
-	if err := n.send(wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
+	if err := n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
 		slog.Warn("send_req_err", "node", n.Name, "err", err)
 		n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
 	}
 }
 
-func (n *Node) onReq(b []byte) {
+func (n *Node) onReq(from transport.MemAddr, b []byte) {
 	req, err := syncproto.DecodeReq(b)
 	if err != nil { /*…*/
 		return
@@ -446,13 +480,13 @@ func (n *Node) onReq(b []byte) {
 	slog.Info("send_delta", "node", n.Name, "entries", len(delta.Entries), "ops", ops, "bytes", len(enc), "partial", truncated)
 	n.emit(EventSendDelta, map[string]any{"entries": len(delta.Entries), "ops": ops, "bytes": len(enc), "partial": truncated})
 
-	if err := n.send(wire.MT_SYNC_DELTA, enc); err != nil {
+	if err := n.sendTo(from, wire.MT_SYNC_DELTA, enc); err != nil {
 		slog.Warn("send_delta_err", "node", n.Name, "err", err)
 		n.emit(EventWarn, map[string]any{"msg": "send_delta_err", "err": err.Error()})
 	}
 }
 
-func (n *Node) onDelta(b []byte) {
+func (n *Node) onDelta(from transport.MemAddr, b []byte) {
 	d, err := syncproto.DecodeDelta(b)
 	if err != nil {
 		slog.Warn("decode_delta_err", "node", n.Name, "err", err)
@@ -505,7 +539,7 @@ func (n *Node) onDelta(b []byte) {
 	req := syncproto.DiffForReq(n.Log, lr)
 	if len(req.Needs) > 0 {
 		n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "continue"})
-		if err := n.send(wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
+		if err := n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
 			slog.Warn("send_req_err", "node", n.Name, "err", err)
 			n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
 		}
@@ -577,7 +611,7 @@ func (n *Node) onPong() {
 	}
 }
 
-func (n *Node) onSegAd(b []byte) {
+func (n *Node) onSegAd(from transport.MemAddr, b []byte) {
 	ad, err := syncproto.DecodeSegAd(b)
 	if err != nil {
 		n.emit(EventWarn, map[string]any{"msg": "decode_segad_err", "err": err.Error()})
@@ -587,7 +621,7 @@ func (n *Node) onSegAd(b []byte) {
 	req := syncproto.DiffForReqFromSegAd(n.Log, ad)
 	if len(req.Needs) > 0 {
 		n.emit(EventSendReq, map[string]any{"needs": req.Needs})
-		if err := n.send(wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
+		if err := n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
 			n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
 		}
 		return
@@ -612,12 +646,12 @@ func (n *Node) onSegAd(b []byte) {
 	}
 
 	n.emit(EventSendSegKeysReq, map[string]any{"sids": sids})
-	if err := n.send(wire.MT_SEG_KEYS_REQ, syncproto.EncodeSegKeysReq(syncproto.SegKeysReq{SIDs: sids})); err != nil {
+	if err := n.sendTo(from, wire.MT_SEG_KEYS_REQ, syncproto.EncodeSegKeysReq(syncproto.SegKeysReq{SIDs: sids})); err != nil {
 		n.emit(EventWarn, map[string]any{"msg": "send_segkeys_req_err", "err": err.Error()})
 	}
 }
 
-func (n *Node) onSegKeysReq(b []byte) {
+func (n *Node) onSegKeysReq(from transport.MemAddr, b []byte) {
 	req, err := syncproto.DecodeSegKeysReq(b)
 	if err != nil {
 		n.emit(EventWarn, map[string]any{"msg": "decode_segkeys_req_err", "err": err.Error()})
@@ -627,12 +661,12 @@ func (n *Node) onSegKeysReq(b []byte) {
 	payload := syncproto.BuildSegKeys(view, req.SIDs)
 	enc := syncproto.EncodeSegKeys(payload)
 	n.emit(EventSendSegKeys, map[string]any{"items": len(payload.Items)})
-	if err := n.send(wire.MT_SEG_KEYS, enc); err != nil {
+	if err := n.sendTo(from, wire.MT_SEG_KEYS, enc); err != nil {
 		n.emit(EventWarn, map[string]any{"msg": "send_segkeys_err", "err": err.Error()})
 	}
 }
 
-func (n *Node) onSegKeys(b []byte) {
+func (n *Node) onSegKeys(from transport.MemAddr, b []byte) {
 	sk, err := syncproto.DecodeSegKeys(b)
 	if err != nil {
 		n.emit(EventWarn, map[string]any{"msg": "decode_segkeys_err", "err": err.Error()})
@@ -659,7 +693,7 @@ func (n *Node) onSegKeys(b []byte) {
 	}
 	req := syncproto.Req{Needs: needs}
 	n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "seg_keys"})
-	if err := n.send(wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
+	if err := n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
 		n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
 	}
 }

@@ -25,11 +25,15 @@ type ChaosConfig struct {
 	// Seed (optional). If 0, uses time.Now().UnixNano()
 	Seed int64
 }
+type chaosEnv struct {
+	from MemAddr
+	data []byte
+}
 
 type ChaosEP struct {
 	under EndpointIF
 
-	in     chan []byte
+	in     chan chaosEnv
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -54,11 +58,11 @@ func WrapChaos(under EndpointIF, cfg ChaosConfig) *ChaosEP {
 	}
 	cep := &ChaosEP{
 		under: under,
-		in:    make(chan []byte, cfg.MaxQueue),
+		in:    make(chan chaosEnv, cfg.MaxQueue),
 		cfg:   cfg,
 		rng:   rand.New(rand.NewSource(cfg.Seed)),
 	}
-	cep.up.Store(cfg.Up || true)
+	cep.up.Store(cfg.Up)
 
 	cep.ctx, cep.cancel = context.WithCancel(context.Background())
 	cep.wg.Add(1)
@@ -73,12 +77,24 @@ func (c *ChaosEP) Close() {
 	close(c.in)
 }
 
+func (c *ChaosEP) Addr() MemAddr {
+	return c.under.Addr()
+}
+
 func (c *ChaosEP) Recv(ctx context.Context) ([]byte, bool) {
+	_, b, ok := c.RecvFrom(ctx)
+	return b, ok
+}
+
+func (c *ChaosEP) RecvFrom(ctx context.Context) (MemAddr, []byte, bool) {
 	select {
 	case <-ctx.Done():
-		return nil, false
-	case b, ok := <-c.in:
-		return b, ok
+		return "", nil, false
+	case env, ok := <-c.in:
+		if !ok {
+			return "", nil, false
+		}
+		return env.from, env.data, true
 	}
 }
 
@@ -116,7 +132,17 @@ func (c *ChaosEP) Send(to MemAddr, frame []byte) error {
 func (c *ChaosEP) pumpRecv() {
 	defer c.wg.Done()
 	for {
-		frame, ok := c.under.Recv(c.ctx)
+		var (
+			from  MemAddr
+			frame []byte
+			ok    bool
+		)
+		if fe, okFE := c.under.(FromEndpoint); okFE {
+			from, frame, ok = fe.RecvFrom(c.ctx)
+		} else {
+			frame, ok = c.under.Recv(c.ctx)
+			from = ""
+		}
 		if !ok {
 			return
 		}
@@ -136,7 +162,7 @@ func (c *ChaosEP) pumpRecv() {
 		copy := clone(frame)
 		if delay <= 0 {
 			select {
-			case c.in <- copy:
+			case c.in <- chaosEnv{from: from, data: copy}:
 			default:
 				// drop if receiver queue full
 			}
@@ -144,7 +170,7 @@ func (c *ChaosEP) pumpRecv() {
 		}
 		time.AfterFunc(delay, func() {
 			select {
-			case c.in <- copy:
+			case c.in <- chaosEnv{from: from, data: copy}:
 			default:
 				// drop if queue full
 			}

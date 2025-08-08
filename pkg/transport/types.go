@@ -7,5 +7,11 @@ import "context"
 type EndpointIF interface {
 	Recv(ctx context.Context) ([]byte, bool)
 	Send(to MemAddr, frame []byte) error
+	Addr() MemAddr
 	Close()
+}
+
+type FromEndpoint interface {
+	EndpointIF
+	RecvFrom(ctx context.Context) (from MemAddr, frame []byte, ok bool)
 }

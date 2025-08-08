@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -42,6 +43,7 @@ var (
 
 	flQuiesceLast = flag.Duration("quiesce-last", 10*time.Second, "stop writers this long before the end to measure convergence")
 
+	flStopWritesAt  = flag.Duration("stop-writes-at", 30*time.Second, "stop writers at this offset; 0=never")
 	flFailurePeriod = flag.Duration("failure-period", 0, "mean time between random link failures (0=off)")
 	flRecoveryDelay = flag.Duration("recovery-delay", 5*time.Second, "time a failed link stays down before reconnect")
 )
@@ -164,7 +166,15 @@ func main() {
 			writerLoop(writersCtx, s, *flWriteInterval)
 		}(sns[i])
 	}
-
+	if flStopWritesAt != nil && *flStopWritesAt > 0 {
+		go func() {
+			select {
+			case <-time.After(*flStopWritesAt):
+				stopWriters()
+			case <-ctx.Done():
+			}
+		}()
+	}
 	if *flFailurePeriod > 0 && *flRecoveryDelay > 0 {
 		go flapLoop(ctx, sns, *flFailurePeriod, *flRecoveryDelay)
 	}
@@ -205,7 +215,19 @@ func main() {
 				allEq := true
 				for i, s := range sns {
 					view := materialize.Snapshot(s.Node.Log)
-					root := merkle.Build(materialize.LeavesFromSnapshot(view))
+					leaves := materialize.LeavesFromSnapshot(view)
+
+					slices.SortFunc(leaves, func(a, b merkle.Leaf) int {
+						switch {
+						case a.Key < b.Key:
+							return -1
+						case a.Key > b.Key:
+							return 1
+						default:
+							return 0
+						}
+					})
+					root := merkle.Build(leaves)
 					buf[i] = root
 					row = append(row, short(root[:]))
 					if i > 0 && buf[i] != buf[0] {
@@ -271,6 +293,12 @@ func main() {
 		}
 	}()
 
+	half := time.NewTimer(*flDuration / 2)
+	go func() {
+		<-half.C
+		stopWriters()
+	}()
+
 	// stop on duration or Ctrl-C
 	timer := time.NewTimer(*flDuration)
 	sig := make(chan os.Signal, 1)
@@ -284,7 +312,6 @@ func main() {
 	// shutdown
 	cancel()
 	rootCancel()
-	stopWriters()
 	evCancel()
 
 	// stop nodes/endpoints
@@ -392,7 +419,7 @@ func mustOpenCSVs(dir string, n int) (*csv.Writer, *csv.Writer, *os.File, func()
 func headerRoots(n int) []string {
 	h := make([]string, 0, 1+n)
 	h = append(h, "t_sec")
-	for i := 0; i < n; i++ {
+	for i := range n {
 		h = append(h, fmt.Sprintf("N%02d", i))
 	}
 	return h

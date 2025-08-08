@@ -9,21 +9,26 @@ import (
 
 type MemAddr string
 
+type memEnvelope struct {
+	from MemAddr
+	data []byte
+}
+
 // Switch delivers frames between listened addresses.
 type Switch struct {
 	mu    sync.RWMutex
-	inbox map[MemAddr]chan []byte
+	inbox map[MemAddr]chan memEnvelope
 }
 
 func NewSwitch() *Switch {
-	return &Switch{inbox: make(map[MemAddr]chan []byte)}
+	return &Switch{inbox: make(map[MemAddr]chan memEnvelope)}
 }
 
 // handle a node uses to send/recv frames.
 type Endpoint struct {
 	sw     *Switch
 	addr   MemAddr
-	in     chan []byte
+	in     chan memEnvelope
 	closed chan struct{}
 }
 
@@ -33,7 +38,7 @@ func (s *Switch) Listen(addr MemAddr) (*Endpoint, error) {
 	if _, exists := s.inbox[addr]; exists {
 		return nil, fmt.Errorf("address already in use: %s", addr)
 	}
-	ch := make(chan []byte, 128)
+	ch := make(chan memEnvelope, 128)
 	s.inbox[addr] = ch
 	return &Endpoint{
 		sw: s, addr: addr, in: ch, closed: make(chan struct{}),
@@ -64,15 +69,20 @@ func (e *Endpoint) Close() {
 	}
 }
 
-// Recv blocks until a frame arrives or ctx/endpoint is closed.
 func (e *Endpoint) Recv(ctx context.Context) ([]byte, bool) {
+	_, b, ok := e.RecvFrom(ctx)
+	return b, ok
+}
+
+// Recv blocks until a frame arrives or ctx/endpoint is closed.
+func (e *Endpoint) RecvFrom(ctx context.Context) (MemAddr, []byte, bool) {
 	select {
 	case <-e.closed:
-		return nil, false
+		return "", nil, false
 	case <-ctx.Done():
-		return nil, false
-	case b := <-e.in:
-		return b, true
+		return "", nil, false
+	case env := <-e.in:
+		return env.from, env.data, true
 	}
 }
 
@@ -90,7 +100,7 @@ func (e *Endpoint) Send(to MemAddr, frame []byte) error {
 	default:
 	}
 	select {
-	case dst <- frame:
+	case dst <- memEnvelope{from: e.addr, data: frame}:
 		return nil
 	default:
 		// backpressure / drop policy; for now blockless error

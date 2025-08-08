@@ -9,12 +9,17 @@ import (
 	"time"
 )
 
+type tcpEnv struct {
+	from MemAddr
+	data []byte
+}
+
 // TCPEndpoint implements EndpointIF over TCP.
 // Address strings are just MemAddr (alias of string).
 type TCPEndpoint struct {
 	ln     net.Listener
 	addr   MemAddr
-	in     chan []byte
+	in     chan tcpEnv
 	closed chan struct{}
 
 	mu    sync.Mutex
@@ -36,7 +41,7 @@ func ListenTCP(addr string) (*TCPEndpoint, error) {
 	ep := &TCPEndpoint{
 		ln:     ln,
 		addr:   MemAddr(ln.Addr().String()),
-		in:     make(chan []byte, 128),
+		in:     make(chan tcpEnv, 128),
 		closed: make(chan struct{}),
 		conns:  make(map[MemAddr]*tcpPeer),
 	}
@@ -63,13 +68,18 @@ func (e *TCPEndpoint) Close() {
 }
 
 func (e *TCPEndpoint) Recv(ctx context.Context) ([]byte, bool) {
+	_, b, ok := e.RecvFrom(ctx)
+	return b, ok
+}
+
+func (e *TCPEndpoint) RecvFrom(ctx context.Context) (MemAddr, []byte, bool) {
 	select {
 	case <-e.closed:
-		return nil, false
+		return "", nil, false
 	case <-ctx.Done():
-		return nil, false
+		return "", nil, false
 	case b := <-e.in:
-		return b, true
+		return b.from, b.data, true
 	}
 }
 
@@ -124,7 +134,7 @@ func (e *TCPEndpoint) getOrDial(to MemAddr) *tcpPeer {
 				return
 			}
 			select {
-			case e.in <- b:
+			case e.in <- tcpEnv{from: to, data: b}:
 			case <-e.closed:
 				return
 			}
@@ -164,13 +174,14 @@ func (e *TCPEndpoint) acceptLoop() {
 func (e *TCPEndpoint) handleConn(c net.Conn) {
 	defer c.Close()
 	r := bufio.NewReader(c)
+	peer := MemAddr(c.RemoteAddr().String())
 	for {
 		b, err := readFrame(r)
 		if err != nil {
 			return
 		}
 		select {
-		case e.in <- b:
+		case e.in <- tcpEnv{from: peer, data: b}:
 		case <-e.closed:
 			return
 		}
