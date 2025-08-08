@@ -93,8 +93,8 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
 
+	defer term.Restore(int(os.Stdin.Fd()), oldState)
 	installUI()
 	defer restoreUI()
 
@@ -104,7 +104,8 @@ func main() {
 	// key/command reader
 	inputEditCh := make(chan string, 64) // live edits
 	cmdCh := make(chan string, 16)       // completed lines
-	go readKeys(inputEditCh, cmdCh)
+	quitCh := make(chan struct{})
+	go readKeys(inputEditCh, cmdCh, quitCh)
 
 	// exit on Ctrl-C too (raw reader also exits on ^C)
 	sig := make(chan os.Signal, 1)
@@ -117,6 +118,10 @@ func main() {
 	for {
 		select {
 		case e := <-evCh:
+			if e.Type == node.EventHB {
+				// Optionally: keep a counter/timestamp if you want to show a tiny pulse elsewhere.
+				break
+			}
 			events = append(events, e)
 			if len(events) > maxEvents {
 				events = events[len(events)-maxEvents:]
@@ -131,6 +136,8 @@ func main() {
 			if handleCmd(strings.TrimSpace(line), nA, nB, actA, actB, &events) {
 				return
 			}
+		case <-quitCh:
+			return
 		case <-sig:
 			return
 		}
@@ -245,7 +252,7 @@ func handleCmd(line string, nA, nB *node.Node, actA, actB model.ActorID, events 
 }
 
 // Raw key reader (single-keystroke). Shows live prompt and emits full lines.
-func readKeys(editOut chan<- string, lineOut chan<- string) {
+func readKeys(editOut chan<- string, lineOut chan<- string, quit chan<- struct{}) {
 	buf := make([]byte, 1)
 	cur := []rune{}
 	for {
@@ -255,7 +262,8 @@ func readKeys(editOut chan<- string, lineOut chan<- string) {
 		b := buf[0]
 		switch b {
 		case 3: // Ctrl-C
-			os.Exit(0)
+			close(quit)
+			return
 		case '\r', '\n':
 			lineOut <- string(cur)
 			cur = cur[:0]
@@ -447,6 +455,22 @@ func formatEvents(ev []node.Event) []string {
 			out = append(out, fmt.Sprintf("%s%-6s%s %s PAUSE %s", clrGray, e.Node, clrReset, col, label))
 		case node.EventWarn:
 			out = append(out, fmt.Sprintf("%s%-6s%s %s WARN%s %v", clrGray, e.Node, clrReset, clrRed, clrReset, e.Fields))
+		case node.EventSendSegAd:
+			out = append(out, fmt.Sprintf("%s%-6s%s %s SEG_AD%s items=%v",
+				clrGray, e.Node, clrReset, clrCyan, clrReset, e.Fields["items"]))
+
+		case node.EventSendSegKeysReq:
+			out = append(out, fmt.Sprintf("%s%-6s%s %s SEG_KEYS_REQ%s sids=%v",
+				clrGray, e.Node, clrReset, clrYellow, clrReset, e.Fields["sids"]))
+
+		case node.EventSendSegKeys:
+			out = append(out, fmt.Sprintf("%s%-6s%s %s SEG_KEYS%s items=%v",
+				clrGray, e.Node, clrReset, clrCyan, clrReset, e.Fields["items"]))
+
+		case node.EventHB:
+			// ignore to reduce noise
+			// (do nothing)
+			continue
 		default:
 			out = append(out, fmt.Sprintf("%s%-6s%s %s %v", clrGray, e.Node, clrReset, string(e.Type), e.Fields))
 		}
@@ -599,8 +623,19 @@ func stripANSI(s string) string {
 }
 
 func clearScreen() { fmt.Print("\x1b[2J\x1b[H") }
-func installUI()   { fmt.Print("\x1b[?25l"); clearScreen() }
-func restoreUI()   { fmt.Print("\x1b[?25h\x1b[0m") }
+
+func installUI() {
+	// fmt.Print("\x1b[?1049h")   // ALT SCREEN ON
+	fmt.Print("\x1b[?25l")     // hide cursor
+	fmt.Print("\x1b[H\x1b[2J") // home + clear
+}
+
+// leave alt screen + show cursor + reset attrs
+func restoreUI() {
+	fmt.Print("\x1b[0m")   // reset SGR
+	fmt.Print("\x1b[?25h") // show cursor
+	// fmt.Print("\x1b[?1049l\n") // ALT SCREEN OFF (restores previous screen)
+}
 
 func onOff(b bool) string {
 	if b {

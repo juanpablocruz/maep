@@ -18,6 +18,7 @@ import (
 	"github.com/juanpablocruz/maep/pkg/merkle"
 	"github.com/juanpablocruz/maep/pkg/model"
 	"github.com/juanpablocruz/maep/pkg/oplog"
+	"github.com/juanpablocruz/maep/pkg/segment"
 	"github.com/juanpablocruz/maep/pkg/syncproto"
 	"github.com/juanpablocruz/maep/pkg/transport"
 	"github.com/juanpablocruz/maep/pkg/wire"
@@ -312,6 +313,10 @@ func (n *Node) recvLoop() {
 			n.endSession(false, "peer_end")
 		case wire.MT_SEG_AD:
 			n.onSegAd(payload)
+		case wire.MT_SEG_KEYS_REQ:
+			n.onSegKeysReq(payload)
+		case wire.MT_SEG_KEYS:
+			n.onSegKeys(payload)
 		default:
 			slog.Warn("unknown_msg", "node", n.Name, "mt", mt)
 			n.emit(EventWarn, map[string]any{"msg": "unknown_msg", "mt": mt})
@@ -348,9 +353,7 @@ func (n *Node) onSummary(b []byte) {
 
 func (n *Node) onReq(b []byte) {
 	req, err := syncproto.DecodeReq(b)
-	if err != nil {
-		slog.Warn("decode_req_err", "node", n.Name, "err", err)
-		n.emit(EventWarn, map[string]any{"msg": "decode_req_err", "err": err.Error()})
+	if err != nil { /*…*/
 		return
 	}
 	if len(req.Needs) == 0 {
@@ -360,12 +363,20 @@ func (n *Node) onReq(b []byte) {
 
 	delta, truncated := syncproto.BuildDeltaForLimited(n.Log, req, n.DeltaMaxBytes)
 
+	// count ops
 	ops := 0
 	for _, e := range delta.Entries {
 		ops += len(e.Ops)
 	}
-	enc := syncproto.EncodeDelta(delta)
 
+	// If after fallback we still have nothing, politely END.
+	if ops == 0 {
+		slog.Info("send_delta_empty", "node", n.Name)
+		_ = n.send(wire.MT_SYNC_END, nil)
+		return
+	}
+
+	enc := syncproto.EncodeDelta(delta)
 	slog.Info("send_delta", "node", n.Name, "entries", len(delta.Entries), "ops", ops, "bytes", len(enc), "partial", truncated)
 	n.emit(EventSendDelta, map[string]any{"entries": len(delta.Entries), "ops": ops, "bytes": len(enc), "partial": truncated})
 
@@ -388,12 +399,17 @@ func (n *Node) onDelta(b []byte) {
 	slog.Info("applied_delta", "node", n.Name, "keys", len(d.Entries), "counts_before", before, "counts_after", after)
 	n.emit(EventAppliedDelta, map[string]any{"keys": len(d.Entries), "before": before, "after": after})
 
+	changed := !countsEqual(before, after)
 	// Use the last remote summary as our equality target.
 	n.sessMu.Lock()
 	lr := n.sess.lastRemote
 	active := n.sess.active
 	n.sessMu.Unlock()
 	if len(lr.Leaves) == 0 || !active {
+		return
+	}
+
+	if !changed {
 		return
 	}
 
@@ -491,11 +507,82 @@ func (n *Node) onSegAd(b []byte) {
 		n.emit(EventWarn, map[string]any{"msg": "decode_segad_err", "err": err.Error()})
 		return
 	}
+	// Try targeted REQ first
 	req := syncproto.DiffForReqFromSegAd(n.Log, ad)
-	if len(req.Needs) == 0 {
+	if len(req.Needs) > 0 {
+		n.emit(EventSendReq, map[string]any{"needs": req.Needs})
+		if err := n.send(wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
+			n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
+		}
 		return
 	}
-	n.emit(EventSendReq, map[string]any{"needs": req.Needs})
+
+	// No local keys in differing segments → ask for the key lists.
+	// Figure out which SIDs differ from the ad.
+	diff := syncproto.ChangedSegments(n.Log, ad)
+	if len(diff) == 0 {
+		return
+	}
+
+	// Make a stable list (and optionally cap to avoid huge payloads)
+	sids := make([]segment.ID, 0, len(diff))
+	for sid := range diff {
+		sids = append(sids, sid)
+	}
+	slices.Sort(sids)
+	// Optional: cap top-N segments
+	if len(sids) > 64 {
+		sids = sids[:64]
+	}
+
+	n.emit(EventSendSegKeysReq, map[string]any{"sids": sids})
+	if err := n.send(wire.MT_SEG_KEYS_REQ, syncproto.EncodeSegKeysReq(syncproto.SegKeysReq{SIDs: sids})); err != nil {
+		n.emit(EventWarn, map[string]any{"msg": "send_segkeys_req_err", "err": err.Error()})
+	}
+}
+
+func (n *Node) onSegKeysReq(b []byte) {
+	req, err := syncproto.DecodeSegKeysReq(b)
+	if err != nil {
+		n.emit(EventWarn, map[string]any{"msg": "decode_segkeys_req_err", "err": err.Error()})
+		return
+	}
+	view := materialize.Snapshot(n.Log)
+	payload := syncproto.BuildSegKeys(view, req.SIDs)
+	enc := syncproto.EncodeSegKeys(payload)
+	n.emit(EventSendSegKeys, map[string]any{"items": len(payload.Items)})
+	if err := n.send(wire.MT_SEG_KEYS, enc); err != nil {
+		n.emit(EventWarn, map[string]any{"msg": "send_segkeys_err", "err": err.Error()})
+	}
+}
+
+func (n *Node) onSegKeys(b []byte) {
+	sk, err := syncproto.DecodeSegKeys(b)
+	if err != nil {
+		n.emit(EventWarn, map[string]any{"msg": "decode_segkeys_err", "err": err.Error()})
+		return
+	}
+	// Build Needs from local op counts
+	counts := n.Log.CountPerKey()
+	needs := make([]syncproto.Need, 0, 64)
+	for _, it := range sk.Items {
+		for _, p := range it.Pairs {
+			from := uint32(0)
+			if c, ok := counts[p.Key]; ok && c > 0 {
+				if c > int(^uint32(0)) {
+					from = ^uint32(0)
+				} else {
+					from = uint32(c)
+				}
+			}
+			needs = append(needs, syncproto.Need{Key: p.Key, From: from})
+		}
+	}
+	if len(needs) == 0 {
+		return
+	}
+	req := syncproto.Req{Needs: needs}
+	n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "seg_keys"})
 	if err := n.send(wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
 		n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
 	}
@@ -524,4 +611,16 @@ func maxDur(a, b time.Duration) time.Duration {
 		return a
 	}
 	return b
+}
+
+func countsEqual(a, b map[string]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
 }

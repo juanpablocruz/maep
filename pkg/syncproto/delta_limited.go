@@ -5,34 +5,50 @@ import (
 	"github.com/juanpablocruz/maep/pkg/oplog"
 )
 
-// BuildDeltaForLimited builds a delta like BuildDeltaFor, but trims it to maxBytes.
-// Returns (delta, truncated).
+// BuildDeltaForLimited builds a delta like BuildDeltaFor, but trims to maxBytes.
+// If the first pass yields zero ops (because Need.From >= local count),
+// it retries with From=0 for the same keys so convergence can proceed.
 func BuildDeltaForLimited(l *oplog.Log, req Req, maxBytes int) (Delta, bool) {
-	// Build the full delta using your existing logic (respects Need.From).
 	full := BuildDeltaFor(l, req)
 
-	// Accounting:
-	// - top-level entry count: 4 bytes
-	// - per-entry header: u16 keyLen + key + u32 opCount = 2 + len(key) + 4
-	// - per-op payload:  u16 + u8 + u64 + u64 + 16 + 32 + u32 + len(value) = 71 + len(value)
-	size := 4
+	totalOps := 0
+	for _, e := range full.Entries {
+		totalOps += len(e.Ops)
+	}
+
+	// Fallback: same counts but different histories → send full history for those keys.
+	if totalOps == 0 && len(req.Needs) > 0 {
+		req0 := Req{Needs: make([]Need, len(req.Needs))}
+		for i, n := range req.Needs {
+			req0.Needs[i] = Need{Key: n.Key, From: 0}
+		}
+		full = BuildDeltaFor(l, req0)
+		// recompute to see if we now have something
+		totalOps = 0
+		for _, e := range full.Entries {
+			totalOps += len(e.Ops)
+		}
+	}
+
+	// ---- trim to maxBytes ----
+	size := 4 // u32 entry count
 	var out []DeltaEntry
 	truncated := false
 
 	for _, e := range full.Entries {
-		entryOverhead := 2 + len(e.Key) + 4
+		entryOverhead := 2 + len(e.Key) + 4 // u16 keyLen + key + u32 opCount
 		addedHeader := false
 		ops := make([]model.Op, 0, len(e.Ops))
 
 		for _, op := range e.Ops {
-			opSize := 71 + len(op.Value)
+			opSize := 2 + 1 + 8 + 8 + 16 + 32 + 4 + len(op.Value) // 71 + len(value)
 			need := opSize
 			if !addedHeader {
 				need += entryOverhead
 			}
 			if size+need > maxBytes {
 				truncated = true
-				break // move to next entry
+				break
 			}
 			if !addedHeader {
 				size += entryOverhead
@@ -47,8 +63,7 @@ func BuildDeltaForLimited(l *oplog.Log, req Req, maxBytes int) (Delta, bool) {
 		}
 	}
 
-	// If nothing fit but we had something to send, force at least one op
-	// so the requester can make progress (assumes reasonable maxBytes).
+	// Last resort: force 1 op so the requester can progress (assumes sane maxBytes).
 	if len(out) == 0 && len(full.Entries) > 0 && len(full.Entries[0].Ops) > 0 {
 		out = []DeltaEntry{{Key: full.Entries[0].Key, Ops: full.Entries[0].Ops[:1]}}
 		truncated = true

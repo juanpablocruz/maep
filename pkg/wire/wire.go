@@ -18,6 +18,9 @@ const (
 	MT_PONG byte = 0x11
 
 	MT_SEG_AD byte = 0x12
+
+	MT_SEG_KEYS_REQ byte = 0x13
+	MT_SEG_KEYS     byte = 0x14
 )
 
 // Encode frame: | 1B type | 4B big-endian length | payload... |

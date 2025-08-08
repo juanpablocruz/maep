@@ -15,10 +15,12 @@ const (
 	EventConnChange   EventType = "conn_change"
 	EventPauseChange  EventType = "pause_change"
 
-	EventHB        EventType = "hb"
-	EventHealth    EventType = "health"
-	EventSync      EventType = "sync"
-	EventSendSegAd EventType = "send_segad"
+	EventHB             EventType = "hb"
+	EventHealth         EventType = "health"
+	EventSync           EventType = "sync"
+	EventSendSegAd      EventType = "send_segad"
+	EventSendSegKeysReq EventType = "send_segkeys_req"
+	EventSendSegKeys    EventType = "send_segkeys"
 )
 
 type Event struct {
