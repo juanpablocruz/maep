@@ -39,6 +39,11 @@ var (
 	flReord  = flag.Float64("reorder", 0.0, "reorder probability [0..1]")
 	flDelay  = flag.Duration("delay", 0, "base one-way delay")
 	flJitter = flag.Duration("jitter", 0, "jitter (+/-)")
+
+	flQuiesceLast = flag.Duration("quiesce-last", 10*time.Second, "stop writers this long before the end to measure convergence")
+
+	flFailurePeriod = flag.Duration("failure-period", 0, "mean time between random link failures (0=off)")
+	flRecoveryDelay = flag.Duration("recovery-delay", 5*time.Second, "time a failed link stays down before reconnect")
 )
 
 type simNode struct {
@@ -65,7 +70,7 @@ func main() {
 
 	// bring up endpoints
 	sns := make([]*simNode, *flNodes)
-	for i := 0; i < *flNodes; i++ {
+	for i := range *flNodes {
 		tcp, err := transport.ListenTCP(fmt.Sprintf("127.0.0.1:%d", *flBasePort+i))
 		if err != nil {
 			panic(err)
@@ -96,13 +101,13 @@ func main() {
 	}
 
 	// ring peers
-	for i := 0; i < *flNodes; i++ {
+	for i := range *flNodes {
 		next := (i + 1) % *flNodes
 		sns[i].PeerAddr = transport.MemAddr(fmt.Sprintf("127.0.0.1:%d", *flBasePort+next))
 	}
 
 	// actor ids
-	for i := 0; i < *flNodes; i++ {
+	for i := range *flNodes {
 		copy(sns[i].Actor[:], bytes.Repeat([]byte{byte(0xA0 + i)}, 16))
 	}
 
@@ -111,17 +116,14 @@ func main() {
 	var fwdWG sync.WaitGroup
 
 	// spawn nodes
-	for i := 0; i < *flNodes; i++ {
+	for i := range *flNodes {
 		n := node.New(sns[i].Name, sns[i].TCP, sns[i].PeerAddr, *flSyncInterval)
 		n.AttachHB(sns[i].UDP)
 		n.SetDeltaMaxBytes(*flDeltaChunk)
 		n.AttachEvents(make(chan node.Event, 1024))
 		// allow sim to tune HB/suspect
 		n.SetHeartbeatEvery(*flHeartbeat)
-		hbK := int((*flSuspectTO + *flHeartbeat - 1) / *flHeartbeat)
-		if hbK < 3 {
-			hbK = 3
-		}
+		hbK := max(int((*flSuspectTO+*flHeartbeat-1) / *flHeartbeat), 3)
 		n.SetSuspectThreshold(hbK)
 
 		sns[i].Node = n
@@ -153,13 +155,22 @@ func main() {
 	sns[0].Node.Put("A", []byte("v1"), sns[0].Actor)
 
 	// writers
+	writersCtx, stopWriters := context.WithCancel(ctx)
 	var wWG sync.WaitGroup
-	for i := 0; i < *flNodes; i++ {
+	for i := range *flNodes {
 		wWG.Add(1)
 		go func(s *simNode) {
 			defer wWG.Done()
-			writerLoop(ctx, s, *flWriteInterval)
+			writerLoop(writersCtx, s, *flWriteInterval)
 		}(sns[i])
+	}
+
+	if *flFailurePeriod > 0 && *flRecoveryDelay > 0 {
+		go flapLoop(ctx, sns, *flFailurePeriod, *flRecoveryDelay)
+	}
+
+	if *flQuiesceLast > 0 && *flDuration > *flQuiesceLast {
+		time.AfterFunc(*flDuration-*flQuiesceLast, stopWriters)
 	}
 
 	rootsCSV, roundsCSV, sumTxt, closeFiles := mustOpenCSVs(*flOutDir, *flNodes)
@@ -167,10 +178,12 @@ func main() {
 
 	// metrics
 	type syncState struct {
-		firstSync time.Time
-		roundBeg  map[string]time.Time
-		latencies []time.Duration
-		mu        sync.Mutex
+		firstSync   time.Time
+		roundBeg    map[string]time.Time
+		latencies   []time.Duration
+		convergedAt time.Time
+		sawUnequal  bool
+		mu          sync.Mutex
 	}
 	ss := &syncState{roundBeg: make(map[string]time.Time)}
 
@@ -207,6 +220,15 @@ func main() {
 					}
 					ss.mu.Unlock()
 				}
+				ss.mu.Lock()
+				// Track divergence then first global equality after first sync began
+				if !allEq && !ss.firstSync.IsZero() {
+					ss.sawUnequal = true
+				}
+				if allEq && !ss.firstSync.IsZero() && ss.sawUnequal && ss.convergedAt.IsZero() {
+					ss.convergedAt = time.Now()
+				}
+				ss.mu.Unlock()
 			case <-rootTickerCtx.Done():
 				return
 			}
@@ -262,6 +284,7 @@ func main() {
 	// shutdown
 	cancel()
 	rootCancel()
+	stopWriters()
 	evCancel()
 
 	// stop nodes/endpoints
@@ -285,6 +308,13 @@ func main() {
 	fmt.Fprintf(sumTxt, "Chaos: loss=%.2f dup=%.2f reorder=%.2f delay=%s jitter=%s\n",
 		*flLoss, *flDup, *flReord, flDelay.String(), flJitter.String())
 	fmt.Fprintf(sumTxt, "SyncLatency(s): mean=%.3f stdev=%.3f samples=%d\n", mean, stdev, len(ss.latencies))
+	ss.mu.Lock()
+	if !ss.firstSync.IsZero() && !ss.convergedAt.IsZero() {
+		fmt.Fprintf(sumTxt, "Convergence(s): %.3f\n", ss.convergedAt.Sub(ss.firstSync).Seconds())
+	} else {
+		fmt.Fprintf(sumTxt, "Convergence(s): n/a\n")
+	}
+	ss.mu.Unlock()
 }
 
 func writerLoop(ctx context.Context, s *simNode, mean time.Duration) {
@@ -300,6 +330,32 @@ func writerLoop(ctx context.Context, s *simNode, mean time.Duration) {
 			k := keys[rand.Intn(len(keys))]
 			v := fmt.Sprintf("v%d", rand.Intn(1000))
 			s.Node.Put(k, []byte(v), s.Actor)
+		}
+	}
+}
+
+// flapLoop periodically drops one ring link (i <-> i+1) then restores it.
+func flapLoop(ctx context.Context, sns []*simNode, meanPeriod, down time.Duration) {
+	if meanPeriod <= 0 || down <= 0 {
+		return
+	}
+	lambda := 1.0 / meanPeriod.Seconds()
+	n := len(sns)
+	for {
+		// next failure time ~ Exp(meanPeriod)
+		sleep := time.Duration(rand.ExpFloat64()/lambda*1e9) * time.Nanosecond
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(sleep):
+			i := rand.Intn(n)
+			j := (i + 1) % n
+			// simulate link down between i and j
+			sns[i].Node.SetConnected(false)
+			sns[j].Node.SetConnected(false)
+			time.Sleep(down)
+			sns[i].Node.SetConnected(true)
+			sns[j].Node.SetConnected(true)
 		}
 	}
 }

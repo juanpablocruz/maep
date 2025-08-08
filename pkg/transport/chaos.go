@@ -164,7 +164,11 @@ func (c *ChaosEP) SetBaseDelay(d time.Duration) {
 	c.cfgMu.Unlock()
 }
 func (c *ChaosEP) SetJitter(d time.Duration) { c.cfgMu.Lock(); c.cfg.Jitter = d; c.cfgMu.Unlock() }
-func (c *ChaosEP) GetConfig() ChaosConfig    { return c.getCfg() }
+func (c *ChaosEP) GetConfig() ChaosConfig {
+	cfg := c.getCfg()
+	cfg.Up = c.up.Load()
+	return cfg
+}
 
 func (c *ChaosEP) getCfg() ChaosConfig { c.cfgMu.RLock(); defer c.cfgMu.RUnlock(); return c.cfg }
 

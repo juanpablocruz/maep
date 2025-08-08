@@ -193,10 +193,11 @@ func (n *Node) summaryLoop() {
 	defer t.Stop()
 
 	var lastRoot [32]byte
+	var lastSent time.Time
 	backoff := n.backoffBase
 	nextAllowed := time.Now() // earliest time we may try to send
 
-	trySend := func() {
+	trySend := func(force bool) {
 		// guard: paused or link down
 		if n.paused.Load() || !n.conn.Load() || time.Now().Before(nextAllowed) {
 			return
@@ -210,8 +211,12 @@ func (n *Node) summaryLoop() {
 		}
 		root := merkle.Build(ls)
 
-		// only send if root changed
-		if bytes.Equal(root[:], lastRoot[:]) {
+		// Send if root changed OR we're doing a periodic refresh.
+		// Throttle: at most once per n.Ticker unless root changed.
+		if bytes.Equal(root[:], lastRoot[:]) && !force {
+			return
+		}
+		if !force && time.Since(lastSent) < n.Ticker {
 			return
 		}
 
@@ -245,6 +250,7 @@ func (n *Node) summaryLoop() {
 		backoff = n.backoffBase
 		nextAllowed = time.Now() // can send again any time root changes
 		lastRoot = root
+		lastSent = time.Now()
 	}
 
 	for {
@@ -253,7 +259,7 @@ func (n *Node) summaryLoop() {
 			return
 
 		case <-t.C:
-			trySend()
+			trySend(true)
 
 		case <-n.kickCh:
 			// debounce a burst of writes for ~50ms
@@ -270,7 +276,7 @@ func (n *Node) summaryLoop() {
 					return
 				}
 			}
-			trySend()
+			trySend(false)
 		}
 	}
 }
@@ -314,7 +320,7 @@ func (n *Node) sendHB(mt byte, payload []byte) error {
 		if !n.conn.Load() {
 			return fmt.Errorf("link down")
 		}
-		n.emit(EventWire, map[string]any{"proto": "udp", "dir": "->", "mt": int(mt), "len": len(enc)})
+		n.emit(EventWire, map[string]any{"proto": "udp", "dir": "->", "mt": int(mt), "bytes": len(enc)})
 		return n.HB.Send(n.Peer, enc)
 	}
 
