@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -925,21 +926,9 @@ func truncateSegList(sids []segment.ID, max int) string {
 }
 
 func parseFloat(s string) float64 {
-	f := 0.0
-	sign := 1.0
-	if strings.HasPrefix(s, "-") {
-		sign = -1
-		s = s[1:]
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0
 	}
-	for _, r := range s {
-		if r == '.' {
-			break
-		} // keep it simple; you can use strconv if you prefer
-		if r >= '0' && r <= '9' {
-			f = f*10 + float64(r-'0')
-		} else {
-			break
-		}
-	}
-	return f * sign
+	return f
 }

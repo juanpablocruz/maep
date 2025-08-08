@@ -58,7 +58,7 @@ func WrapChaos(under EndpointIF, cfg ChaosConfig) *ChaosEP {
 		cfg:   cfg,
 		rng:   rand.New(rand.NewSource(cfg.Seed)),
 	}
-	cep.up.Store(cfg.Up || true)
+	cep.up.Store(cfg.Up)
 
 	cep.ctx, cep.cancel = context.WithCancel(context.Background())
 	cep.wg.Add(1)
@@ -94,21 +94,23 @@ func (c *ChaosEP) Send(to MemAddr, frame []byte) error {
 		return nil
 	}
 
-	deliver := func(copy []byte, extraDelay time.Duration) {
+	deliver := func(copy []byte, extraDelay time.Duration) error {
 		delay := c.delayWithJitter(cfg) + extraDelay
 		if delay <= 0 {
-			_ = c.under.Send(to, copy)
-			return
+			return c.under.Send(to, copy)
 		}
 		time.AfterFunc(delay, func() { _ = c.under.Send(to, copy) })
+		return nil
 	}
 
 	// Normal send
-	deliver(clone(frame), 0)
+	if err := deliver(clone(frame), 0); err != nil {
+		return err
+	}
 
 	// Dup?
 	if c.roll() < cfg.Dup {
-		deliver(clone(frame), c.delayWithJitter(cfg))
+		_ = deliver(clone(frame), c.delayWithJitter(cfg))
 	}
 	return nil
 }
@@ -120,11 +122,10 @@ func (c *ChaosEP) pumpRecv() {
 		if !ok {
 			return
 		}
-		cfg := c.getCfg()
-		// Drop?
-		if c.roll() < cfg.Loss || !c.up.Load() {
+		if !c.up.Load() {
 			continue
 		}
+		cfg := c.getCfg()
 
 		extra := time.Duration(0)
 		// Reorder → add extra random delay
@@ -164,7 +165,11 @@ func (c *ChaosEP) SetBaseDelay(d time.Duration) {
 	c.cfgMu.Unlock()
 }
 func (c *ChaosEP) SetJitter(d time.Duration) { c.cfgMu.Lock(); c.cfg.Jitter = d; c.cfgMu.Unlock() }
-func (c *ChaosEP) GetConfig() ChaosConfig    { return c.getCfg() }
+func (c *ChaosEP) GetConfig() ChaosConfig {
+	cfg := c.getCfg()
+	cfg.Up = c.up.Load()
+	return cfg
+}
 
 func (c *ChaosEP) getCfg() ChaosConfig { c.cfgMu.RLock(); defer c.cfgMu.RUnlock(); return c.cfg }
 
