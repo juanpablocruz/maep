@@ -57,39 +57,51 @@ const (
 	clrGray    = "\x1b[90m"
 )
 
+type chaosPair struct{ tcp, udp *transport.ChaosEP }
+
 func main() {
 	// Transport & nodes
 	// sw := transport.NewSwitch()
 	// epA, _ := sw.Listen("A")
 	// epB, _ := sw.Listen("B")
 
-	epATCP, err := transport.ListenTCP("127.0.0.1:9001")
+	epATCPraw, err := transport.ListenTCP("127.0.0.1:9001")
 	if err != nil {
 		panic(err)
 	}
-	epBTCP, err := transport.ListenTCP("127.0.0.1:9002")
+	epBTCPraw, err := transport.ListenTCP("127.0.0.1:9002")
 	if err != nil {
 		panic(err)
 	}
-	epAUDP, err := transport.ListenUDP("127.0.0.1:9001")
+	epAUDPraw, err := transport.ListenUDP("127.0.0.1:9001")
 	if err != nil {
 		panic(err)
 	}
-	epBUDP, err := transport.ListenUDP("127.0.0.1:9002")
+	epBUDPraw, err := transport.ListenUDP("127.0.0.1:9002")
 	if err != nil {
 		panic(err)
 	}
 
-	nA := node.New("A", epATCP, transport.MemAddr("127.0.0.1:9002"), 500*time.Millisecond)
-	nB := node.New("B", epBTCP, transport.MemAddr("127.0.0.1:9001"), 500*time.Millisecond)
+	chaosA_TCP := transport.WrapChaos(epATCPraw, transport.ChaosConfig{Up: true})
+	chaosB_TCP := transport.WrapChaos(epBTCPraw, transport.ChaosConfig{Up: true})
+	chaosA_UDP := transport.WrapChaos(epAUDPraw, transport.ChaosConfig{Up: true})
+	chaosB_UDP := transport.WrapChaos(epBUDPraw, transport.ChaosConfig{Up: true})
 
-	defer epATCP.Close()
-	defer epBTCP.Close()
-	defer epAUDP.Close()
-	defer epBUDP.Close()
+	nA := node.New("A", chaosA_TCP, transport.MemAddr("127.0.0.1:9002"), 500*time.Millisecond)
+	nB := node.New("B", chaosB_TCP, transport.MemAddr("127.0.0.1:9001"), 500*time.Millisecond)
 
-	nA.AttachHB(epAUDP)
-	nB.AttachHB(epBUDP)
+	nA.AttachHB(chaosA_UDP)
+	nB.AttachHB(chaosB_UDP)
+
+	defer chaosA_TCP.Close()
+	defer chaosB_TCP.Close()
+	defer chaosA_UDP.Close()
+	defer chaosB_UDP.Close()
+
+	nets := map[string]chaosPair{
+		"a": {tcp: chaosA_TCP, udp: chaosA_UDP},
+		"b": {tcp: chaosB_TCP, udp: chaosB_UDP},
+	}
 
 	// Events
 	evCh := make(chan node.Event, 256)
@@ -164,7 +176,7 @@ func main() {
 			render(nA, nB, events, wireLog, input)
 		case line := <-cmdCh:
 			input = ""
-			if handleCmd(strings.TrimSpace(line), nA, nB, actA, actB, &events) {
+			if handleCmd(strings.TrimSpace(line), nA, nB, actA, actB, &events, nets) {
 				return
 			}
 		case <-quitCh:
@@ -177,7 +189,7 @@ func main() {
 
 // -------- Commands --------
 
-func handleCmd(line string, nA, nB *node.Node, actA, actB model.ActorID, events *[]node.Event) bool {
+func handleCmd(line string, nA, nB *node.Node, actA, actB model.ActorID, events *[]node.Event, nets map[string]chaosPair) bool {
 	if line == "" {
 		return false
 	}
@@ -275,6 +287,104 @@ func handleCmd(line string, nA, nB *node.Node, actA, actB model.ActorID, events 
 			} else {
 				nA.Put(k, []byte(v), actA)
 			}
+		}
+	case "net":
+		// net <a|b> <path> <param> <value...>
+		// path: tcp|udp|both
+		// params:
+		//   loss <p>           (0..1)
+		//   dup <p>            (0..1)
+		//   reorder <p>        (0..1)
+		//   delay <base> [jit] (e.g. 80ms 20ms)
+		//   up|down
+		if len(parts) < 3 {
+			emit("usage: net <a|b> <tcp|udp|both> <loss|dup|reorder|delay|up|down> [args]")
+			return false
+		}
+		nodeSel := strings.ToLower(parts[1])
+		path := strings.ToLower(parts[2])
+		cp, ok := nets[nodeSel]
+		if !ok {
+			emit("unknown node (a|b)")
+			return false
+		}
+		targets := []*transport.ChaosEP{}
+		switch path {
+		case "tcp":
+			targets = []*transport.ChaosEP{cp.tcp}
+		case "udp":
+			targets = []*transport.ChaosEP{cp.udp}
+		case "both":
+			targets = []*transport.ChaosEP{cp.tcp, cp.udp}
+		default:
+			emit("path must be tcp|udp|both")
+			return false
+		}
+		if len(parts) < 4 {
+			emit("missing param")
+			return false
+		}
+		param := strings.ToLower(parts[3])
+
+		setAll := func(fn func(*transport.ChaosEP)) {
+			for _, t := range targets {
+				fn(t)
+			}
+		}
+
+		switch param {
+		case "up":
+			setAll(func(t *transport.ChaosEP) { t.SetUp(true) })
+			emit("net link up")
+		case "down":
+			setAll(func(t *transport.ChaosEP) { t.SetUp(false) })
+			emit("net link down")
+		case "loss":
+			if len(parts) < 5 {
+				emit("usage: net <n> <p> loss <0..1>")
+				return false
+			}
+			p := parseFloat(parts[4])
+			setAll(func(t *transport.ChaosEP) { t.SetLoss(p) })
+			emit(fmt.Sprintf("loss=%.2f", p))
+		case "dup":
+			if len(parts) < 5 {
+				emit("usage: net <n> <p> dup <0..1>")
+				return false
+			}
+			p := parseFloat(parts[4])
+			setAll(func(t *transport.ChaosEP) { t.SetDup(p) })
+			emit(fmt.Sprintf("dup=%.2f", p))
+		case "reorder":
+			if len(parts) < 5 {
+				emit("usage: net <n> <p> reorder <0..1>")
+				return false
+			}
+			p := parseFloat(parts[4])
+			setAll(func(t *transport.ChaosEP) { t.SetReorder(p) })
+			emit(fmt.Sprintf("reorder=%.2f", p))
+		case "delay":
+			if len(parts) < 5 {
+				emit("usage: net <n> <p> delay <base> [jitter]")
+				return false
+			}
+			base, err1 := time.ParseDuration(parts[4])
+			jit := time.Duration(0)
+			var err2 error
+			if len(parts) >= 6 {
+				jit, err2 = time.ParseDuration(parts[5])
+			}
+			if err1 != nil || (len(parts) >= 6 && err2 != nil) {
+				emit("bad duration (e.g. 80ms 20ms)")
+				return false
+			}
+			setAll(func(t *transport.ChaosEP) {
+				t.SetBaseDelay(base)
+				t.SetJitter(jit)
+			})
+			emit(fmt.Sprintf("delay base=%s jitter=%s", base, jit))
+		default:
+			emit("unknown net param")
 		}
 	default:
 		emit("unknown: " + line)
@@ -532,9 +642,10 @@ func formatWire(ev []node.Event) []string {
 			line = clrGray + line + clrReset
 		}
 
-		if proto == "udp" {
+		switch proto {
+		case "udp":
 			line = colorize(line, clrBlue)
-		} else if proto == "tcp" {
+		case "tcp":
 			line = colorize(line, clrCyan)
 		}
 		out = append(out, line)
@@ -811,4 +922,24 @@ func truncateSegList(sids []segment.ID, max int) string {
 	head := make([]segment.ID, len(sids[:max]))
 	copy(head, sids[:max])
 	return fmt.Sprintf("(%v … +%d)", head, len(sids)-max)
+}
+
+func parseFloat(s string) float64 {
+	f := 0.0
+	sign := 1.0
+	if strings.HasPrefix(s, "-") {
+		sign = -1
+		s = s[1:]
+	}
+	for _, r := range s {
+		if r == '.' {
+			break
+		} // keep it simple; you can use strconv if you prefer
+		if r >= '0' && r <= '9' {
+			f = f*10 + float64(r-'0')
+		} else {
+			break
+		}
+	}
+	return f * sign
 }
