@@ -34,6 +34,7 @@ type Node struct {
 	Name   string
 	Peer   transport.MemAddr
 	EP     transport.EndpointIF
+	HB     transport.EndpointIF
 	Log    *oplog.Log
 	Clock  *hlc.Clock
 	Ticker time.Duration
@@ -87,10 +88,15 @@ func New(name string, ep transport.EndpointIF, peer transport.MemAddr, tickEvery
 	return n
 }
 
+func (n *Node) AttachHB(ep transport.EndpointIF) { n.HB = ep }
+
 func (n *Node) AttachEvents(ch chan Event) { n.Events = ch }
 
 func (n *Node) Start() {
 	go n.recvLoop()
+	if n.HB != nil {
+		go n.recvHBLoop()
+	}
 	go n.summaryLoop()
 	go n.heartbeatLoop()
 }
@@ -144,6 +150,32 @@ func (n *Node) Delete(key string, actor model.ActorID) {
 	slog.Info("del", "node", n.Name, "key", key, "hlc", op.HLCTicks)
 	n.emit(EventDel, map[string]any{"key": key, "hlc": op.HLCTicks})
 	n.kick()
+}
+
+func (n *Node) recvHBLoop() {
+	for {
+		frame, ok := n.HB.Recv(n.ctx)
+		if !ok {
+			return
+		}
+		mt, _, err := wire.Decode(frame)
+		if err != nil {
+			n.emit(EventWarn, map[string]any{"msg": "wire_decode_err_hb", "err": err.Error()})
+			continue
+		}
+		switch mt {
+		case wire.MT_PING:
+			n.emit(EventHB, map[string]any{"dir": "<-udp"})
+			if err := n.sendHB(wire.MT_PONG, nil); err != nil {
+				n.emit(EventWarn, map[string]any{"msg": "send_pong_err_udp", "err": err.Error()})
+			}
+		case wire.MT_PONG:
+			n.emit(EventHB, map[string]any{"dir": "<-udp"})
+			n.onPong()
+		default:
+			// Ignore non-HB messages on UDP path for now.
+		}
+	}
 }
 
 func (n *Node) summaryLoop() {
@@ -264,6 +296,16 @@ func genSessionID() uint64 {
 		return uint64(time.Now().UnixNano())
 	}
 	return binary.BigEndian.Uint64(b[:])
+}
+
+func (n *Node) sendHB(mt byte, payload []byte) error {
+	if n.HB != nil {
+		if !n.conn.Load() {
+			return fmt.Errorf("link down")
+		}
+		return n.HB.Send(n.Peer, wire.Encode(mt, payload))
+	}
+	return n.send(mt, payload)
 }
 
 func (n *Node) send(mt byte, payload []byte) error {
@@ -470,11 +512,11 @@ func (n *Node) heartbeatLoop() {
 			}
 
 			if err := n.send(wire.MT_PING, nil); err != nil {
-				n.emit(EventHB, map[string]any{"dir": "->", "err": err.Error()})
+				n.emit(EventHB, map[string]any{"dir": "->udp", "err": err.Error()})
 				n.onMiss()
 				continue
 			}
-			n.emit(EventHB, map[string]any{"dir": "->"})
+			n.emit(EventHB, map[string]any{"dir": "->udp"})
 			n.onMiss()
 		}
 	}

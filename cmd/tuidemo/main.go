@@ -62,15 +62,23 @@ func main() {
 	// epA, _ := sw.Listen("A")
 	// epB, _ := sw.Listen("B")
 
-	epA, _ := transport.ListenTCP("127.0.0.1:9001")
-	epB, _ := transport.ListenTCP("127.0.0.1:9002")
-	defer epA.Close()
-	defer epB.Close()
+	epATCP, _ := transport.ListenTCP("127.0.0.1:9001")
+	epBTCP, _ := transport.ListenTCP("127.0.0.1:9002")
+	epAUDP, _ := transport.ListenUDP("127.0.0.1:9001")
+	epBUDP, _ := transport.ListenUDP("127.0.0.1:9002")
+
+	nA := node.New("A", epATCP, transport.MemAddr("127.0.0.1:9002"), 500*time.Millisecond)
+	nB := node.New("B", epBTCP, transport.MemAddr("127.0.0.1:9001"), 500*time.Millisecond)
+	defer epATCP.Close()
+	defer epBTCP.Close()
+	defer epAUDP.Close()
+	defer epBUDP.Close()
+
+	nA.AttachHB(epAUDP)
+	nB.AttachHB(epBUDP)
 
 	// nA := node.New("A", epA, "B", 500*time.Millisecond)
 	// nB := node.New("B", epB, "A", 500*time.Millisecond)
-	nA := node.New("A", epA, transport.MemAddr("127.0.0.1:9002"), 500*time.Millisecond)
-	nB := node.New("B", epB, transport.MemAddr("127.0.0.1:9001"), 500*time.Millisecond)
 
 	// Events
 	evCh := make(chan node.Event, 256)
