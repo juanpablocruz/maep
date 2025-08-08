@@ -41,6 +41,10 @@ type Node struct {
 
 	DeltaMaxBytes int
 
+	kickCh      chan struct{}
+	backoffBase time.Duration
+	backoffMax  time.Duration
+
 	conn   atomic.Bool
 	paused atomic.Bool
 
@@ -68,7 +72,10 @@ func New(name string, ep *transport.Endpoint, peer transport.MemAddr, tickEvery 
 		Log:           oplog.New(),
 		Clock:         hlc.New(),
 		Ticker:        tickEvery,
-		DeltaMaxBytes: 32,
+		DeltaMaxBytes: 32 * 1024,
+		kickCh:        make(chan struct{}, 1),
+		backoffBase:   500 * time.Millisecond,
+		backoffMax:    5 * time.Second,
 		hbEvery:       350 * time.Millisecond,
 		hbMissK:       6,
 		ctx:           ctx, cancel: cancel,
@@ -120,6 +127,7 @@ func (n *Node) Put(key string, val []byte, actor model.ActorID) {
 	n.Log.Append(op)
 	slog.Info("put", "node", n.Name, "key", key, "val", string(val), "hlc", op.HLCTicks)
 	n.emit(EventPut, map[string]any{"key": key, "val": string(val), "hlc": op.HLCTicks})
+	n.kick()
 }
 
 func (n *Node) Delete(key string, actor model.ActorID) {
@@ -134,58 +142,92 @@ func (n *Node) Delete(key string, actor model.ActorID) {
 	n.Log.Append(op)
 	slog.Info("del", "node", n.Name, "key", key, "hlc", op.HLCTicks)
 	n.emit(EventDel, map[string]any{"key": key, "hlc": op.HLCTicks})
+	n.kick()
 }
 
 func (n *Node) summaryLoop() {
 	t := time.NewTicker(n.Ticker)
 	defer t.Stop()
+
 	var lastRoot [32]byte
+	backoff := n.backoffBase
+	nextAllowed := time.Now() // earliest time we may try to send
+
+	trySend := func() {
+		// guard: paused or link down
+		if n.paused.Load() || !n.conn.Load() || time.Now().Before(nextAllowed) {
+			return
+		}
+
+		sum := syncproto.BuildSummaryFromLog(n.Log)
+		// compute root
+		ls := make([]merkle.Leaf, 0, len(sum.Leaves))
+		for _, lf := range sum.Leaves {
+			ls = append(ls, merkle.Leaf{Key: lf.Key, Hash: lf.Hash})
+		}
+		root := merkle.Build(ls)
+
+		// only send if root changed
+		if bytes.Equal(root[:], lastRoot[:]) {
+			return
+		}
+
+		n.beginSession()
+
+		// (A) best-effort SEG_AD (doesn't affect backoff timer)
+		ad := syncproto.BuildSegAdFromLog(n.Log)
+		encAd := syncproto.EncodeSegAd(ad)
+		n.emit(EventSendSegAd, map[string]any{"items": len(ad.Items)})
+		if err := n.send(wire.MT_SEG_AD, encAd); err != nil {
+			slog.Warn("send_segad_err", "node", n.Name, "err", err)
+			n.emit(EventWarn, map[string]any{"msg": "send_segad_err", "err": err.Error()})
+			// keep going; SUMMARY is the driver
+		}
+
+		// (B) full SUMMARY drives REQ/DELTA
+		slog.Info("send_summary", "node", n.Name, "peer", n.Peer, "leaves", len(sum.Leaves))
+		n.emit(EventSendSummary, map[string]any{
+			"peer": n.Peer, "leaves": len(sum.Leaves), "root": fmt.Sprintf("%x", root[:8]),
+		})
+		if err := n.send(wire.MT_SYNC_SUMMARY, syncproto.EncodeSummary(sum)); err != nil {
+			// backoff with jitter on failure
+			slog.Warn("send_summary_err", "node", n.Name, "err", err)
+			n.emit(EventWarn, map[string]any{"msg": "send_summary_err", "err": err.Error()})
+			backoff = minDur(n.backoffMax, maxDur(n.backoffBase, backoff*2))
+			nextAllowed = time.Now().Add(jitter(backoff))
+			return
+		}
+
+		// success → reset backoff and advance root
+		backoff = n.backoffBase
+		nextAllowed = time.Now() // can send again any time root changes
+		lastRoot = root
+	}
 
 	for {
 		select {
 		case <-n.ctx.Done():
 			return
+
 		case <-t.C:
-			// Build full summary & root
-			sum := syncproto.BuildSummaryFromLog(n.Log)
-			ls := make([]merkle.Leaf, 0, len(sum.Leaves))
-			for _, lf := range sum.Leaves {
-				ls = append(ls, merkle.Leaf{Key: lf.Key, Hash: lf.Hash})
+			trySend()
+
+		case <-n.kickCh:
+			// debounce a burst of writes for ~50ms
+			debounce := time.NewTimer(50 * time.Millisecond)
+		drain:
+			for {
+				select {
+				case <-n.kickCh:
+					// keep draining while timer runs
+				case <-debounce.C:
+					break drain
+				case <-n.ctx.Done():
+					debounce.Stop()
+					return
+				}
 			}
-			root := merkle.Build(ls)
-
-			// Only (re)advertise when our root changed and we're allowed to talk
-			if bytes.Equal(root[:], lastRoot[:]) || n.paused.Load() || !n.conn.Load() {
-				continue
-			}
-
-			n.beginSession()
-
-			// (A) Best-effort: segment advertisement
-			ad := syncproto.BuildSegAdFromLog(n.Log)
-			encAd := syncproto.EncodeSegAd(ad)
-			n.emit(EventSendSegAd, map[string]any{"items": len(ad.Items)})
-			if err := n.send(wire.MT_SEG_AD, encAd); err != nil {
-				slog.Warn("send_segad_err", "node", n.Name, "err", err)
-				n.emit(EventWarn, map[string]any{"msg": "send_segad_err", "err": err.Error()})
-				// do not return; still try SUMMARY
-			}
-
-			// (B) Driver: full summary
-			slog.Info("send_summary", "node", n.Name, "peer", n.Peer, "leaves", len(sum.Leaves))
-			n.emit(EventSendSummary, map[string]any{
-				"peer": n.Peer, "leaves": len(sum.Leaves),
-				"root": fmt.Sprintf("%x", root[:8]),
-			})
-			if err := n.send(wire.MT_SYNC_SUMMARY, syncproto.EncodeSummary(sum)); err != nil {
-				slog.Warn("send_summary_err", "node", n.Name, "err", err)
-				n.emit(EventWarn, map[string]any{"msg": "send_summary_err", "err": err.Error()})
-				// Don't advance lastRoot; we'll retry next tick
-				continue
-			}
-
-			// Advance only after a successful SUMMARY send
-			lastRoot = root
+			trySend()
 		}
 	}
 }
@@ -457,4 +499,29 @@ func (n *Node) onSegAd(b []byte) {
 	if err := n.send(wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
 		n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
 	}
+}
+
+func (n *Node) kick() {
+	select {
+	case n.kickCh <- struct{}{}:
+	default:
+	} // collapse bursts
+}
+
+func jitter(d time.Duration) time.Duration {
+	n := time.Now().UnixNano()
+	frac := 0.8 + float64(n%400)/1000.0 // 0.8..1.199
+	return time.Duration(float64(d) * frac)
+}
+func minDur(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+func maxDur(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
 }
