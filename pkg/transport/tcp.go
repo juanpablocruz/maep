@@ -172,11 +172,26 @@ func (e *TCPEndpoint) acceptLoop() {
 }
 
 func (e *TCPEndpoint) handleConn(c net.Conn) {
-	defer c.Close()
-	r := bufio.NewReader(c)
 	peer := MemAddr(c.RemoteAddr().String())
+	p := &tcpPeer{addr: peer, c: c, r: bufio.NewReader(c)}
+
+	// make this inbound conn replyable
+	e.mu.Lock()
+	e.conns[peer] = p
+	e.mu.Unlock()
+
+	defer func() {
+		// remove only if still the same pointer
+		e.mu.Lock()
+		if cur, ok := e.conns[peer]; ok && cur == p {
+			delete(e.conns, peer)
+		}
+		e.mu.Unlock()
+		_ = c.Close()
+	}()
+
 	for {
-		b, err := readFrame(r)
+		b, err := readFrame(p.r)
 		if err != nil {
 			return
 		}
