@@ -19,7 +19,7 @@ func (c *Clock) Now() uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	wall := time.Now().UnixNano()
+	wall := time.Now().UnixNano() >> 16
 	switch {
 	case wall < c.lastWall:
 		c.logical++
