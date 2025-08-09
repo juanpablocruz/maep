@@ -488,9 +488,11 @@ func (n *Node) onReq(from transport.MemAddr, b []byte) {
 	n.sessMu.Lock()
 	n.sess.sndNext = 0
 	n.sess.sndInflight = []syncproto.DeltaChunk{chunks[0]}
+	ackCh := n.sess.ackCh
+	sessCtx := n.sess.ctx
 	n.sessMu.Unlock()
 
-	go n.streamChunks(from, chunks)
+	go n.streamChunks(from, chunks, ackCh, sessCtx)
 }
 
 func (n *Node) onDelta(from transport.MemAddr, b []byte) {
@@ -872,13 +874,13 @@ func (n *Node) onAck(_ transport.MemAddr, b []byte) {
 
 }
 
-func (n *Node) streamChunks(to transport.MemAddr, chunks []syncproto.DeltaChunk) {
-	n.sessMu.Lock()
-	ackCh := n.sess.ackCh
-	sessCtx := n.sess.ctx
+func (n *Node) streamChunks(to transport.MemAddr, chunks []syncproto.DeltaChunk, ackCh chan uint32, sessCtx context.Context) {
 	window := n.DeltaWindowChunks
 	timeout := n.RetransTimeout
-	n.sessMu.Unlock()
+	if sessCtx == nil || ackCh == nil {
+		n.emit(EventWarn, map[string]any{"msg": "stream_chunks_no_session"})
+		return
+	}
 	if window < 1 {
 		window = 1
 	}

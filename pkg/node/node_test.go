@@ -3,6 +3,10 @@ package node
 import (
 	"testing"
 	"time"
+
+	"github.com/juanpablocruz/maep/pkg/hlc"
+	"github.com/juanpablocruz/maep/pkg/model"
+	"github.com/juanpablocruz/maep/pkg/oplog"
 )
 
 func TestCountsEqual(t *testing.T) {
@@ -135,5 +139,46 @@ func TestOnMissAndOnPong(t *testing.T) {
 	}
 	if n.misses.Load() != 0 {
 		t.Fatalf("misses not reset")
+	}
+}
+
+func TestPutAndDelete(t *testing.T) {
+	ch := make(chan Event, 10)
+	n := &Node{Events: ch, Log: oplog.New(), Clock: hlc.New(), kickCh: make(chan struct{}, 1)}
+	var actor model.ActorID
+	actor[0] = 1
+	n.Put("k", []byte("v"), actor)
+	snap := n.Log.Snapshot()
+	ops := snap["k"]
+	if len(ops) != 1 || ops[0].Kind != model.OpKindPut || string(ops[0].Value) != "v" {
+		t.Fatalf("put not appended: %#v", ops)
+	}
+	select {
+	case ev := <-ch:
+		if ev.Type != EventPut || ev.Fields["key"] != "k" || ev.Fields["val"] != "v" {
+			t.Fatalf("unexpected put event: %+v", ev)
+		}
+	default:
+		t.Fatalf("missing put event")
+	}
+	if len(n.kickCh) != 1 {
+		t.Fatalf("kick not triggered on put")
+	}
+
+	ch = make(chan Event, 10)
+	n.Events = ch
+	n.Delete("k2", actor)
+	snap = n.Log.Snapshot()
+	ops = snap["k2"]
+	if len(ops) != 1 || ops[0].Kind != model.OpKindDel {
+		t.Fatalf("del not appended: %#v", ops)
+	}
+	select {
+	case ev := <-ch:
+		if ev.Type != EventDel || ev.Fields["key"] != "k2" {
+			t.Fatalf("unexpected del event: %+v", ev)
+		}
+	default:
+		t.Fatalf("missing del event")
 	}
 }
