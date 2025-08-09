@@ -3,6 +3,7 @@ package syncproto
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -326,22 +327,36 @@ func EncodeDeltaChunk(c DeltaChunk) []byte {
 			putBytes(&b, op.Value)
 		}
 	}
-	return b.Bytes()
+
+	sum := sha256.Sum256(b.Bytes())
+	var out bytes.Buffer
+	out.Write(b.Bytes())
+	out.Write(sum[:])
+
+	return out.Bytes()
 }
 
 func DecodeDeltaChunk(p []byte) (DeltaChunk, error) {
-	r := bytes.NewReader(p)
+	if len(p) < 32 {
+		return DeltaChunk{}, errors.New("delta chunk too short for hash")
+	}
+
+	payload := p[:len(p)-32]
+	var got [32]byte
+	copy(got[:], p[len(p)-32:])
+
+	r := bytes.NewReader(payload)
 	seq, err := getU32(r)
 	if err != nil {
 		return DeltaChunk{}, err
 	}
 	lastb, err := r.ReadByte()
 	if err != nil {
-		return DeltaChunk{}, err
+		return DeltaChunk{Seq: seq}, err
 	}
 	nEnt, err := getU32(r)
 	if err != nil {
-		return DeltaChunk{}, err
+		return DeltaChunk{Seq: seq}, err
 	}
 	ents := make([]DeltaEntry, 0, nEnt)
 	for range int(nEnt) {
@@ -387,7 +402,7 @@ func DecodeDeltaChunk(p []byte) (DeltaChunk, error) {
 			}
 			val, err := getBytes(r)
 			if err != nil {
-				return DeltaChunk{}, err
+				return DeltaChunk{Seq: seq}, err
 			}
 			op.Key = string(kb)
 			op.Value = val
@@ -398,7 +413,14 @@ func DecodeDeltaChunk(p []byte) (DeltaChunk, error) {
 	if r.Len() != 0 {
 		dbg("decode_delta_chunk_trailing", "bytes", r.Len())
 	}
-	return DeltaChunk{Seq: seq, Last: lastb == 1, Entries: ents}, nil
+
+	c := DeltaChunk{Seq: seq, Last: lastb == 1, Entries: ents}
+	want := sha256.Sum256(payload)
+	c.Hash = got
+	if got != want {
+		return c, errors.New("bad chunk hash")
+	}
+	return c, nil
 }
 
 // --- Ack ---
@@ -432,4 +454,25 @@ func DecodeRoot(b []byte) (Root, error) {
 	var r Root
 	copy(r.Hash[:], b[:32])
 	return r, nil
+}
+
+func EncodeDeltaNack(n DeltaNack) []byte {
+	var buf bytes.Buffer
+	_ = binary.Write(&buf, binary.BigEndian, n.Seq)
+	buf.WriteByte(n.Code)
+	return buf.Bytes()
+}
+
+func DecodeDeltaNack(b []byte) (DeltaNack, error) {
+	if len(b) < 5 {
+		return DeltaNack{}, errors.New("short nack")
+	}
+	n := DeltaNack{
+		Seq:  binary.BigEndian.Uint32(b[:4]),
+		Code: b[4],
+	}
+	if len(b) != 5 {
+		return DeltaNack{}, errors.New("trailing bytes in nack")
+	}
+	return n, nil
 }

@@ -40,6 +40,7 @@ func DecodeDescentReq(b []byte) (DescentReq, error) {
 		return DescentReq{}, errors.New("short descent req")
 	}
 	plen := int(binary.BigEndian.Uint16(b[:2]))
+
 	if len(b) < 2+plen {
 		return DescentReq{}, errors.New("short descent req prefix")
 	}

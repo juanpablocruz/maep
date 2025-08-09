@@ -418,6 +418,8 @@ func (n *Node) recvLoop() {
 			n.onDescentReq(from, payload)
 		case wire.MT_DESCENT_RESP:
 			n.onDescentResp(from, payload)
+		case wire.MT_DELTA_NACK:
+			n.onDeltaNack(from, payload)
 		default:
 			slog.Warn("unknown_msg", "node", n.Name, "mt", mt)
 			n.emit(EventWarn, map[string]any{"msg": "unknown_msg", "mt": mt})
@@ -767,6 +769,14 @@ func (n *Node) chunkDelta(d syncproto.Delta, maxBytes int) []syncproto.DeltaChun
 func (n *Node) onDeltaChunk(from transport.MemAddr, b []byte) {
 	ch, err := syncproto.DecodeDeltaChunk(b)
 	if err != nil {
+		// If decoder populated Seq (bad hash case), NACK it.
+		if ch.Seq != 0 {
+			_ = n.sendTo(from, wire.MT_DELTA_NACK, syncproto.EncodeDeltaNack(syncproto.DeltaNack{
+				Seq:  ch.Seq,
+				Code: 0, // 0 = bad_hash
+			}))
+			n.emit(EventAck, map[string]any{"dir": "send", "nack": true, "seq": ch.Seq, "reason": "bad_hash"})
+		}
 		n.emit(EventWarn, map[string]any{"msg": "decode_delta_chunk_err", "err": err.Error()})
 		return
 	}
@@ -776,14 +786,33 @@ func (n *Node) onDeltaChunk(from transport.MemAddr, b []byte) {
 	n.sessMu.Unlock()
 
 	n.emit(EventRecvDeltaChunk, map[string]any{
-		"seq": ch.Seq, "last": ch.Last, "entries": len(ch.Entries), "expect": expect,
+		"seq": ch.Seq, "last": ch.Last, "entries": len(ch.Entries), "expect": expect, "hash_ok": true,
 	})
 
 	// Reject anything not exactly the next expected chunk.
 	if ch.Seq != expect {
-		if expect > 0 {
-			_ = n.sendTo(from, wire.MT_SYNC_ACK, syncproto.EncodeAck(syncproto.Ack{Seq: expect - 1}))
-			n.emit(EventAck, map[string]any{"dir": "send", "seq": expect - 1, "reason": "out_of_order", "got": ch.Seq})
+		if ch.Seq < expect {
+			// Duplicate/late: ACK previous-in-order to hint resync; also NACK duplicate.
+			if expect > 0 {
+				_ = n.sendTo(from, wire.MT_SYNC_ACK, syncproto.EncodeAck(syncproto.Ack{Seq: expect - 1}))
+				n.emit(EventAck, map[string]any{"dir": "send", "seq": expect - 1, "reason": "duplicate"})
+			}
+			_ = n.sendTo(from, wire.MT_DELTA_NACK, syncproto.EncodeDeltaNack(syncproto.DeltaNack{
+				Seq:  ch.Seq,
+				Code: 2, // 2 = duplicate
+			}))
+			n.emit(EventAck, map[string]any{"dir": "send", "nack": true, "seq": ch.Seq, "reason": "duplicate"})
+		} else { // ch.Seq > expect
+			// Out-of-window/skip: ACK last in-order and NACK the future chunk.
+			if expect > 0 {
+				_ = n.sendTo(from, wire.MT_SYNC_ACK, syncproto.EncodeAck(syncproto.Ack{Seq: expect - 1}))
+				n.emit(EventAck, map[string]any{"dir": "send", "seq": expect - 1, "reason": "out_of_order"})
+			}
+			_ = n.sendTo(from, wire.MT_DELTA_NACK, syncproto.EncodeDeltaNack(syncproto.DeltaNack{
+				Seq:  ch.Seq,
+				Code: 1, // 1 = out_of_window
+			}))
+			n.emit(EventAck, map[string]any{"dir": "send", "nack": true, "seq": ch.Seq, "reason": "out_of_window"})
 		}
 		return
 	}
@@ -800,8 +829,8 @@ func (n *Node) onDeltaChunk(from transport.MemAddr, b []byte) {
 	n.sessMu.Lock()
 	n.sess.rcvExpect++
 	n.sessMu.Unlock()
-	_ = n.sendTo(from, wire.MT_SYNC_ACK, syncproto.EncodeAck(syncproto.Ack{Seq: ch.Seq}))
 
+	_ = n.sendTo(from, wire.MT_SYNC_ACK, syncproto.EncodeAck(syncproto.Ack{Seq: ch.Seq}))
 	n.emit(EventAck, map[string]any{"dir": "send", "seq": ch.Seq})
 
 	if ch.Last && n.maybeEndIfEqual(from) {
@@ -864,6 +893,16 @@ func (n *Node) streamChunks(to transport.MemAddr, chunks []syncproto.DeltaChunk)
 	unacked := make(map[uint32]*inflight)
 	next := 0
 
+	// Keep sess.sndInflight in sync so onDeltaNack can find any in-flight seq.
+	snapshotInflight := func() {
+		n.sessMu.Lock()
+		n.sess.sndInflight = make([]syncproto.DeltaChunk, 0, len(unacked))
+		for _, inf := range unacked {
+			n.sess.sndInflight = append(n.sess.sndInflight, inf.ch)
+		}
+		n.sessMu.Unlock()
+	}
+
 	// Helper to send one chunk
 	sendOne := func(ch syncproto.DeltaChunk) bool {
 		enc := syncproto.EncodeDeltaChunk(ch)
@@ -875,10 +914,7 @@ func (n *Node) streamChunks(to transport.MemAddr, chunks []syncproto.DeltaChunk)
 			return false
 		}
 		unacked[ch.Seq] = &inflight{ch: ch, sentAt: time.Now()}
-		// mark inflight in session (optional, for observability)
-		n.sessMu.Lock()
-		n.sess.sndInflight = []syncproto.DeltaChunk{ch}
-		n.sessMu.Unlock()
+		snapshotInflight()
 		return true
 	}
 
@@ -907,6 +943,7 @@ func (n *Node) streamChunks(to transport.MemAddr, chunks []syncproto.DeltaChunk)
 		case seq := <-ackCh:
 			// Ack always increases by 1 (receiver is in-order)
 			delete(unacked, seq)
+			snapshotInflight()
 			// Top up window
 			for next < len(chunks) && len(unacked) < window {
 				if !sendOne(chunks[next]) {
@@ -934,6 +971,7 @@ func (n *Node) streamChunks(to transport.MemAddr, chunks []syncproto.DeltaChunk)
 					_ = s
 				}
 			}
+			snapshotInflight()
 		}
 	}
 }
@@ -1225,4 +1263,37 @@ func (n *Node) maybeEndIfEqual(to transport.MemAddr) bool {
 	}
 	n.endSessionTo(to, true, "caught_up")
 	return true
+}
+
+func (n *Node) onDeltaNack(from transport.MemAddr, b []byte) {
+	nack, err := syncproto.DecodeDeltaNack(b)
+	if err != nil {
+		n.emit(EventWarn, map[string]any{"msg": "decode_delta_nack_err", "err": err.Error()})
+		return
+	}
+	n.emit(EventAck, map[string]any{"dir": "recv", "nack": true, "seq": nack.Seq, "code": nack.Code})
+
+	// We keep the last sent chunk in sess.sndInflight (window is small).
+	n.sessMu.Lock()
+	infl := n.sess.sndInflight
+	n.sessMu.Unlock()
+	if len(infl) == 0 {
+		n.emit(EventWarn, map[string]any{"msg": "nack_no_inflight"})
+		return
+	}
+	for _, ch := range infl {
+		if ch.Seq != nack.Seq {
+			continue
+		}
+		enc := syncproto.EncodeDeltaChunk(ch)
+		n.emit(EventSendDeltaChunk, map[string]any{
+			"seq": ch.Seq, "entries": len(ch.Entries), "bytes": len(enc), "last": ch.Last, "retrans": true, "reason": "nack",
+		})
+		if err := n.sendTo(from, wire.MT_SYNC_DELTA_CHUNK, enc); err != nil {
+			n.emit(EventWarn, map[string]any{"msg": "retransmit_err", "seq": ch.Seq, "err": err.Error()})
+		}
+		return
+	}
+	// No match in inflight (could be stale); log and move on.
+	n.emit(EventWarn, map[string]any{"msg": "nack_unknown_seq", "seq": nack.Seq})
 }

@@ -382,6 +382,8 @@ func main() {
 
 	// Per-chunk RTTs CSV (already suggested)
 	_ = tele.writeChunkRTTsCSV(filepath.Join(*flOutDir, "chunk_rtts.csv"))
+	_ = tele.writeBytesByMsgCSV(filepath.Join(*flOutDir, "bytes_by_msg.csv"))
+	_ = tele.writeChunksCSV(filepath.Join(*flOutDir, "chunks.csv"))
 }
 
 func writerLoop(ctx context.Context, s *simNode, mean time.Duration) {

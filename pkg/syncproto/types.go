@@ -40,10 +40,16 @@ type DeltaChunk struct {
 	Seq     uint32
 	Last    bool
 	Entries []DeltaEntry
+	Hash    [32]byte
 }
 
 type Ack struct {
 	Seq uint32
+}
+
+type DeltaNack struct {
+	Seq  uint32
+	Code uint8
 }
 
 // BuildSummaryFromLog -> materialize -> leaves -> summary

@@ -32,6 +32,12 @@ type telemetry struct {
 	bytesTx int64
 	bytesRx int64
 
+	// Per-message-type accounting (indexed by wire MT 0..255)
+	msgSentBytes [256]int64
+	msgSentCount [256]int64
+	msgRecvBytes [256]int64
+	msgRecvCount [256]int64
+
 	// Sessions
 	sessionsBeg int64
 	sessionsEnd map[string]int64 // reason -> count
@@ -41,6 +47,13 @@ type telemetry struct {
 	rtts     []float64 // seconds
 	rttRows  [][]string
 	retransN map[chunkKey]int // retransmits per seq
+
+	chunkMeta map[chunkKey]struct {
+		entries int
+		bytes   int
+		last    bool
+	}
+	chunkRows [][]string
 
 	inflightSeqs map[string]map[uint32]struct{} // node -> set of unacked seqs
 	occLastT     map[string]time.Time           // node -> last change time
@@ -64,9 +77,13 @@ type telemetry struct {
 
 func newTelemetry() *telemetry {
 	return &telemetry{
-		sessionsEnd:  make(map[string]int64),
-		sendTS:       make(map[chunkKey]time.Time),
-		retransN:     make(map[chunkKey]int),
+		sessionsEnd: make(map[string]int64),
+		sendTS:      make(map[chunkKey]time.Time),
+		retransN:    make(map[chunkKey]int),
+		chunkMeta: make(map[chunkKey]struct {
+			entries, bytes int
+			last           bool
+		}),
 		inflightSeqs: make(map[string]map[uint32]struct{}),
 		occLastT:     make(map[string]time.Time),
 		occLastC:     make(map[string]int),
@@ -93,12 +110,21 @@ func (t *telemetry) handle(ev node.Event) {
 		if nbytes == 0 {
 			nbytes, _ = toInt64(ev.Fields["len"])
 		} // UDP uses "len"
+		mt64, _ := toInt64(ev.Fields["mt"])
+		mt := 0
+		if mt64 >= 0 && mt64 <= 255 {
+			mt = int(mt64)
+		}
 		if dir == "->" {
 			t.bytesTx += nbytes
 			t.bytesTxNode[ev.Node] += nbytes
+			t.msgSentBytes[mt] += nbytes
+			t.msgSentCount[mt]++
 		} else {
 			t.bytesRx += nbytes
 			t.bytesRxNode[ev.Node] += nbytes
+			t.msgRecvBytes[mt] += nbytes
+			t.msgRecvCount[mt]++
 		}
 
 	case node.EventSync:
@@ -138,10 +164,11 @@ func (t *telemetry) handle(ev node.Event) {
 
 	case node.EventSendDeltaChunk:
 		sequ := toU32(ev.Fields["seq"])
+		ck := chunkKey{ev.Node, sequ}
 		// track first send only (not retrans)
 		if rt, _ := ev.Fields["retrans"].(bool); rt {
 			t.retrans++
-			t.retransN[chunkKey{ev.Node, sequ}]++
+			t.retransN[ck]++
 		} else {
 			if _, ok := t.inflightSeqs[ev.Node]; !ok {
 				t.inflightSeqs[ev.Node] = make(map[uint32]struct{})
@@ -150,8 +177,17 @@ func (t *telemetry) handle(ev node.Event) {
 				t.inflightSeqs[ev.Node][sequ] = struct{}{}
 				t.occBump(ev.Node, ev.Time, len(t.inflightSeqs[ev.Node])) // NEW
 			}
-			if _, ok := t.sendTS[chunkKey{ev.Node, sequ}]; !ok {
-				t.sendTS[chunkKey{ev.Node, sequ}] = ev.Time
+			if _, ok := t.sendTS[ck]; !ok {
+				t.sendTS[ck] = ev.Time
+				// capture meta for chunks.csv
+				ent := int(toU32(ev.Fields["entries"]))
+				byt, _ := toInt64(ev.Fields["bytes"])
+				last, _ := ev.Fields["last"].(bool)
+				t.chunkMeta[ck] = struct {
+					entries int
+					bytes   int
+					last    bool
+				}{entries: ent, bytes: int(byt), last: last}
 			}
 		}
 		t.chunksSent++
@@ -172,8 +208,22 @@ func (t *telemetry) handle(ev node.Event) {
 				t.rttRows = append(t.rttRows, []string{
 					ev.Node, fmt.Sprintf("%d", sequ), fmt.Sprintf("%.6f", rtt), fmt.Sprintf("%d", t.retransN[ck]),
 				})
+				// finalize chunk row
+				meta := t.chunkMeta[ck]
+				t.chunkRows = append(t.chunkRows, []string{
+					ev.Node,
+					fmt.Sprintf("%d", sequ),
+					ts.UTC().Format(time.RFC3339Nano),
+					ev.Time.UTC().Format(time.RFC3339Nano),
+					fmt.Sprintf("%.6f", rtt),
+					fmt.Sprintf("%d", t.retransN[ck]),
+					fmt.Sprintf("%d", meta.entries),
+					fmt.Sprintf("%d", meta.bytes),
+					fmt.Sprintf("%t", meta.last),
+				})
 				delete(t.sendTS, ck)
 				delete(t.retransN, ck)
+				delete(t.chunkMeta, ck)
 			}
 			// occupancy drop when this seq is newly acked
 			if m, ok := t.inflightSeqs[ev.Node]; ok {
@@ -203,6 +253,56 @@ func (t *telemetry) writeChunkRTTsCSV(path string) error {
 	defer w.Flush()
 	_ = w.Write([]string{"node", "seq", "rtt_seconds", "retransmits"})
 	for _, r := range t.rttRows {
+		_ = w.Write(r)
+	}
+	return nil
+}
+
+func (t *telemetry) writeBytesByMsgCSV(path string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := csv.NewWriter(f)
+	defer w.Flush()
+	_ = w.Write([]string{"type_hex", "sent_bytes", "sent_count", "recv_bytes", "recv_count"})
+	for i := range 256 {
+		sb, sc := t.msgSentBytes[i], t.msgSentCount[i]
+		rb, rc := t.msgRecvBytes[i], t.msgRecvCount[i]
+		if sb == 0 && sc == 0 && rb == 0 && rc == 0 {
+			continue
+		}
+		_ = w.Write([]string{
+			fmt.Sprintf("0x%02X", i),
+			fmt.Sprintf("%d", sb),
+			fmt.Sprintf("%d", sc),
+			fmt.Sprintf("%d", rb),
+			fmt.Sprintf("%d", rc),
+		})
+	}
+	return nil
+}
+
+func (t *telemetry) writeChunksCSV(path string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.chunkRows) == 0 {
+		return nil
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := csv.NewWriter(f)
+	defer w.Flush()
+	_ = w.Write([]string{
+		"node", "seq", "sent_ts", "ack_ts", "rtt_seconds", "retransmits", "entries", "bytes", "last",
+	})
+	for _, r := range t.chunkRows {
 		_ = w.Write(r)
 	}
 	return nil
