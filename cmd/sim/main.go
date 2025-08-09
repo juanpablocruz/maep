@@ -23,6 +23,8 @@ import (
 	"github.com/juanpablocruz/maep/pkg/transport"
 )
 
+var tele = newTelemetry()
+
 var (
 	flNodes         = flag.Int("nodes", 5, "number of nodes in ring")
 	flDuration      = flag.Duration("duration", 60*time.Second, "run duration")
@@ -116,7 +118,6 @@ func main() {
 		copy(sns[i].Actor[:], bytes.Repeat([]byte{byte(0xA0 + i)}, 16))
 	}
 
-	// events fan-in
 	evOut := make(chan node.Event, 8192)
 	var fwdWG sync.WaitGroup
 
@@ -270,7 +271,11 @@ func main() {
 		defer evWG.Done()
 		for {
 			select {
-			case e := <-evOut:
+			case e, ok := <-evOut:
+				if !ok {
+					return
+				}
+				tele.handle(e)
 				if e.Type == node.EventSync {
 					act, _ := e.Fields["action"].(string)
 					switch act {
@@ -347,6 +352,33 @@ func main() {
 		fmt.Fprintf(sumTxt, "Convergence(s): n/a\n")
 	}
 	ss.mu.Unlock()
+
+	tele.finalize(time.Now())
+	mean, stdev = meanStdevSeconds(ss.latencies)
+	fmt.Fprintf(sumTxt, "Nodes: %d\nDuration: %s\nSync interval: %s\nWrite interval: %s\nHB: %s\nSuspect: %s\nDelta max: %d\n",
+		*flNodes, flDuration.String(), flSyncInterval.String(), flWriteInterval.String(), flHeartbeat.String(), flSuspectTO.String(), *flDeltaChunk)
+	fmt.Fprintf(sumTxt, "Chaos: loss=%.2f dup=%.2f reorder=%.2f delay=%s jitter=%s\n",
+		*flLoss, *flDup, *flReord, flDelay.String(), flJitter.String())
+	fmt.Fprintf(sumTxt, "Delta window: %d  Retrans timeout: %s\n", *flDeltaWindowChunks, flRetransTimeout.String())
+	fmt.Fprintf(sumTxt, "SyncLatency(s): mean=%.3f stdev=%.3f samples=%d\n", mean, stdev, len(ss.latencies))
+
+	ss.mu.Lock()
+	if !ss.firstSync.IsZero() && !ss.convergedAt.IsZero() {
+		fmt.Fprintf(sumTxt, "Convergence(s): %.3f\n", ss.convergedAt.Sub(ss.firstSync).Seconds())
+	} else {
+		fmt.Fprintf(sumTxt, "Convergence(s): n/a\n")
+	}
+	ss.mu.Unlock()
+
+	counts, rtt, ses, occ, thr := tele.statsLines()
+	fmt.Fprintln(sumTxt, counts)
+	fmt.Fprintln(sumTxt, rtt)
+	fmt.Fprintln(sumTxt, ses)
+	fmt.Fprintln(sumTxt, occ)
+	fmt.Fprintln(sumTxt, thr)
+
+	// Per-chunk RTTs CSV (already suggested)
+	_ = tele.writeChunkRTTsCSV(filepath.Join(*flOutDir, "chunk_rtts.csv"))
 }
 
 func writerLoop(ctx context.Context, s *simNode, mean time.Duration) {

@@ -846,38 +846,6 @@ func (n *Node) chunkDelta(d syncproto.Delta, maxBytes int) []syncproto.DeltaChun
 	return out
 }
 
-func (n *Node) sendRemainingChunks(to transport.MemAddr, rest []syncproto.DeltaChunk) {
-	n.sessMu.Lock()
-	ackCh := n.sess.ackCh
-	sessCtx := n.sess.ctx
-	n.sessMu.Unlock()
-
-	for _, ch := range rest {
-		// Wait for ACK of the current inflight chunk
-		select {
-		case <-sessCtx.Done():
-			return
-		case <-n.ctx.Done():
-			return
-		case <-ackCh:
-			// proceed
-		}
-
-		n.sessMu.Lock()
-		n.sess.sndInflight = []syncproto.DeltaChunk{ch}
-		n.sessMu.Unlock()
-
-		enc := syncproto.EncodeDeltaChunk(ch)
-		n.emit(EventSendDeltaChunk, map[string]any{
-			"seq": ch.Seq, "entries": len(ch.Entries), "bytes": len(enc), "last": ch.Last,
-		})
-		if err := n.sendTo(to, wire.MT_SYNC_DELTA_CHUNK, enc); err != nil {
-			n.emit(EventWarn, map[string]any{"msg": "send_delta_chunk_err", "err": err.Error()})
-			return
-		}
-	}
-}
-
 func (n *Node) onDeltaChunk(from transport.MemAddr, b []byte) {
 	ch, err := syncproto.DecodeDeltaChunk(b)
 	if err != nil {
