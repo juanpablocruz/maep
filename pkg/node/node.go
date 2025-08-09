@@ -49,7 +49,9 @@ type Node struct {
 
 	Events chan Event
 
-	DeltaMaxBytes int
+	DeltaMaxBytes     int
+	DeltaWindowChunks int
+	RetransTimeout    time.Duration
 
 	kickCh      chan struct{}
 	backoffBase time.Duration
@@ -76,19 +78,21 @@ type Node struct {
 func New(name string, ep transport.EndpointIF, peer transport.MemAddr, tickEvery time.Duration) *Node {
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &Node{
-		Name:          name,
-		Peer:          peer,
-		EP:            ep,
-		Log:           oplog.New(),
-		Clock:         hlc.New(),
-		Ticker:        tickEvery,
-		DeltaMaxBytes: 32 * 1024,
-		kickCh:        make(chan struct{}, 1),
-		backoffBase:   500 * time.Millisecond,
-		backoffMax:    5 * time.Second,
-		hbEvery:       350 * time.Millisecond,
-		hbMissK:       6,
-		ctx:           ctx, cancel: cancel,
+		Name:              name,
+		Peer:              peer,
+		EP:                ep,
+		Log:               oplog.New(),
+		Clock:             hlc.New(),
+		Ticker:            tickEvery,
+		DeltaMaxBytes:     32 * 1024,
+		DeltaWindowChunks: 1,
+		RetransTimeout:    2 * time.Second,
+		kickCh:            make(chan struct{}, 1),
+		backoffBase:       500 * time.Millisecond,
+		backoffMax:        5 * time.Second,
+		hbEvery:           350 * time.Millisecond,
+		hbMissK:           6,
+		ctx:               ctx, cancel: cancel,
 	}
 
 	n.conn.Store(true)
@@ -126,6 +130,19 @@ func (n *Node) SetPaused(p bool) {
 	if prev != p {
 		n.emit(EventPauseChange, map[string]any{"paused": p})
 	}
+}
+
+func (n *Node) SetDeltaWindowChunks(w int) {
+	if w < 1 {
+		w = 1
+	}
+	n.DeltaWindowChunks = w
+}
+func (n *Node) SetRetransTimeout(d time.Duration) {
+	if d < 100*time.Millisecond {
+		d = 100 * time.Millisecond
+	}
+	n.RetransTimeout = d
 }
 
 func (n *Node) SetHeartbeatEvery(d time.Duration) { n.HBSetEvery(d) }
@@ -421,6 +438,11 @@ func (n *Node) recvLoop() {
 			if !n.sess.active {
 				n.sess.id = genSessionID()
 				n.sess.active = true
+				n.sess.sndNext = 0
+				n.sess.sndInflight = nil
+				n.sess.rcvExpect = 0
+				n.sess.ackCh = make(chan uint32, 8)                   // NEW
+				n.sess.ctx, n.sess.cancel = context.WithCancel(n.ctx) // NEW
 				n.emit(EventSync, map[string]any{"action": "begin", "id": n.sess.id})
 			}
 			n.sessMu.Unlock()
@@ -473,13 +495,26 @@ func (n *Node) onSummary(from transport.MemAddr, b []byte) {
 
 func (n *Node) onReq(from transport.MemAddr, b []byte) {
 	req, err := syncproto.DecodeReq(b)
-	if err != nil { /*…*/
+	if err != nil {
 		return
 	}
 	if len(req.Needs) == 0 {
 		n.endSession(true, "no_need")
 		return
 	}
+
+	n.sessMu.Lock()
+	if !n.sess.active {
+		n.sess.id = genSessionID()
+		n.sess.active = true
+	}
+	if n.sess.ackCh == nil {
+		n.sess.ackCh = make(chan uint32, 8)
+	}
+	if n.sess.ctx == nil || n.sess.cancel == nil {
+		n.sess.ctx, n.sess.cancel = context.WithCancel(n.ctx)
+	}
+	n.sessMu.Unlock()
 
 	delta, _ := syncproto.BuildDeltaForLimited(n.Log, req, n.DeltaMaxBytes)
 
@@ -489,7 +524,6 @@ func (n *Node) onReq(from transport.MemAddr, b []byte) {
 		ops += len(e.Ops)
 	}
 
-	// If after fallback we still have nothing, politely END.
 	if ops == 0 {
 		slog.Info("send_delta_empty", "node", n.Name)
 		_ = n.send(wire.MT_SYNC_END, nil)
@@ -507,17 +541,8 @@ func (n *Node) onReq(from transport.MemAddr, b []byte) {
 	n.sess.sndLastSeq = lastSeq
 	n.sess.hasLast = true
 	n.sessMu.Unlock()
-	enc := syncproto.EncodeDeltaChunk(chunks[0])
-	n.emit(EventSendDeltaChunk, map[string]any{
-		"seq": chunks[0].Seq, "entries": len(chunks[0].Entries),
-		"bytes": len(enc), "last": chunks[0].Last,
-		"partial": len(chunks) > 1, "ops": ops,
-	})
-	if err := n.sendTo(from, wire.MT_SYNC_DELTA_CHUNK, enc); err != nil {
-		n.emit(EventWarn, map[string]any{"msg": "send_delta_chunk_err", "err": err.Error()})
-	}
-	// queue the rest to send upon ACK
-	go n.sendRemainingChunks(from, chunks[1:])
+
+	go n.streamChunks(from, chunks)
 }
 
 func (n *Node) onDelta(from transport.MemAddr, b []byte) {
@@ -938,22 +963,116 @@ func (n *Node) onAck(_ transport.MemAddr, b []byte) {
 	}
 
 	n.emit(EventAck, map[string]any{"dir": "recv", "seq": a.Seq})
+
 	n.sessMu.Lock()
-	if len(n.sess.sndInflight) > 0 && n.sess.sndInflight[0].Seq == a.Seq {
-		n.sess.sndInflight = nil
+	if n.sess.ackCh != nil {
+		select {
+		case n.sess.ackCh <- a.Seq:
+		default:
+		}
+	}
+	if a.Seq+1 > n.sess.sndNext {
 		n.sess.sndNext = a.Seq + 1
-		if n.sess.ackCh != nil {
-			select {
-			case n.sess.ackCh <- a.Seq:
-			default:
-			}
-		}
-		if n.sess.hasLast && a.Seq == n.sess.sndLastSeq {
-			if err = n.send(wire.MT_SYNC_END, nil); err != nil {
-				n.emit(EventWarn, map[string]any{"msg": "send_sync_end", "err": err.Error()})
-			}
-		}
 	}
 	n.sessMu.Unlock()
 
+}
+
+func (n *Node) streamChunks(to transport.MemAddr, chunks []syncproto.DeltaChunk) {
+	n.sessMu.Lock()
+	ackCh := n.sess.ackCh
+	sessCtx := n.sess.ctx
+	window := n.DeltaWindowChunks
+	timeout := n.RetransTimeout
+	n.sessMu.Unlock()
+	if window < 1 {
+		window = 1
+	}
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+
+	type inflight struct {
+		ch     syncproto.DeltaChunk
+		sentAt time.Time
+	}
+	unacked := make(map[uint32]*inflight)
+	next := 0
+	lastSeq := chunks[len(chunks)-1].Seq
+	n.sess.sndLastSeq = lastSeq
+
+	// Helper to send one chunk
+	sendOne := func(ch syncproto.DeltaChunk) bool {
+		enc := syncproto.EncodeDeltaChunk(ch)
+		n.emit(EventSendDeltaChunk, map[string]any{
+			"seq": ch.Seq, "entries": len(ch.Entries), "bytes": len(enc), "last": ch.Last,
+		})
+		if err := n.sendTo(to, wire.MT_SYNC_DELTA_CHUNK, enc); err != nil {
+			n.emit(EventWarn, map[string]any{"msg": "send_delta_chunk_err", "err": err.Error()})
+			return false
+		}
+		unacked[ch.Seq] = &inflight{ch: ch, sentAt: time.Now()}
+		// mark inflight in session (optional, for observability)
+		n.sessMu.Lock()
+		n.sess.sndInflight = []syncproto.DeltaChunk{ch}
+		n.sessMu.Unlock()
+		return true
+	}
+
+	// Initial fill
+	for next < len(chunks) && len(unacked) < window {
+		if !sendOne(chunks[next]) {
+			return
+		}
+		next++
+	}
+
+	tick := time.NewTicker(timeout / 2)
+	defer tick.Stop()
+
+	for {
+		if len(unacked) == 0 && next >= len(chunks) {
+			// Done sending + all acked → sender side can end now.
+			_ = n.send(wire.MT_SYNC_END, nil)
+			return
+		}
+
+		select {
+		case <-sessCtx.Done():
+			return
+		case <-n.ctx.Done():
+			return
+
+		case seq := <-ackCh:
+			// Ack always increases by 1 (receiver is in-order)
+			delete(unacked, seq)
+			// Top up window
+			for next < len(chunks) && len(unacked) < window {
+				if !sendOne(chunks[next]) {
+					return
+				}
+				next++
+			}
+
+		case <-tick.C:
+			// Retransmit any expired chunk
+			now := time.Now()
+			for s, inf := range unacked {
+				if now.Sub(inf.sentAt) >= timeout {
+					// resend
+					enc := syncproto.EncodeDeltaChunk(inf.ch)
+					n.emit(EventSendDeltaChunk, map[string]any{
+						"seq": inf.ch.Seq, "entries": len(inf.ch.Entries), "bytes": len(enc), "last": inf.ch.Last, "retrans": true,
+					})
+					if err := n.sendTo(to, wire.MT_SYNC_DELTA_CHUNK, enc); err != nil {
+						n.emit(EventWarn, map[string]any{"msg": "send_delta_chunk_err", "err": err.Error()})
+						return
+					}
+					inf.sentAt = now
+					// keep inacked
+					_ = s
+				}
+			}
+		}
+	}
 }

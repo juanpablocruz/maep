@@ -46,6 +46,9 @@ var (
 	flStopWritesAt  = flag.Duration("stop-writes-at", 30*time.Second, "stop writers at this offset; 0=never")
 	flFailurePeriod = flag.Duration("failure-period", 0, "mean time between random link failures (0=off)")
 	flRecoveryDelay = flag.Duration("recovery-delay", 5*time.Second, "time a failed link stays down before reconnect")
+
+	flDeltaWindowChunks = flag.Int("delta-window-chunks", 1, "max delta chunks in flight per session")
+	flRetransTimeout    = flag.Duration("retrans-timeout", 2*time.Second, "retransmit timeout for unacked chunks")
 )
 
 type simNode struct {
@@ -127,6 +130,8 @@ func main() {
 		n.SetHeartbeatEvery(*flHeartbeat)
 		hbK := max(int((*flSuspectTO+*flHeartbeat-1) / *flHeartbeat), 3)
 		n.SetSuspectThreshold(hbK)
+		n.SetDeltaWindowChunks(*flDeltaWindowChunks)
+		n.SetRetransTimeout(*flRetransTimeout)
 
 		sns[i].Node = n
 		n.Start()
