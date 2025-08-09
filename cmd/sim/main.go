@@ -51,6 +51,8 @@ var (
 
 	flDeltaWindowChunks = flag.Int("delta-window-chunks", 1, "max delta chunks in flight per session")
 	flRetransTimeout    = flag.Duration("retrans-timeout", 2*time.Second, "retransmit timeout for unacked chunks")
+
+	flDescent = flag.Bool("descent", true, "use Merkle descent for summaries")
 )
 
 type simNode struct {
@@ -133,6 +135,7 @@ func main() {
 		n.SetSuspectThreshold(hbK)
 		n.SetDeltaWindowChunks(*flDeltaWindowChunks)
 		n.SetRetransTimeout(*flRetransTimeout)
+		n.DescentEnabled = *flDescent
 
 		sns[i].Node = n
 		n.Start()

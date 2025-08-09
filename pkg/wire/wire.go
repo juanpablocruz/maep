@@ -24,6 +24,10 @@ const (
 
 	MT_SEG_KEYS_REQ byte = 0x13
 	MT_SEG_KEYS     byte = 0x14
+
+	MT_SYNC_ROOT    byte = 0x31
+	MT_DESCENT_REQ  byte = 0x32
+	MT_DESCENT_RESP byte = 0x33
 )
 
 // Encode frame: | 1B type | 4B big-endian length | payload... |

@@ -25,6 +25,8 @@ const (
 	EventSendDeltaChunk EventType = "send_delta_chunk"
 	EventRecvDeltaChunk EventType = "recv_delta_chunk"
 	EventAck            EventType = "ack"
+	EventDescent        EventType = "descent"
+	EventSendRoot       EventType = "send_root"
 )
 
 type Event struct {

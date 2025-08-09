@@ -12,6 +12,10 @@ import (
 	"github.com/juanpablocruz/maep/pkg/segment"
 )
 
+type Root struct {
+	Hash [32]byte
+}
+
 func dbg(msg string, args ...any) {
 	logger := slog.Default()
 	if logger.Enabled(context.Background(), slog.LevelDebug) {
@@ -414,4 +418,18 @@ func DecodeAck(p []byte) (Ack, error) {
 		dbg("decode_ack_trailing", "bytes", r.Len())
 	}
 	return Ack{Seq: seq}, nil
+}
+
+func EncodeRoot(r Root) []byte {
+	b := make([]byte, 32)
+	copy(b, r.Hash[:])
+	return b
+}
+func DecodeRoot(b []byte) (Root, error) {
+	if len(b) < 32 {
+		return Root{}, errors.New("short root")
+	}
+	var r Root
+	copy(r.Hash[:], b[:32])
+	return r, nil
 }
