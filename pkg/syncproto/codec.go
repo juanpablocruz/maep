@@ -297,3 +297,121 @@ func DecodeSegAd(b []byte) (SegAd, error) {
 	}
 	return SegAd{Items: items}, nil
 }
+
+// --- DeltaChunk ---
+func EncodeDeltaChunk(c DeltaChunk) []byte {
+	var b bytes.Buffer
+	putU32(&b, c.Seq)
+	if c.Last {
+		b.WriteByte(1)
+	} else {
+		b.WriteByte(0)
+	}
+	putU32(&b, uint32(len(c.Entries)))
+	for _, e := range c.Entries {
+		putU16(&b, uint16(len(e.Key)))
+		b.WriteString(e.Key)
+		putU32(&b, uint32(len(e.Ops)))
+		for _, op := range e.Ops {
+			putU16(&b, op.Version)
+			b.WriteByte(op.Kind)
+			putU64(&b, op.HLCTicks)
+			putU64(&b, uint64(op.WallNanos))
+			b.Write(op.Actor[:])
+			b.Write(op.Hash[:])
+			putBytes(&b, op.Value)
+		}
+	}
+	return b.Bytes()
+}
+
+func DecodeDeltaChunk(p []byte) (DeltaChunk, error) {
+	r := bytes.NewReader(p)
+	seq, err := getU32(r)
+	if err != nil {
+		return DeltaChunk{}, err
+	}
+	lastb, err := r.ReadByte()
+	if err != nil {
+		return DeltaChunk{}, err
+	}
+	nEnt, err := getU32(r)
+	if err != nil {
+		return DeltaChunk{}, err
+	}
+	ents := make([]DeltaEntry, 0, nEnt)
+	for range int(nEnt) {
+		kl, err := getU16(r)
+		if err != nil {
+			return DeltaChunk{}, err
+		}
+		kb := make([]byte, kl)
+		if _, err := r.Read(kb); err != nil {
+			return DeltaChunk{}, err
+		}
+		nOps, err := getU32(r)
+		if err != nil {
+			return DeltaChunk{}, err
+		}
+		ops := make([]model.Op, 0, nOps)
+		for range int(nOps) {
+			var op model.Op
+			ver, err := getU16(r)
+			if err != nil {
+				return DeltaChunk{}, err
+			}
+			op.Version = ver
+			kind, err := r.ReadByte()
+			if err != nil {
+				return DeltaChunk{}, err
+			}
+			op.Kind = kind
+			op.HLCTicks, err = getU64(r)
+			if err != nil {
+				return DeltaChunk{}, err
+			}
+			w, err := getU64(r)
+			if err != nil {
+				return DeltaChunk{}, err
+			}
+			op.WallNanos = int64(w)
+			if _, err := r.Read(op.Actor[:]); err != nil {
+				return DeltaChunk{}, err
+			}
+			if _, err := r.Read(op.Hash[:]); err != nil {
+				return DeltaChunk{}, err
+			}
+			val, err := getBytes(r)
+			if err != nil {
+				return DeltaChunk{}, err
+			}
+			op.Key = string(kb)
+			op.Value = val
+			ops = append(ops, op)
+		}
+		ents = append(ents, DeltaEntry{Key: string(kb), Ops: ops})
+	}
+	if r.Len() != 0 {
+		dbg("decode_delta_chunk_trailing", "bytes", r.Len())
+	}
+	return DeltaChunk{Seq: seq, Last: lastb == 1, Entries: ents}, nil
+}
+
+// --- Ack ---
+func EncodeAck(a Ack) []byte {
+	var b bytes.Buffer
+	putU32(&b, a.Seq)
+	return b.Bytes()
+}
+
+func DecodeAck(p []byte) (Ack, error) {
+	r := bytes.NewReader(p)
+	seq, err := getU32(r)
+	if err != nil {
+		return Ack{}, err
+	}
+	if r.Len() != 0 {
+		dbg("decode_ack_trailing", "bytes", r.Len())
+	}
+	return Ack{Seq: seq}, nil
+}

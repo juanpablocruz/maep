@@ -36,6 +36,16 @@ type DeltaEntry struct {
 	Ops []model.Op
 }
 
+type DeltaChunk struct {
+	Seq     uint32
+	Last    bool
+	Entries []DeltaEntry
+}
+
+type Ack struct {
+	Seq uint32
+}
+
 // BuildSummaryFromLog -> materialize -> leaves -> summary
 func BuildSummaryFromLog(l *oplog.Log) Summary {
 	view := materialize.Snapshot(l)

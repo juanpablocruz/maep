@@ -22,6 +22,9 @@ const (
 	EventSendSegKeysReq EventType = "send_segkeys_req"
 	EventSendSegKeys    EventType = "send_segkeys"
 	EventWire           EventType = "wire"
+	EventSendDeltaChunk EventType = "send_delta_chunk"
+	EventRecvDeltaChunk EventType = "recv_delta_chunk"
+	EventAck            EventType = "ack"
 )
 
 type Event struct {

@@ -25,9 +25,17 @@ import (
 )
 
 type syncSession struct {
-	id         uint64
-	active     bool
-	lastRemote syncproto.Summary
+	id          uint64
+	active      bool
+	lastRemote  syncproto.Summary
+	sndNext     uint32
+	sndInflight []syncproto.DeltaChunk
+	rcvExpect   uint32
+	ackCh       chan uint32
+	ctx         context.Context
+	cancel      context.CancelFunc
+	sndLastSeq  uint32
+	hasLast     bool
 }
 
 type Node struct {
@@ -312,6 +320,11 @@ func (n *Node) beginSession() {
 	}
 	n.sess.id = genSessionID()
 	n.sess.active = true
+	n.sess.sndNext = 0
+	n.sess.sndInflight = nil
+	n.sess.rcvExpect = 0
+	n.sess.ackCh = make(chan uint32, 8)
+	n.sess.ctx, n.sess.cancel = context.WithCancel(n.ctx)
 	n.emit(EventSync, map[string]any{"action": "begin", "id": n.sess.id})
 	_ = n.send(wire.MT_SYNC_BEGIN, nil)
 }
@@ -324,6 +337,9 @@ func (n *Node) endSession(sendEnd bool, reason string) {
 	}
 	if sendEnd {
 		_ = n.send(wire.MT_SYNC_END, nil)
+	}
+	if n.sess.cancel != nil {
+		n.sess.cancel()
 	}
 	n.emit(EventSync, map[string]any{"action": "end", "id": n.sess.id, "reason": reason})
 	n.sess = syncSession{}
@@ -417,6 +433,10 @@ func (n *Node) recvLoop() {
 			n.onSegKeysReq(from, payload)
 		case wire.MT_SEG_KEYS:
 			n.onSegKeys(from, payload)
+		case wire.MT_SYNC_DELTA_CHUNK:
+			n.onDeltaChunk(from, payload)
+		case wire.MT_SYNC_ACK:
+			n.onAck(from, payload)
 		default:
 			slog.Warn("unknown_msg", "node", n.Name, "mt", mt)
 			n.emit(EventWarn, map[string]any{"msg": "unknown_msg", "mt": mt})
@@ -461,7 +481,7 @@ func (n *Node) onReq(from transport.MemAddr, b []byte) {
 		return
 	}
 
-	delta, truncated := syncproto.BuildDeltaForLimited(n.Log, req, n.DeltaMaxBytes)
+	delta, _ := syncproto.BuildDeltaForLimited(n.Log, req, n.DeltaMaxBytes)
 
 	// count ops
 	ops := 0
@@ -475,15 +495,29 @@ func (n *Node) onReq(from transport.MemAddr, b []byte) {
 		_ = n.send(wire.MT_SYNC_END, nil)
 		return
 	}
-
-	enc := syncproto.EncodeDelta(delta)
-	slog.Info("send_delta", "node", n.Name, "entries", len(delta.Entries), "ops", ops, "bytes", len(enc), "partial", truncated)
-	n.emit(EventSendDelta, map[string]any{"entries": len(delta.Entries), "ops": ops, "bytes": len(enc), "partial": truncated})
-
-	if err := n.sendTo(from, wire.MT_SYNC_DELTA, enc); err != nil {
-		slog.Warn("send_delta_err", "node", n.Name, "err", err)
-		n.emit(EventWarn, map[string]any{"msg": "send_delta_err", "err": err.Error()})
+	chunks := n.chunkDelta(delta, n.DeltaMaxBytes)
+	if len(chunks) == 0 {
+		_ = n.send(wire.MT_SYNC_END, nil)
+		return
 	}
+	lastSeq := chunks[len(chunks)-1].Seq
+	n.sessMu.Lock()
+	n.sess.sndNext = 0
+	n.sess.sndInflight = []syncproto.DeltaChunk{chunks[0]}
+	n.sess.sndLastSeq = lastSeq
+	n.sess.hasLast = true
+	n.sessMu.Unlock()
+	enc := syncproto.EncodeDeltaChunk(chunks[0])
+	n.emit(EventSendDeltaChunk, map[string]any{
+		"seq": chunks[0].Seq, "entries": len(chunks[0].Entries),
+		"bytes": len(enc), "last": chunks[0].Last,
+		"partial": len(chunks) > 1, "ops": ops,
+	})
+	if err := n.sendTo(from, wire.MT_SYNC_DELTA_CHUNK, enc); err != nil {
+		n.emit(EventWarn, map[string]any{"msg": "send_delta_chunk_err", "err": err.Error()})
+	}
+	// queue the rest to send upon ACK
+	go n.sendRemainingChunks(from, chunks[1:])
 }
 
 func (n *Node) onDelta(from transport.MemAddr, b []byte) {
@@ -677,15 +711,15 @@ func (n *Node) onSegKeys(from transport.MemAddr, b []byte) {
 	needs := make([]syncproto.Need, 0, 64)
 	for _, it := range sk.Items {
 		for _, p := range it.Pairs {
-			from := uint32(0)
+			fromCount := uint32(0)
 			if c, ok := counts[p.Key]; ok && c > 0 {
 				if c > int(^uint32(0)) {
-					from = ^uint32(0)
+					fromCount = ^uint32(0)
 				} else {
-					from = uint32(c)
+					fromCount = uint32(c)
 				}
 			}
-			needs = append(needs, syncproto.Need{Key: p.Key, From: from})
+			needs = append(needs, syncproto.Need{Key: p.Key, From: fromCount})
 		}
 	}
 	if len(needs) == 0 {
@@ -733,4 +767,193 @@ func countsEqual(a, b map[string]int) bool {
 		}
 	}
 	return true
+}
+
+// split a Delta into <=maxBytes chunks (coarse: pack entries until limit)
+func (n *Node) chunkDelta(d syncproto.Delta, maxBytes int) []syncproto.DeltaChunk {
+	if maxBytes <= 0 {
+		maxBytes = n.DeltaMaxBytes
+	}
+	seq := uint32(0)
+	var out []syncproto.DeltaChunk
+	cur := syncproto.DeltaChunk{Seq: seq, Last: false, Entries: nil}
+	room := maxBytes
+	// very simple packer: add whole entries until we’d exceed maxBytes;
+	// if an entry itself is too big, it becomes a singleton chunk.
+	estEntrySize := func(e syncproto.DeltaEntry) int {
+		// rough upper bound: key + per-op fixed parts + values
+		s := 2 + len(e.Key) + 4
+		for _, op := range e.Ops {
+			s += 2 + 1 + 8 + 8 + 16 + 32 + 4 + len(op.Value)
+		}
+		return s
+	}
+	flush := func() {
+		if len(cur.Entries) == 0 {
+			return
+		}
+		out = append(out, cur)
+		seq++
+		cur = syncproto.DeltaChunk{Seq: seq}
+		room = maxBytes
+	}
+	for _, e := range d.Entries {
+		sz := estEntrySize(e)
+		if sz > maxBytes {
+			// singleton too big: flush current, push this alone
+			flush()
+			out = append(out, syncproto.DeltaChunk{Seq: seq, Entries: []syncproto.DeltaEntry{e}})
+			seq++
+			cur = syncproto.DeltaChunk{Seq: seq}
+			room = maxBytes
+			continue
+		}
+		if sz > room {
+			flush()
+		}
+		cur.Entries = append(cur.Entries, e)
+		room -= sz
+	}
+	flush()
+	if len(out) > 0 {
+		out[len(out)-1].Last = true
+	}
+	return out
+}
+
+func (n *Node) sendRemainingChunks(to transport.MemAddr, rest []syncproto.DeltaChunk) {
+	n.sessMu.Lock()
+	ackCh := n.sess.ackCh
+	sessCtx := n.sess.ctx
+	n.sessMu.Unlock()
+
+	for _, ch := range rest {
+		// Wait for ACK of the current inflight chunk
+		select {
+		case <-sessCtx.Done():
+			return
+		case <-n.ctx.Done():
+			return
+		case <-ackCh:
+			// proceed
+		}
+
+		n.sessMu.Lock()
+		n.sess.sndInflight = []syncproto.DeltaChunk{ch}
+		n.sessMu.Unlock()
+
+		enc := syncproto.EncodeDeltaChunk(ch)
+		n.emit(EventSendDeltaChunk, map[string]any{
+			"seq": ch.Seq, "entries": len(ch.Entries), "bytes": len(enc), "last": ch.Last,
+		})
+		if err := n.sendTo(to, wire.MT_SYNC_DELTA_CHUNK, enc); err != nil {
+			n.emit(EventWarn, map[string]any{"msg": "send_delta_chunk_err", "err": err.Error()})
+			return
+		}
+	}
+}
+
+func (n *Node) onDeltaChunk(from transport.MemAddr, b []byte) {
+	ch, err := syncproto.DecodeDeltaChunk(b)
+	if err != nil {
+		n.emit(EventWarn, map[string]any{"msg": "decode_delta_chunk_err", "err": err.Error()})
+		return
+	}
+
+	n.sessMu.Lock()
+	expect := n.sess.rcvExpect
+	n.sessMu.Unlock()
+
+	n.emit(EventRecvDeltaChunk, map[string]any{
+		"seq": ch.Seq, "last": ch.Last, "entries": len(ch.Entries),
+		"expect": expect,
+	})
+	// window=1: only accept in-order
+	if ch.Seq != expect {
+		if expect > 0 {
+			_ = n.sendTo(from, wire.MT_SYNC_ACK, syncproto.EncodeAck(syncproto.Ack{Seq: expect - 1}))
+			n.emit(EventAck, map[string]any{"dir": "send", "seq": expect - 1})
+		}
+		return
+	}
+
+	// apply entries
+	before := n.Log.CountPerKey()
+	for _, e := range ch.Entries {
+		for _, op := range e.Ops {
+			n.Log.Append(op)
+		}
+	}
+	after := n.Log.CountPerKey()
+	n.emit(EventAppliedDelta, map[string]any{"keys": len(ch.Entries), "before": before, "after": after})
+
+	// advance expect and ACK
+	n.sessMu.Lock()
+	n.sess.rcvExpect++
+	n.sessMu.Unlock()
+	_ = n.sendTo(from, wire.MT_SYNC_ACK, syncproto.EncodeAck(syncproto.Ack{Seq: ch.Seq}))
+
+	n.emit(EventAck, map[string]any{"dir": "send", "seq": ch.Seq})
+
+	if ch.Last {
+		// optional: equality-check vs lastRemote summary like your onDelta()
+		n.sessMu.Lock()
+		lr := n.sess.lastRemote
+		n.sessMu.Unlock()
+		if len(lr.Leaves) > 0 {
+			myView := materialize.Snapshot(n.Log)
+			myLeaves := materialize.LeavesFromSnapshot(myView)
+			if len(lr.Leaves) == len(myLeaves) {
+				eq := true
+				remote := make(map[string][32]byte, len(lr.Leaves))
+				for _, lf := range lr.Leaves {
+					remote[lf.Key] = lf.Hash
+				}
+				for _, lf := range myLeaves {
+					if remote[lf.Key] != lf.Hash {
+						eq = false
+						break
+					}
+				}
+				if eq {
+					n.endSession(true, "caught_up")
+					return
+				}
+			}
+		}
+		// Not equal yet → follow-up REQ as you do in onDelta()
+		req := syncproto.DiffForReq(n.Log, lr)
+		if len(req.Needs) > 0 {
+			n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "continue"})
+			_ = n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req))
+		}
+	}
+}
+
+func (n *Node) onAck(_ transport.MemAddr, b []byte) {
+	a, err := syncproto.DecodeAck(b)
+	if err != nil {
+		n.emit(EventWarn, map[string]any{"msg": "decode_ack_err", "err": err.Error()})
+		return
+	}
+
+	n.emit(EventAck, map[string]any{"dir": "recv", "seq": a.Seq})
+	n.sessMu.Lock()
+	if len(n.sess.sndInflight) > 0 && n.sess.sndInflight[0].Seq == a.Seq {
+		n.sess.sndInflight = nil
+		n.sess.sndNext = a.Seq + 1
+		if n.sess.ackCh != nil {
+			select {
+			case n.sess.ackCh <- a.Seq:
+			default:
+			}
+		}
+		if n.sess.hasLast && a.Seq == n.sess.sndLastSeq {
+			if err = n.send(wire.MT_SYNC_END, nil); err != nil {
+				n.emit(EventWarn, map[string]any{"msg": "send_sync_end", "err": err.Error()})
+			}
+		}
+	}
+	n.sessMu.Unlock()
+
 }
