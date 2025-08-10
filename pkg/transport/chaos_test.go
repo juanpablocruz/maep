@@ -104,3 +104,22 @@ func TestChaosLoss(t *testing.T) {
 		t.Fatalf("expected frame to be dropped")
 	}
 }
+
+func TestChaosClose_NoPanicOnDelayedDelivery(t *testing.T) {
+	sw := NewSwitch()
+	a, _ := sw.Listen("A")
+	b, _ := sw.Listen("B")
+	defer b.Close()
+
+	chaos := WrapChaos(a, ChaosConfig{Up: true, BaseDelay: 50 * time.Millisecond, Seed: 1})
+	// Send a few frames with delay scheduled
+	for i := 0; i < 5; i++ {
+		if err := chaos.Send("B", []byte("x")); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+	// Close immediately; previously this could close c.in and cause send on closed channel
+	chaos.Close()
+	// Give timers some time to fire; test passes if no panic occurs
+	time.Sleep(100 * time.Millisecond)
+}

@@ -74,7 +74,7 @@ func (c *ChaosEP) Close() {
 	c.cancel()
 	c.wg.Wait()
 	c.under.Close()
-	close(c.in)
+	// Do not close(c.in) to avoid potential sends from delayed timers after Close
 }
 
 func (c *ChaosEP) Addr() MemAddr {
@@ -170,6 +170,8 @@ func (c *ChaosEP) pumpRecv() {
 		}
 		time.AfterFunc(delay, func() {
 			select {
+			case <-c.ctx.Done():
+				return
 			case c.in <- chaosEnv{from: from, data: copy}:
 			default:
 				// drop if queue full

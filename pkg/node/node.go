@@ -348,13 +348,21 @@ func (n *Node) summaryLoop() {
 				"peer": n.Peer, "root": fmt.Sprintf("%x", root[:8]),
 			})
 			if n.ms != nil {
-				if err := n.ms.Send(n.ctx, n.Peer, protoport.SummaryReqMsg{R: syncproto.SummaryReq{Root: root}}); err != nil {
+				if err := n.sendMsgWithTimeout(n.Peer, protoport.SummaryReqMsg{R: syncproto.SummaryReq{Root: root}}); err != nil {
 					slog.Warn("send_summary_req_err", "node", n.Name, "err", err)
 					n.emit(EventWarn, map[string]any{"msg": "send_summary_req_err", "err": err.Error()})
 					backoff = minDur(n.backoffMax, maxDur(n.backoffBase, backoff*2))
 					nextAllowed = time.Now().Add(jitter(backoff))
 					return
 				}
+				// Cache our per-key frontier snapshot for SV-bounded receive checks (typed messenger path)
+				sum := syncproto.BuildSummaryFromLog(n.Log)
+				n.sessMu.Lock()
+				n.sess.sentFrontier = make(map[string]uint32, len(sum.Frontier))
+				for _, it := range sum.Frontier {
+					n.sess.sentFrontier[it.Key] = it.From
+				}
+				n.sessMu.Unlock()
 			} else {
 				if err := n.send(wire.MT_SYNC_SUMMARY_REQ, syncproto.EncodeSummaryReq(syncproto.SummaryReq{Root: root})); err != nil {
 					slog.Warn("send_summary_req_err", "node", n.Name, "err", err)
@@ -552,7 +560,7 @@ func (n *Node) handleSummaryResp(from transport.MemAddr, sum syncproto.Summary) 
 	slog.Info("send_req", "node", n.Name, "needs", req.Needs)
 	n.emit(EventSendReq, map[string]any{"needs": req.Needs})
 	if n.ms != nil {
-		if err := n.ms.Send(n.ctx, from, protoport.ReqMsg{R: req}); err != nil {
+		if err := n.sendMsgWithTimeout(from, protoport.ReqMsg{R: req}); err != nil {
 			slog.Warn("send_req_err", "node", n.Name, "err", err)
 			n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
 		}
@@ -698,7 +706,7 @@ func (n *Node) handleDelta(from transport.MemAddr, d syncproto.Delta) {
 	if len(req.Needs) > 0 {
 		n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "continue"})
 		if n.ms != nil {
-			if err := n.ms.Send(n.ctx, from, protoport.ReqMsg{R: req}); err != nil {
+			if err := n.sendMsgWithTimeout(from, protoport.ReqMsg{R: req}); err != nil {
 				slog.Warn("send_req_err", "node", n.Name, "err", err)
 				n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
 			}
@@ -819,7 +827,7 @@ func (n *Node) onSegKeys(from transport.MemAddr, b []byte) {
 	req := syncproto.Req{Needs: needs}
 	n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "seg_keys"})
 	if n.ms != nil {
-		if err := n.ms.Send(n.ctx, from, protoport.ReqMsg{R: req}); err != nil {
+		if err := n.sendMsgWithTimeout(from, protoport.ReqMsg{R: req}); err != nil {
 			n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
 		}
 	} else if err := n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
@@ -984,9 +992,9 @@ func (n *Node) handleDeltaChunk(from transport.MemAddr, ch syncproto.DeltaChunk)
 				if len(req.Needs) > 0 {
 					n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "continue_after_chunk"})
 					if n.ms != nil {
-						if err := n.ms.Send(n.ctx, from, protoport.ReqMsg{R: req}); err != nil {
-							n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
-						}
+											if err := n.sendMsgWithTimeout(from, protoport.ReqMsg{R: req}); err != nil {
+						n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
+					}
 					} else if err := n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
 						n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
 					}
@@ -1214,7 +1222,11 @@ func (n *Node) handleRoot(from transport.MemAddr, r syncproto.Root) {
 
 	n.emit(EventDescent, map[string]any{"dir": "->", "kind": "req", "prefix": ""})
 	req := syncproto.DescentReq{Prefix: nil}
-	if err := n.sendTo(from, wire.MT_DESCENT_REQ, syncproto.EncodeDescentReq(req)); err != nil {
+	if n.ms != nil {
+		if err := n.ms.Send(n.ctx, from, protoport.DescentReqMsg{R: req}); err != nil {
+			n.emit(EventWarn, map[string]any{"msg": "send_descent_req_err", "err": err.Error()})
+		}
+	} else if err := n.sendTo(from, wire.MT_DESCENT_REQ, syncproto.EncodeDescentReq(req)); err != nil {
 		n.emit(EventWarn, map[string]any{"msg": "send_descent_req_err", "err": err.Error()})
 	}
 }
@@ -1230,7 +1242,11 @@ func (n *Node) handleDescentReq(from transport.MemAddr, req syncproto.DescentReq
 		kind = "resp_leaves"
 	}
 	n.emit(EventDescent, map[string]any{"dir": "<-", "kind": kind, "prefix": string(req.Prefix)})
-	if err := n.sendTo(from, wire.MT_DESCENT_RESP, syncproto.EncodeDescentResp(resp)); err != nil {
+	if n.ms != nil {
+		if err := n.ms.Send(n.ctx, from, protoport.DescentRespMsg{R: resp}); err != nil {
+			n.emit(EventWarn, map[string]any{"msg": "send_descent_resp_err", "err": err.Error()})
+		}
+	} else if err := n.sendTo(from, wire.MT_DESCENT_RESP, syncproto.EncodeDescentResp(resp)); err != nil {
 		n.emit(EventWarn, map[string]any{"msg": "send_descent_resp_err", "err": err.Error()})
 	}
 }
@@ -1372,13 +1388,21 @@ func (n *Node) onDeltaNackHandled(from transport.MemAddr, nack syncproto.DeltaNa
 
 	// We keep the last sent chunk in sess.sndInflight (window is small).
 	n.sessMu.Lock()
-	infl := n.sess.sndInflight
+	// Snapshot inflight to avoid races with the sender updating it
+	infl := make(map[segment.ID][]syncproto.DeltaChunk, len(n.sess.sndInflight))
+	for sid, list := range n.sess.sndInflight {
+		copyList := make([]syncproto.DeltaChunk, len(list))
+		copy(copyList, list)
+		infl[sid] = copyList
+	}
 	n.sessMu.Unlock()
 	if len(infl) == 0 {
 		n.emit(EventWarn, map[string]any{"msg": "nack_no_inflight"})
 		return
 	}
-	if inflist, ok := infl[0]; ok {
+	// Search all SIDs for the matching seq
+	for sid, inflist := range infl {
+		_ = sid // sid preserved for clarity; event logs include ch.SID
 		for _, ch := range inflist {
 			if ch.Seq != nack.Seq {
 				continue
@@ -1387,7 +1411,13 @@ func (n *Node) onDeltaNackHandled(from transport.MemAddr, nack syncproto.DeltaNa
 			n.emit(EventSendDeltaChunk, map[string]any{
 				"sid": int(ch.SID), "seq": ch.Seq, "entries": len(ch.Entries), "bytes": len(enc), "last": ch.Last, "retrans": true, "reason": "nack",
 			})
-			if err := n.sendTo(from, wire.MT_SYNC_DELTA_CHUNK, enc); err != nil {
+			var err error
+			if n.ms != nil {
+				err = n.ms.Send(n.ctx, from, protoport.DeltaChunkMsg{C: ch})
+			} else {
+				err = n.sendTo(from, wire.MT_SYNC_DELTA_CHUNK, enc)
+			}
+			if err != nil {
 				n.emit(EventWarn, map[string]any{"msg": "retransmit_err", "seq": ch.Seq, "err": err.Error()})
 			}
 			return
@@ -1395,4 +1425,17 @@ func (n *Node) onDeltaNackHandled(from transport.MemAddr, nack syncproto.DeltaNa
 	}
 	// No match in inflight (could be stale); log and move on.
 	n.emit(EventWarn, map[string]any{"msg": "nack_unknown_seq", "seq": nack.Seq})
+}
+
+func (n *Node) sendMsgWithTimeout(to transport.MemAddr, m protoport.Message) error {
+	if n.ms == nil {
+		return fmt.Errorf("no messenger")
+	}
+	ctx := n.ctx
+	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > 2*time.Second {
+		c, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		return n.ms.Send(c, to, m)
+	}
+	return n.ms.Send(ctx, to, m)
 }
