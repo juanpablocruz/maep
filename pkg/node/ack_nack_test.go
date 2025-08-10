@@ -1,4 +1,4 @@
-package node
+package node_test
 
 import (
 	"testing"
@@ -6,6 +6,8 @@ import (
 
 	"github.com/juanpablocruz/maep/pkg/hlc"
 	"github.com/juanpablocruz/maep/pkg/model"
+	node "github.com/juanpablocruz/maep/pkg/node"
+	testutil "github.com/juanpablocruz/maep/pkg/node/testutil"
 	"github.com/juanpablocruz/maep/pkg/oplog"
 	"github.com/juanpablocruz/maep/pkg/syncproto"
 	"github.com/juanpablocruz/maep/pkg/transport"
@@ -21,17 +23,18 @@ func TestDuplicateChunkAckNoNack(t *testing.T) {
 	defer b.Close()
 
 	// Node on B receiving from A
-	ev := make(chan Event, 64)
-	n := NewWithOptions("NB",
-		WithEndpoint(b),
-		WithPeer("A"),
-		WithTickerEvery(100*time.Millisecond),
-		WithLog(oplog.New()),
-		WithClock(hlc.New()),
+	n := node.NewWithOptions("NB",
+		node.WithEndpoint(b),
+		node.WithPeer("A"),
+		node.WithTickerEvery(100*time.Millisecond),
+		node.WithLog(oplog.New()),
+		node.WithClock(hlc.New()),
 	)
-	n.AttachEvents(ev)
+	ec := testutil.NewEventCollector(256)
+	ec.Attach(n)
 	n.Start()
 	defer n.Stop()
+	defer ec.Detach(n)
 
 	// Send an in-order chunk (seq 0)
 	op := model.Op{Version: model.OpSchemaV1, Kind: model.OpKindPut, Key: "x", HLCTicks: n.Clock.Now()}
@@ -49,32 +52,28 @@ func TestDuplicateChunkAckNoNack(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Collect events briefly
-	time.Sleep(30 * time.Millisecond)
-	close(ev)
-	sawAckDuplicate := false
-	sawNackDuplicate := false
-	for e := range ev {
-		if e.Type != EventAck {
-			continue
-		}
-		dir, _ := e.Fields["dir"].(string)
-		if dir != "send" {
-			continue
-		}
-		if r, _ := e.Fields["reason"].(string); r == "duplicate" {
-			if _, isNack := e.Fields["nack"].(bool); isNack {
-				sawNackDuplicate = true
-			} else {
-				sawAckDuplicate = true
+	ok := ec.WaitFor(200*time.Millisecond, func(evts []node.Event) bool {
+		sawAckDuplicate := false
+		sawNackDuplicate := false
+		for _, e := range evts {
+			if e.Type != node.EventAck {
+				continue
+			}
+			if dir, _ := e.Fields["dir"].(string); dir != "send" {
+				continue
+			}
+			if r, _ := e.Fields["reason"].(string); r == "duplicate" {
+				if _, isNack := e.Fields["nack"].(bool); isNack {
+					sawNackDuplicate = true
+				} else {
+					sawAckDuplicate = true
+				}
 			}
 		}
-	}
-	if !sawAckDuplicate {
-		t.Fatalf("expected ACK(reason=duplicate) on duplicate chunk")
-	}
-	if sawNackDuplicate {
-		t.Fatalf("did not expect NACK(reason=duplicate) on duplicate chunk")
+		return sawAckDuplicate && !sawNackDuplicate
+	})
+	if !ok {
+		t.Fatalf("expected ACK(reason=duplicate) and no NACK on duplicate chunk")
 	}
 }
 
@@ -86,17 +85,18 @@ func TestFutureChunkNackOutOfWindow(t *testing.T) {
 	defer a.Close()
 	defer b.Close()
 
-	ev := make(chan Event, 64)
-	n := NewWithOptions("NB",
-		WithEndpoint(b),
-		WithPeer("A"),
-		WithTickerEvery(100*time.Millisecond),
-		WithLog(oplog.New()),
-		WithClock(hlc.New()),
+	n := node.NewWithOptions("NB",
+		node.WithEndpoint(b),
+		node.WithPeer("A"),
+		node.WithTickerEvery(100*time.Millisecond),
+		node.WithLog(oplog.New()),
+		node.WithClock(hlc.New()),
 	)
-	n.AttachEvents(ev)
+	ec := testutil.NewEventCollector(256)
+	ec.Attach(n)
 	n.Start()
 	defer n.Stop()
+	defer ec.Detach(n)
 
 	// Send seq=1 while expect=0
 	op := model.Op{Version: model.OpSchemaV1, Kind: model.OpKindPut, Key: "y", HLCTicks: n.Clock.Now()}
@@ -106,20 +106,20 @@ func TestFutureChunkNackOutOfWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	time.Sleep(30 * time.Millisecond)
-	close(ev)
-	sawNack := false
-	for e := range ev {
-		if e.Type != EventAck {
-			continue
-		}
-		if _, isNack := e.Fields["nack"].(bool); isNack {
-			if r, _ := e.Fields["reason"].(string); r == "out_of_window" {
-				sawNack = true
+	ok := ec.WaitFor(200*time.Millisecond, func(evts []node.Event) bool {
+		for _, e := range evts {
+			if e.Type != node.EventAck {
+				continue
+			}
+			if _, isNack := e.Fields["nack"].(bool); isNack {
+				if r, _ := e.Fields["reason"].(string); r == "out_of_window" {
+					return true
+				}
 			}
 		}
-	}
-	if !sawNack {
+		return false
+	})
+	if !ok {
 		t.Fatalf("expected NACK(reason=out_of_window) for future chunk")
 	}
 }
@@ -132,17 +132,18 @@ func TestApplyDeltaChunk_InOrder_AckAndHLCMerge(t *testing.T) {
 	defer a.Close()
 	defer b.Close()
 
-	ev := make(chan Event, 128)
-	n := NewWithOptions("NB",
-		WithEndpoint(b),
-		WithPeer("A"),
-		WithTickerEvery(100*time.Millisecond),
-		WithLog(oplog.New()),
-		WithClock(hlc.New()),
+	n := node.NewWithOptions("NB",
+		node.WithEndpoint(b),
+		node.WithPeer("A"),
+		node.WithTickerEvery(100*time.Millisecond),
+		node.WithLog(oplog.New()),
+		node.WithClock(hlc.New()),
 	)
-	n.AttachEvents(ev)
+	ec := testutil.NewEventCollector(256)
+	ec.Attach(n)
 	n.Start()
 	defer n.Stop()
+	defer ec.Detach(n)
 
 	// Build a chunk with HLC higher than node clock
 	var actor model.ActorID
@@ -156,22 +157,19 @@ func TestApplyDeltaChunk_InOrder_AckAndHLCMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Wait a bit for processing and ACK
-	time.Sleep(30 * time.Millisecond)
-
-	// Verify that we saw a send ACK for seq 0 and that the log contains the op
-	sawAck := false
-	for len(ev) > 0 {
-		e := <-ev
-		if e.Type == EventAck {
-			if dir, _ := e.Fields["dir"].(string); dir == "send" {
-				if seq, _ := e.Fields["seq"].(uint32); seq == 0 {
-					sawAck = true
+	ok := ec.WaitFor(200*time.Millisecond, func(evts []node.Event) bool {
+		for _, e := range evts {
+			if e.Type == node.EventAck {
+				if dir, _ := e.Fields["dir"].(string); dir == "send" {
+					if seq, _ := e.Fields["seq"].(uint32); seq == 0 {
+						return true
+					}
 				}
 			}
 		}
-	}
-	if !sawAck {
+		return false
+	})
+	if !ok {
 		t.Fatalf("expected ACK seq 0 to be sent")
 	}
 	snap := n.Log.Snapshot()
@@ -192,15 +190,18 @@ func TestIdempotentChunkReplay_NoDuplication(t *testing.T) {
 	defer a.Close()
 	defer b.Close()
 
-	n := NewWithOptions("NB",
-		WithEndpoint(b),
-		WithPeer("A"),
-		WithTickerEvery(100*time.Millisecond),
-		WithLog(oplog.New()),
-		WithClock(hlc.New()),
+	n := node.NewWithOptions("NB",
+		node.WithEndpoint(b),
+		node.WithPeer("A"),
+		node.WithTickerEvery(100*time.Millisecond),
+		node.WithLog(oplog.New()),
+		node.WithClock(hlc.New()),
 	)
+	ec := testutil.NewEventCollector(256)
+	ec.Attach(n)
 	n.Start()
 	defer n.Stop()
+	defer ec.Detach(n)
 
 	var actor model.ActorID
 	actor[0] = 0x02
