@@ -500,6 +500,41 @@ func (n *Node) handleSummaryResp(from transport.MemAddr, sum syncproto.Summary) 
 	n.peerSVMu.Lock()
 	n.peerSV[string(from)] = sum
 	n.peerSVMu.Unlock()
+	// Log a concise SV frontier summary (top 5 segments by count)
+	type segView struct {
+		sid int
+		cnt uint32
+	}
+	sv := make([]segView, 0, len(sum.SegFrontier))
+	for _, it := range sum.SegFrontier {
+		sv = append(sv, segView{sid: int(it.SID), cnt: it.Count})
+	}
+	slices.SortFunc(sv, func(a, b segView) int {
+		if a.cnt > b.cnt {
+			return -1
+		}
+		if a.cnt < b.cnt {
+			return 1
+		}
+		if a.sid < b.sid {
+			return -1
+		}
+		if a.sid > b.sid {
+			return 1
+		}
+		return 0
+	})
+	top := 5
+	if len(sv) < top {
+		top = len(sv)
+	}
+	n.emit(EventSendSummary, map[string]any{"dir": "recv", "peer": from, "sv_segs": len(sum.SegFrontier), "sv_keys": len(sum.Frontier), "top_segs": func() []string {
+		out := make([]string, 0, top)
+		for i := 0; i < top; i++ {
+			out = append(out, fmt.Sprintf("%d:%d", sv[i].sid, sv[i].cnt))
+		}
+		return out
+	}()})
 
 	// Build needs bounded by the receiver-advertised frontier (SV)
 	req := syncproto.DiffForOutbound(n.Log, sum)
@@ -1025,18 +1060,31 @@ func (n *Node) streamChunks(to transport.MemAddr, chunks []syncproto.DeltaChunk,
 		ch     syncproto.DeltaChunk
 		sentAt time.Time
 	}
-	unacked := make(map[uint32]*inflight)
-	next := 0
+	// Group chunks per SID
+	perSID := map[segment.ID][]syncproto.DeltaChunk{}
+	for _, ch := range chunks {
+		perSID[ch.SID] = append(perSID[ch.SID], ch)
+	}
+	// Per-SID state
+	unacked := map[segment.ID]map[uint32]*inflight{}
+	nextIdx := map[segment.ID]int{}
 
-	// Keep sess.sndInflight in sync so onDeltaNack can find any in-flight seq.
-	snapshotInflight := func() {}
+	snapshotInflight := func() {
+		n.sessMu.Lock()
+		n.sess.sndInflight = make(map[segment.ID][]syncproto.DeltaChunk)
+		for sid, m := range unacked {
+			list := make([]syncproto.DeltaChunk, 0, len(m))
+			for _, inf := range m {
+				list = append(list, inf.ch)
+			}
+			n.sess.sndInflight[sid] = list
+		}
+		n.sessMu.Unlock()
+	}
 
-	// Helper to send one chunk
 	sendOne := func(ch syncproto.DeltaChunk) bool {
 		enc := syncproto.EncodeDeltaChunk(ch)
-		n.emit(EventSendDeltaChunk, map[string]any{
-			"sid": int(ch.SID), "seq": ch.Seq, "entries": len(ch.Entries), "bytes": len(enc), "last": ch.Last,
-		})
+		n.emit(EventSendDeltaChunk, map[string]any{"sid": int(ch.SID), "seq": ch.Seq, "entries": len(ch.Entries), "bytes": len(enc), "last": ch.Last})
 		var err error
 		if n.ms != nil {
 			err = n.ms.Send(n.ctx, to, protoport.DeltaChunkMsg{C: ch})
@@ -1047,25 +1095,49 @@ func (n *Node) streamChunks(to transport.MemAddr, chunks []syncproto.DeltaChunk,
 			n.emit(EventWarn, map[string]any{"msg": "send_delta_chunk_err", "err": err.Error()})
 			return false
 		}
-		unacked[ch.Seq] = &inflight{ch: ch, sentAt: time.Now()}
+		if unacked[ch.SID] == nil {
+			unacked[ch.SID] = make(map[uint32]*inflight)
+		}
+		unacked[ch.SID][ch.Seq] = &inflight{ch: ch, sentAt: time.Now()}
 		snapshotInflight()
 		return true
 	}
 
-	// Initial fill
-	for next < len(chunks) && len(unacked) < window {
-		if !sendOne(chunks[next]) {
-			return
+	// Initial fill per SID
+	for sid, list := range perSID {
+		sent := 0
+		for nextIdx[sid] < len(list) && sent < window {
+			if !sendOne(list[nextIdx[sid]]) {
+				return
+			}
+			nextIdx[sid]++
+			sent++
 		}
-		next++
 	}
 
 	tick := time.NewTicker(timeout / 2)
 	defer tick.Stop()
 
 	for {
-		if len(unacked) == 0 && next >= len(chunks) {
-			return
+		// exit when all SIDs finished
+		allDone := true
+		for sid, list := range perSID {
+			if nextIdx[sid] < len(list) {
+				allDone = false
+				break
+			}
+		}
+		if allDone {
+			idle := true
+			for _, m := range unacked {
+				if len(m) > 0 {
+					idle = false
+					break
+				}
+			}
+			if idle {
+				return
+			}
 		}
 
 		select {
@@ -1075,41 +1147,43 @@ func (n *Node) streamChunks(to transport.MemAddr, chunks []syncproto.DeltaChunk,
 			return
 
 		case ack := <-ackCh:
-			// Ack always increases by 1 (receiver is in-order)
-			_ = ack.SID
-			delete(unacked, ack.Seq)
+			// Ack per SID
+			if m := unacked[ack.SID]; m != nil {
+				delete(m, ack.Seq)
+			}
 			snapshotInflight()
-			// Top up window
-			for next < len(chunks) && len(unacked) < window {
-				if !sendOne(chunks[next]) {
+			// Top up this SID
+			sid := ack.SID
+			list := perSID[sid]
+			inFlight := len(unacked[sid])
+			for nextIdx[sid] < len(list) && inFlight < window {
+				if !sendOne(list[nextIdx[sid]]) {
 					return
 				}
-				next++
+				nextIdx[sid]++
+				inFlight++
 			}
 
 		case <-tick.C:
-			// Retransmit any expired chunk
+			// Retransmit expired per SID
 			now := time.Now()
-			for s, inf := range unacked {
-				if now.Sub(inf.sentAt) >= timeout {
-					// resend
-					enc := syncproto.EncodeDeltaChunk(inf.ch)
-					n.emit(EventSendDeltaChunk, map[string]any{
-						"sid": int(inf.ch.SID), "seq": inf.ch.Seq, "entries": len(inf.ch.Entries), "bytes": len(enc), "last": inf.ch.Last, "retrans": true,
-					})
-					var err error
-					if n.ms != nil {
-						err = n.ms.Send(n.ctx, to, protoport.DeltaChunkMsg{C: inf.ch})
-					} else {
-						err = n.sendTo(to, wire.MT_SYNC_DELTA_CHUNK, enc)
+			for _, m := range unacked {
+				for _, inf := range m {
+					if now.Sub(inf.sentAt) >= timeout {
+						enc := syncproto.EncodeDeltaChunk(inf.ch)
+						n.emit(EventSendDeltaChunk, map[string]any{"sid": int(inf.ch.SID), "seq": inf.ch.Seq, "entries": len(inf.ch.Entries), "bytes": len(enc), "last": inf.ch.Last, "retrans": true})
+						var err error
+						if n.ms != nil {
+							err = n.ms.Send(n.ctx, to, protoport.DeltaChunkMsg{C: inf.ch})
+						} else {
+							err = n.sendTo(to, wire.MT_SYNC_DELTA_CHUNK, enc)
+						}
+						if err != nil {
+							n.emit(EventWarn, map[string]any{"msg": "send_delta_chunk_err", "err": err.Error()})
+							return
+						}
+						inf.sentAt = now
 					}
-					if err != nil {
-						n.emit(EventWarn, map[string]any{"msg": "send_delta_chunk_err", "err": err.Error()})
-						return
-					}
-					inf.sentAt = now
-					// keep inacked
-					_ = s
 				}
 			}
 			snapshotInflight()
