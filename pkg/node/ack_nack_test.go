@@ -51,25 +51,32 @@ func TestDuplicateChunkAckNoNack(t *testing.T) {
 
 	// Collect events briefly
 	time.Sleep(30 * time.Millisecond)
-	close(ev)
+	// drain events without closing channel to avoid racing with emitters
 	sawAckDuplicate := false
 	sawNackDuplicate := false
-	for e := range ev {
-		if e.Type != EventAck {
-			continue
-		}
-		dir, _ := e.Fields["dir"].(string)
-		if dir != "send" {
-			continue
-		}
-		if r, _ := e.Fields["reason"].(string); r == "duplicate" {
-			if _, isNack := e.Fields["nack"].(bool); isNack {
-				sawNackDuplicate = true
-			} else {
-				sawAckDuplicate = true
+	for {
+		select {
+		case e := <-ev:
+			if e.Type != EventAck {
+				continue
 			}
+			dir, _ := e.Fields["dir"].(string)
+			if dir != "send" {
+				continue
+			}
+			if r, _ := e.Fields["reason"].(string); r == "duplicate" {
+				if _, isNack := e.Fields["nack"].(bool); isNack {
+					sawNackDuplicate = true
+				} else {
+					sawAckDuplicate = true
+				}
+			}
+		default:
+			goto doneDup
 		}
 	}
+
+doneDup:
 	if !sawAckDuplicate {
 		t.Fatalf("expected ACK(reason=duplicate) on duplicate chunk")
 	}
@@ -107,18 +114,25 @@ func TestFutureChunkNackOutOfWindow(t *testing.T) {
 	}
 
 	time.Sleep(30 * time.Millisecond)
-	close(ev)
+	// drain events without closing channel to avoid racing with emitters
 	sawNack := false
-	for e := range ev {
-		if e.Type != EventAck {
-			continue
-		}
-		if _, isNack := e.Fields["nack"].(bool); isNack {
-			if r, _ := e.Fields["reason"].(string); r == "out_of_window" {
-				sawNack = true
+	for {
+		select {
+		case e := <-ev:
+			if e.Type != EventAck {
+				continue
 			}
+			if _, isNack := e.Fields["nack"].(bool); isNack {
+				if r, _ := e.Fields["reason"].(string); r == "out_of_window" {
+					sawNack = true
+				}
+			}
+		default:
+			goto doneFut
 		}
 	}
+
+doneFut:
 	if !sawNack {
 		t.Fatalf("expected NACK(reason=out_of_window) for future chunk")
 	}
