@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -53,6 +54,10 @@ var (
 	flRetransTimeout    = flag.Duration("retrans-timeout", 2*time.Second, "retransmit timeout for unacked chunks")
 
 	flDescent = flag.Bool("descent", true, "use Merkle descent for summaries")
+
+	// diagnostics
+	flPrintEvents = flag.Bool("print-events", false, "print selected reconciliation events to stdout")
+	flTypes       = flag.String("types", "send_root,descent,send_req,send_delta_chunk,recv_delta_chunk,ack,sync,applied_delta,warn", "comma-separated event types to print")
 )
 
 type simNode struct {
@@ -313,7 +318,8 @@ func main() {
 				_ = rootsCSV.Write(row)
 				if allEq {
 					ss.mu.Lock()
-					if ss.convergedAt.IsZero() {
+					// Only record convergence after writers have stopped to measure from a stable point.
+					if ss.convergedAt.IsZero() && !ss.writesStoppedAt.IsZero() {
 						ss.convergedAt = time.Now()
 					}
 					ss.mu.Unlock()
@@ -335,7 +341,15 @@ func main() {
 		}
 	}()
 
-	// consume events; track SYNC begin/end
+	// prepare event-type filter
+	typeFilter := map[string]bool{}
+	if flTypes != nil && *flTypes != "" {
+		for _, t := range strings.Split(*flTypes, ",") {
+			typeFilter[strings.TrimSpace(t)] = true
+		}
+	}
+
+	// consume events; track SYNC begin/end and optionally print
 	evCtx, evCancel := context.WithCancel(ctx)
 	var evWG sync.WaitGroup
 	evWG.Add(1)
@@ -348,6 +362,13 @@ func main() {
 					return
 				}
 				tele.handle(e)
+				if *flPrintEvents {
+					et := string(e.Type)
+					if len(typeFilter) == 0 || typeFilter[et] {
+						// compact one-line render
+						fmt.Printf("%s %-6s %-20s %v\n", e.Time.Format(time.RFC3339Nano), e.Node, et, e.Fields)
+					}
+				}
 				if e.Type == node.EventSync {
 					act, _ := e.Fields["action"].(string)
 					switch act {
@@ -438,7 +459,7 @@ func main() {
 			}
 		}
 		ss.mu.Lock()
-		if allEq && ss.convergedAt.IsZero() {
+		if allEq && ss.convergedAt.IsZero() && !ss.writesStoppedAt.IsZero() {
 			ss.convergedAt = time.Now()
 		}
 		ss.mu.Unlock()
@@ -452,10 +473,17 @@ func main() {
 		*flLoss, *flDup, *flReord, flDelay.String(), flJitter.String())
 	fmt.Fprintf(sumTxt, "SyncLatency(s): mean=%.3f stdev=%.3f samples=%d\n", mean, stdev, len(ss.latencies))
 	ss.mu.Lock()
-	if !ss.convergedAt.IsZero() && !ss.writesStoppedAt.IsZero() {
-		fmt.Fprintf(sumTxt, "Convergence(s): %.3f\n", ss.convergedAt.Sub(ss.writesStoppedAt).Seconds())
-	} else if !ss.convergedAt.IsZero() && !ss.firstSync.IsZero() {
-		fmt.Fprintf(sumTxt, "Convergence(s): %.3f\n", ss.convergedAt.Sub(ss.firstSync).Seconds())
+	base := ss.writesStoppedAt
+	if base.IsZero() {
+		// If writers never stopped, treat convergence as n/a to avoid misleading 0.000
+		base = time.Time{}
+	}
+	if !ss.convergedAt.IsZero() && !base.IsZero() {
+		diff := ss.convergedAt.Sub(base).Seconds()
+		if diff < 0 {
+			diff = 0
+		}
+		fmt.Fprintf(sumTxt, "Convergence(s): %.3f\n", diff)
 	} else {
 		fmt.Fprintf(sumTxt, "Convergence(s): n/a\n")
 	}
@@ -469,12 +497,17 @@ func main() {
 		*flLoss, *flDup, *flReord, flDelay.String(), flJitter.String())
 	fmt.Fprintf(sumTxt, "Delta window: %d  Retrans timeout: %s\n", *flDeltaWindowChunks, flRetransTimeout.String())
 	fmt.Fprintf(sumTxt, "SyncLatency(s): mean=%.3f stdev=%.3f samples=%d\n", mean, stdev, len(ss.latencies))
-
 	ss.mu.Lock()
-	if !ss.convergedAt.IsZero() && !ss.writesStoppedAt.IsZero() {
-		fmt.Fprintf(sumTxt, "Convergence(s): %.3f\n", ss.convergedAt.Sub(ss.writesStoppedAt).Seconds())
-	} else if !ss.convergedAt.IsZero() && !ss.firstSync.IsZero() {
-		fmt.Fprintf(sumTxt, "Convergence(s): %.3f\n", ss.convergedAt.Sub(ss.firstSync).Seconds())
+	base2 := ss.writesStoppedAt
+	if base2.IsZero() {
+		base2 = time.Time{}
+	}
+	if !ss.convergedAt.IsZero() && !base2.IsZero() {
+		diff := ss.convergedAt.Sub(base2).Seconds()
+		if diff < 0 {
+			diff = 0
+		}
+		fmt.Fprintf(sumTxt, "Convergence(s): %.3f\n", diff)
 	} else {
 		fmt.Fprintf(sumTxt, "Convergence(s): n/a\n")
 	}

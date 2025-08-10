@@ -37,6 +37,11 @@ type syncSession struct {
 	dqueue      [][]byte
 	lastRoot    [32]byte
 	haveRoot    bool
+
+	// Client-side bookkeeping for requests awaiting a delta response
+	lastReq         syncproto.Req
+	awaitingDelta   bool
+	repairAttempted bool
 }
 
 type Node struct {
@@ -163,13 +168,13 @@ func (n *Node) IsPaused() bool { return n.paused.Load() }
 
 func (n *Node) Put(key string, val []byte, actor model.ActorID) {
 	op := model.Op{
-		Version:  model.OpSchemaV1,
-		Kind:     model.OpKindPut,
-		Key:      key,
-		Value:    slices.Clone(val),
-		HLCTicks: n.Clock.Now(),
+		Version:   model.OpSchemaV1,
+		Kind:      model.OpKindPut,
+		Key:       key,
+		Value:     slices.Clone(val),
+		HLCTicks:  n.Clock.Now(),
 		WallNanos: time.Now().UnixNano(),
-		Actor:    actor,
+		Actor:     actor,
 	}
 	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
 	n.Log.Append(op)
@@ -180,12 +185,12 @@ func (n *Node) Put(key string, val []byte, actor model.ActorID) {
 
 func (n *Node) Delete(key string, actor model.ActorID) {
 	op := model.Op{
-		Version:  model.OpSchemaV1,
-		Kind:     model.OpKindDel,
-		Key:      key,
-		HLCTicks: n.Clock.Now(),
+		Version:   model.OpSchemaV1,
+		Kind:      model.OpKindDel,
+		Key:       key,
+		HLCTicks:  n.Clock.Now(),
 		WallNanos: time.Now().UnixNano(),
-		Actor:    actor,
+		Actor:     actor,
 	}
 	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
 	n.Log.Append(op)
@@ -455,6 +460,13 @@ func (n *Node) onSummary(from transport.MemAddr, b []byte) {
 		slog.Warn("send_req_err", "node", n.Name, "err", err)
 		n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
 	}
+
+	// Track last request to enable delta-empty repair fallback on the server side
+	n.sessMu.Lock()
+	n.sess.lastReq = req
+	n.sess.awaitingDelta = true
+	n.sess.repairAttempted = false
+	n.sessMu.Unlock()
 }
 
 func (n *Node) onReq(from transport.MemAddr, b []byte) {
@@ -478,6 +490,29 @@ func (n *Node) onReq(from transport.MemAddr, b []byte) {
 	}
 
 	if ops == 0 {
+		// delta empty: if we have a recent request we sent (awaitingDelta), and
+		// it asked for specific keys, force a repair attempt by re-sending From=0
+		// for those keys once. This breaks loops on equal-count/different-hash.
+		n.sessMu.Lock()
+		lr := n.sess.lastReq
+		awaiting := n.sess.awaitingDelta
+		attempted := n.sess.repairAttempted
+		n.sessMu.Unlock()
+
+		if awaiting && !attempted && len(lr.Needs) > 0 {
+			// mark repair attempted and send a follow-up request with From=0
+			n.sessMu.Lock()
+			n.sess.repairAttempted = true
+			n.sessMu.Unlock()
+			req0 := syncproto.Req{Needs: make([]syncproto.Need, 0, len(lr.Needs))}
+			for _, need := range lr.Needs {
+				req0.Needs = append(req0.Needs, syncproto.Need{Key: need.Key, From: 0})
+			}
+			n.emit(EventSendReq, map[string]any{"needs": req0.Needs, "reason": "delta_empty_repair"})
+			_ = n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req0))
+			return
+		}
+
 		slog.Info("send_delta_empty", "node", n.Name)
 		_ = n.sendTo(from, wire.MT_SYNC_END, nil)
 		n.endSessionTo(from, false, "delta_empty")
@@ -514,6 +549,11 @@ func (n *Node) onDelta(from transport.MemAddr, b []byte) {
 	n.emit(EventAppliedDelta, map[string]any{"keys": len(d.Entries), "before": before, "after": after})
 
 	changed := !countsEqual(before, after)
+
+	// We received a non-empty delta; clear awaiting flag.
+	n.sessMu.Lock()
+	n.sess.awaitingDelta = false
+	n.sessMu.Unlock()
 
 	if n.maybeEndIfEqual(from) {
 		return
@@ -799,16 +839,11 @@ func (n *Node) onDeltaChunk(from transport.MemAddr, b []byte) {
 	// Reject anything not exactly the next expected chunk.
 	if ch.Seq != expect {
 		if ch.Seq < expect {
-			// Duplicate/late: ACK previous-in-order to hint resync; also NACK duplicate.
+			// Duplicate/late: just ACK the last in-order; do not send a duplicate NACK.
 			if expect > 0 {
 				_ = n.sendTo(from, wire.MT_SYNC_ACK, syncproto.EncodeAck(syncproto.Ack{Seq: expect - 1}))
 				n.emit(EventAck, map[string]any{"dir": "send", "seq": expect - 1, "reason": "duplicate"})
 			}
-			_ = n.sendTo(from, wire.MT_DELTA_NACK, syncproto.EncodeDeltaNack(syncproto.DeltaNack{
-				Seq:  ch.Seq,
-				Code: 2, // 2 = duplicate
-			}))
-			n.emit(EventAck, map[string]any{"dir": "send", "nack": true, "seq": ch.Seq, "reason": "duplicate"})
 		} else { // ch.Seq > expect
 			// Out-of-window/skip: ACK last in-order and NACK the future chunk.
 			if expect > 0 {
@@ -833,6 +868,9 @@ func (n *Node) onDeltaChunk(from transport.MemAddr, b []byte) {
 	after := n.Log.CountPerKey()
 	n.emit(EventAppliedDelta, map[string]any{"keys": len(ch.Entries), "before": before, "after": after})
 
+	// Guard: if no-op (counts unchanged) and this was the last chunk, avoid livelock.
+	noChange := countsEqual(before, after)
+
 	n.sessMu.Lock()
 	n.sess.rcvExpect++
 	n.sessMu.Unlock()
@@ -853,17 +891,22 @@ func (n *Node) onDeltaChunk(from transport.MemAddr, b []byte) {
 		n.sessMu.Unlock()
 
 		if active && len(lr.Leaves) > 0 {
-			req := syncproto.DiffForReq(n.Log, lr)
-			if len(req.Needs) > 0 {
-				n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "continue_after_chunk"})
-				_ = n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req))
-				// next delta stream will start at seq=0
-				n.sessMu.Lock()
-				n.sess.rcvExpect = 0
-				n.sessMu.Unlock()
-				return
+			if noChange {
+				// If nothing changed after applying this stream, do not immediately re-request.
+				// Fall through to root/descent validation to break potential loops.
+			} else {
+				req := syncproto.DiffForReq(n.Log, lr)
+				if len(req.Needs) > 0 {
+					n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "continue_after_chunk"})
+					_ = n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req))
+					// next delta stream will start at seq=0
+					n.sessMu.Lock()
+					n.sess.rcvExpect = 0
+					n.sessMu.Unlock()
+					return
+				}
+				// If no more needs by summary, equality will be detected by the root path below.
 			}
-			// If no more needs by summary, equality will be detected by the root path below.
 		}
 
 		// 2) Root/descent path: if still unequal, keep descending.

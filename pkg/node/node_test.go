@@ -7,6 +7,7 @@ import (
 	"github.com/juanpablocruz/maep/pkg/hlc"
 	"github.com/juanpablocruz/maep/pkg/model"
 	"github.com/juanpablocruz/maep/pkg/oplog"
+	"github.com/juanpablocruz/maep/pkg/syncproto"
 )
 
 func TestCountsEqual(t *testing.T) {
@@ -180,5 +181,22 @@ func TestPutAndDelete(t *testing.T) {
 		}
 	default:
 		t.Fatalf("missing del event")
+	}
+}
+
+func TestChunkingSplitsAndMarksLast(t *testing.T) {
+	n := &Node{DeltaMaxBytes: 128}
+	// Create a delta with two entries big enough to force split
+	big := make([]byte, 50)
+	d := syncproto.Delta{Entries: []syncproto.DeltaEntry{
+		{Key: "k1", Ops: []model.Op{{Version: model.OpSchemaV1, Kind: model.OpKindPut, Key: "k1", Value: big}}},
+		{Key: "k2", Ops: []model.Op{{Version: model.OpSchemaV1, Kind: model.OpKindPut, Key: "k2", Value: big}}},
+	}}
+	chunks := n.chunkDelta(d, 128)
+	if len(chunks) < 1 {
+		t.Fatalf("expected at least one chunk")
+	}
+	if !chunks[len(chunks)-1].Last {
+		t.Fatalf("last chunk must be marked Last=true")
 	}
 }
