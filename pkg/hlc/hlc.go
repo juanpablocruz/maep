@@ -38,7 +38,7 @@ func (c *Clock) Merge(remote uint64) uint64 {
 	defer c.mu.Unlock()
 
 	local := (uint64(c.lastWall) << 16) | (uint64(c.logical) & 0xFFFF)
-	nowTick := uint64(time.Now().UnixNano()) << 16
+	nowTick := uint64(time.Now().UnixNano()) >> 16
 
 	base := max(remote, max(nowTick, local))
 
