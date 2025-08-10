@@ -355,6 +355,14 @@ func (n *Node) summaryLoop() {
 					nextAllowed = time.Now().Add(jitter(backoff))
 					return
 				}
+				// Cache our per-key frontier snapshot for SV-bounded receive checks (typed messenger path)
+				sum := syncproto.BuildSummaryFromLog(n.Log)
+				n.sessMu.Lock()
+				n.sess.sentFrontier = make(map[string]uint32, len(sum.Frontier))
+				for _, it := range sum.Frontier {
+					n.sess.sentFrontier[it.Key] = it.From
+				}
+				n.sessMu.Unlock()
 			} else {
 				if err := n.send(wire.MT_SYNC_SUMMARY_REQ, syncproto.EncodeSummaryReq(syncproto.SummaryReq{Root: root})); err != nil {
 					slog.Warn("send_summary_req_err", "node", n.Name, "err", err)
@@ -1378,7 +1386,9 @@ func (n *Node) onDeltaNackHandled(from transport.MemAddr, nack syncproto.DeltaNa
 		n.emit(EventWarn, map[string]any{"msg": "nack_no_inflight"})
 		return
 	}
-	if inflist, ok := infl[0]; ok {
+	// Search all SIDs for the matching seq
+	for sid, inflist := range infl {
+		_ = sid // sid preserved for clarity; event logs include ch.SID
 		for _, ch := range inflist {
 			if ch.Seq != nack.Seq {
 				continue
@@ -1387,7 +1397,13 @@ func (n *Node) onDeltaNackHandled(from transport.MemAddr, nack syncproto.DeltaNa
 			n.emit(EventSendDeltaChunk, map[string]any{
 				"sid": int(ch.SID), "seq": ch.Seq, "entries": len(ch.Entries), "bytes": len(enc), "last": ch.Last, "retrans": true, "reason": "nack",
 			})
-			if err := n.sendTo(from, wire.MT_SYNC_DELTA_CHUNK, enc); err != nil {
+			var err error
+			if n.ms != nil {
+				err = n.ms.Send(n.ctx, from, protoport.DeltaChunkMsg{C: ch})
+			} else {
+				err = n.sendTo(from, wire.MT_SYNC_DELTA_CHUNK, enc)
+			}
+			if err != nil {
 				n.emit(EventWarn, map[string]any{"msg": "retransmit_err", "seq": ch.Seq, "err": err.Error()})
 			}
 			return
