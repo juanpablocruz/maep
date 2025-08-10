@@ -55,8 +55,12 @@ func TestDuplicateChunkAckNoNack(t *testing.T) {
 	sawAckDuplicate := false
 	sawNackDuplicate := false
 	for {
-		select {
-		case e := <-ev:
+		nbuf := len(ev)
+		if nbuf == 0 {
+			break
+		}
+		for i := 0; i < nbuf; i++ {
+			e := <-ev
 			if e.Type != EventAck {
 				continue
 			}
@@ -71,12 +75,9 @@ func TestDuplicateChunkAckNoNack(t *testing.T) {
 					sawAckDuplicate = true
 				}
 			}
-		default:
-			goto doneDup
 		}
 	}
 
-doneDup:
 	if !sawAckDuplicate {
 		t.Fatalf("expected ACK(reason=duplicate) on duplicate chunk")
 	}
@@ -117,8 +118,12 @@ func TestFutureChunkNackOutOfWindow(t *testing.T) {
 	// drain events without closing channel to avoid racing with emitters
 	sawNack := false
 	for {
-		select {
-		case e := <-ev:
+		nbuf := len(ev)
+		if nbuf == 0 {
+			break
+		}
+		for i := 0; i < nbuf; i++ {
+			e := <-ev
 			if e.Type != EventAck {
 				continue
 			}
@@ -127,12 +132,9 @@ func TestFutureChunkNackOutOfWindow(t *testing.T) {
 					sawNack = true
 				}
 			}
-		default:
-			goto doneFut
 		}
 	}
 
-doneFut:
 	if !sawNack {
 		t.Fatalf("expected NACK(reason=out_of_window) for future chunk")
 	}
