@@ -397,6 +397,11 @@ type EventManager struct {
 	mu       sync.RWMutex
 	eventCh  chan node.Event
 	capacity int
+	svByNode map[string]struct {
+		Segs int
+		Keys int
+		Top  []string
+	}
 }
 
 func NewEventManager(capacity int) *EventManager {
@@ -406,6 +411,11 @@ func NewEventManager(capacity int) *EventManager {
 		cmdLog:   make([]node.Event, 0, 256),
 		eventCh:  make(chan node.Event, capacity),
 		capacity: capacity,
+		svByNode: make(map[string]struct {
+			Segs int
+			Keys int
+			Top  []string
+		}),
 	}
 }
 
@@ -424,6 +434,21 @@ func (em *EventManager) AddEvent(event node.Event) {
 			em.cmdLog = em.cmdLog[len(em.cmdLog)-200:]
 		}
 		return
+	}
+
+	if event.Type == node.EventSendSummary {
+		// Capture SV snapshot from summary events (either dir send or recv)
+		segs, _ := event.Fields["sv_segs"].(int)
+		keys, _ := event.Fields["sv_keys"].(int)
+		var top []string
+		if v, ok := event.Fields["top_segs"].([]string); ok {
+			top = v
+		}
+		em.svByNode[event.Node] = struct {
+			Segs int
+			Keys int
+			Top  []string
+		}{Segs: segs, Keys: keys, Top: top}
 	}
 
 	if event.Type == node.EventWire {
@@ -1046,6 +1071,12 @@ type tuiModel struct {
 	// State
 	width  int
 	height int
+
+	// Panel visibility
+	showWire   bool
+	showEvents bool
+	showSV     bool
+	showCmds   bool
 }
 
 func initialModel(nodeMgr *NodeManager, eventMgr *EventManager, cmdHandler *CommandHandler, logs *LogsManager) tuiModel {
@@ -1101,6 +1132,10 @@ func initialModel(nodeMgr *NodeManager, eventMgr *EventManager, cmdHandler *Comm
 		input:      "",
 		width:      120, // Default width
 		height:     30,  // Default height
+		showWire:   true,
+		showEvents: true,
+		showSV:     true,
+		showCmds:   true,
 	}
 }
 
@@ -1142,6 +1177,18 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(m.input) > 0 {
 				m.input = m.input[:len(m.input)-1]
 			}
+		case "ctrl+w":
+			m.showWire = !m.showWire
+			m.updateLayout()
+		case "ctrl+e":
+			m.showEvents = !m.showEvents
+			m.updateLayout()
+		case "ctrl+v":
+			m.showSV = !m.showSV
+			m.updateLayout()
+		case "ctrl+h":
+			m.showCmds = !m.showCmds
+			m.updateLayout()
 		default:
 			if len(msg.String()) == 1 && msg.String()[0] >= 32 && msg.String()[0] <= 126 {
 				m.input += msg.String()
@@ -1209,6 +1256,9 @@ func (m tuiModel) View() string {
 		lipgloss.NewStyle().
 			Foreground(lipgloss.Color("240")).
 			Render(fmt.Sprintf(" | Nodes: %d", len(nodes)))
+	// Add quick hint for toggles
+	toggles := lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(" | Toggle panels: [w]ire [e]vents [v]sv [c]mds")
+	statusLine += toggles
 
 	// Update table data
 	m.updateTableData()
@@ -1235,35 +1285,72 @@ func (m tuiModel) View() string {
 	if availableWidth < 60 {
 		availableWidth = 60
 	}
-	// Allocate widths: wire=12.5%, events=50%, cmds=rest (~37.5%)
-	wireW := max(12, availableWidth/8)
-	eventsW := availableWidth / 2
-	cmdW := availableWidth - wireW - eventsW
-	// Ensure reasonable minimums
-	if wireW < 14 {
-		wireW = 14
+	// Dynamic panel widths based on visibility
+	type panelInfo struct {
+		visible bool
+		weight  int
+		min     int
+		w       *int
 	}
-	if eventsW < 24 {
-		eventsW = 24
+	wireW, eventsW, svW, cmdW := 0, 0, 0, 0
+	panels := []panelInfo{
+		{m.showWire, 1, 14, &wireW},
+		{m.showEvents, 2, 24, &eventsW},
+		{m.showSV, 1, 16, &svW},
+		{m.showCmds, 1, 24, &cmdW},
 	}
-	if cmdW < 24 {
-		cmdW = 24
+	totalWeight := 0
+	visibleCount := 0
+	for _, p := range panels {
+		if p.visible {
+			totalWeight += p.weight
+			visibleCount++
+		}
+	}
+	if visibleCount == 0 {
+		// Nothing visible, show a small note and return
+		return header + "\n" + statusLine + "\n\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("No panels visible. Press w/e/v/c to toggle panels.")
+	}
+	// First pass by weights
+	remaining := availableWidth
+	for i := range panels {
+		if !panels[i].visible {
+			continue
+		}
+		alloc := availableWidth * panels[i].weight / totalWeight
+		if alloc < panels[i].min {
+			alloc = panels[i].min
+		}
+		*panels[i].w = alloc
+		remaining -= alloc
+	}
+	// If we overflowed, remaining will be negative; reduce in order: events, cmds, wire, sv
+	if remaining < 0 {
+		reduceOrder := []*panelInfo{&panels[1], &panels[3], &panels[0], &panels[2]}
+		overflow := -remaining
+		for _, p := range reduceOrder {
+			if !(*p).visible || *(*p).w <= (*p).min {
+				continue
+			}
+			canReduce := *(*p).w - (*p).min
+			delta := canReduce
+			if delta > overflow {
+				delta = overflow
+			}
+			*(*p).w -= delta
+			overflow -= delta
+			if overflow == 0 {
+				break
+			}
+		}
 	}
 
 	// Calculate inner content widths subtracting frame (border only)
 	hFrame, _ := panelStyle.GetFrameSize()
-	wireContentW := wireW - hFrame
-	eventsContentW := eventsW - hFrame
-	cmdContentW := cmdW - hFrame
-	if wireContentW < 8 {
-		wireContentW = 8
-	}
-	if eventsContentW < 10 {
-		eventsContentW = 10
-	}
-	if cmdContentW < 10 {
-		cmdContentW = 10
-	}
+	wireContentW := max(0, wireW-hFrame)
+	eventsContentW := max(0, eventsW-hFrame)
+	svContentW := max(0, svW-hFrame)
+	cmdContentW := max(0, cmdW-hFrame)
 
 	// Size viewports (events and wire existing, add commands viewport)
 	m.eventsView.Width = eventsContentW
@@ -1274,29 +1361,55 @@ func (m tuiModel) View() string {
 	m.cmdView.Height = viewportHeight
 
 	// Build panels
-	wirePanel := panelStyle.
-		Width(wireW).
-		Height(viewportHeight + 1).
-		Render(lipgloss.NewStyle().Bold(true).Render("Wire") + "\n" + m.wireView.View())
+	var panelsRendered []string
+	if m.showWire {
+		wirePanel := panelStyle.
+			Width(wireW).
+			Height(viewportHeight + 1).
+			Render(lipgloss.NewStyle().Bold(true).Render("Wire") + "\n" + m.wireView.View())
+		panelsRendered = append(panelsRendered, wirePanel)
+	}
 
 	// Events content already in eventsView
-	eventsPanel := panelStyle.
-		Width(eventsW).
-		Height(viewportHeight + 1).
-		Render(lipgloss.NewStyle().Bold(true).Render("Events") + "\n" + m.eventsView.View())
+	if m.showEvents {
+		eventsPanel := panelStyle.
+			Width(eventsW).
+			Height(viewportHeight + 1).
+			Render(lipgloss.NewStyle().Bold(true).Render("Events") + "\n" + m.eventsView.View())
+		panelsRendered = append(panelsRendered, eventsPanel)
+	}
+
+	// SV panel
+	if m.showSV {
+		var svb strings.Builder
+		svb.WriteString("Node SV (segs/keys top):\n")
+		for _, n := range nodes {
+			sv := m.eventMgr.svByNode[n.Name]
+			top := strings.Join(sv.Top, ",")
+			svb.WriteString(fmt.Sprintf("%s: %d/%d [%s]\n", n.Name, sv.Segs, sv.Keys, top))
+		}
+		svPanel := panelStyle.
+			Width(svW).
+			Height(viewportHeight + 1).
+			Render(lipgloss.NewStyle().Bold(true).Render("SV") + "\n" + lipgloss.NewStyle().Width(svContentW).Render(svb.String()))
+		panelsRendered = append(panelsRendered, svPanel)
+	}
 
 	// Commands: render from cmd log into cmdView
-	cmds := m.eventMgr.GetCmdLog()
-	var cb strings.Builder
-	for i := len(cmds) - 1; i >= 0 && i >= len(cmds)-200; i-- {
-		cb.WriteString(formatEvent(cmds[i]))
-		cb.WriteByte('\n')
+	if m.showCmds {
+		cmds := m.eventMgr.GetCmdLog()
+		var cb strings.Builder
+		for i := len(cmds) - 1; i >= 0 && i >= len(cmds)-200; i-- {
+			cb.WriteString(formatEvent(cmds[i]))
+			cb.WriteByte('\n')
+		}
+		m.cmdView.SetContent(cb.String())
+		cmdPanel := panelStyle.
+			Width(cmdW).
+			Height(viewportHeight + 1).
+			Render(lipgloss.NewStyle().Bold(true).Render("Commands") + "\n" + m.cmdView.View())
+		panelsRendered = append(panelsRendered, cmdPanel)
 	}
-	m.cmdView.SetContent(cb.String())
-	cmdPanel := panelStyle.
-		Width(cmdW).
-		Height(viewportHeight + 1).
-		Render(lipgloss.NewStyle().Bold(true).Render("Commands") + "\n" + m.cmdView.View())
 
 	doc := strings.Builder{}
 	doc.WriteString(header)
@@ -1311,7 +1424,7 @@ func (m tuiModel) View() string {
 	doc.WriteString("\n\n")
 
 	// Panels: title + viewport content inside bordered boxes
-	doc.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, wirePanel, eventsPanel, cmdPanel))
+	doc.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, panelsRendered...))
 	doc.WriteString("\n\n")
 
 	// Input line
