@@ -141,7 +141,12 @@ func main() {
 
 	// spawn nodes
 	for i := range *flNodes {
-		n := node.New(sns[i].Name, sns[i].TCP, sns[i].PeerAddr, *flSyncInterval)
+		n := node.NewWithOptions(
+			sns[i].Name,
+			node.WithEndpoint(sns[i].TCP),
+			node.WithPeer(sns[i].PeerAddr),
+			node.WithTickerEvery(*flSyncInterval),
+		)
 		n.AttachHB(sns[i].UDP)
 		n.SetDeltaMaxBytes(*flDeltaChunk)
 		n.AttachEvents(make(chan node.Event, 1024))

@@ -25,11 +25,12 @@ type Op struct {
 	HLCTicks  uint64
 	WallNanos int64
 	Actor     ActorID
+	Pre       [32]byte
 	Hash      [32]byte
 }
 
 // Compute the deterministic hash used as a tie-breaker in ordering
-func HashOp(version uint16, kind uint8, key string, value []byte, hlc uint64, wall int64, actor ActorID) [32]byte {
+func HashOp(version uint16, kind uint8, key string, value []byte, hlc uint64, wall int64, actor ActorID, pre [32]byte) [32]byte {
 	h := sha256.New()
 
 	var vbuf [2]byte
@@ -46,6 +47,7 @@ func HashOp(version uint16, kind uint8, key string, value []byte, hlc uint64, wa
 	binary.LittleEndian.PutUint64(buf[8:], uint64(wall))
 	h.Write(buf[:])
 	h.Write(actor[:])
+	h.Write(pre[:])
 	var out [32]byte
 	copy(out[:], h.Sum(nil))
 	return out

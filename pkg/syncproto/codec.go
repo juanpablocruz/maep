@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 
+	bin "github.com/juanpablocruz/maep/pkg/internal/bin"
 	"github.com/juanpablocruz/maep/pkg/model"
 	"github.com/juanpablocruz/maep/pkg/segment"
 )
@@ -23,6 +24,8 @@ func dbg(msg string, args ...any) {
 		logger.Debug(msg, args...)
 	}
 }
+
+// legacy helpers retained for decoders below; new encoders use pkg/internal/bin
 func putU16(b *bytes.Buffer, v uint16) { _ = binary.Write(b, binary.BigEndian, v) }
 func putU32(b *bytes.Buffer, v uint32) { _ = binary.Write(b, binary.BigEndian, v) }
 func putU64(b *bytes.Buffer, v uint64) { _ = binary.Write(b, binary.BigEndian, v) }
@@ -42,7 +45,7 @@ func getU64(r *bytes.Reader) (uint64, error) {
 	return v, err
 }
 
-func putBytes(b *bytes.Buffer, p []byte) { putU32(b, uint32(len(p))); b.Write(p) }
+func putBytes(b *bytes.Buffer, p []byte) { _ = bin.PutBytes(b, p) }
 func getBytes(r *bytes.Reader) ([]byte, error) {
 	n32, err := getU32(r)
 	if err != nil {
@@ -66,21 +69,80 @@ func getBytes(r *bytes.Reader) ([]byte, error) {
 	return buf, nil
 }
 
-// Summary <-> bytes
-func EncodeSummary(s Summary) []byte {
+// Summary marshalers
+func MarshalSummary(s Summary) ([]byte, error) {
 	var buf bytes.Buffer
-	putU32(&buf, uint32(len(s.Leaves)))
-	for _, lf := range s.Leaves {
-		putU16(&buf, uint16(len(lf.Key)))
-		buf.WriteString(lf.Key)
-		buf.Write(lf.Hash[:])
+	// Root first (32B)
+	if _, err := buf.Write(s.Root[:]); err != nil {
+		return nil, err
 	}
-	dbg("codec.encode_summary", "leaves", len(s.Leaves), "bytes", buf.Len())
-	return buf.Bytes()
+	if err := bin.PutU32(&buf, uint32(len(s.Leaves))); err != nil {
+		return nil, err
+	}
+	for _, lf := range s.Leaves {
+		if err := bin.PutU16(&buf, uint16(len(lf.Key))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.WriteString(lf.Key); err != nil {
+			return nil, err
+		}
+		if _, err := buf.Write(lf.Hash[:]); err != nil {
+			return nil, err
+		}
+	}
+	// Frontier (SV): count | repeated (keyLen|key | from(u32))
+	if err := bin.PutU32(&buf, uint32(len(s.Frontier))); err != nil {
+		return nil, err
+	}
+	for _, it := range s.Frontier {
+		if err := bin.PutU16(&buf, uint16(len(it.Key))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.WriteString(it.Key); err != nil {
+			return nil, err
+		}
+		if err := bin.PutU32(&buf, it.From); err != nil {
+			return nil, err
+		}
+	}
+	// SegFrontier: count | repeated (sid(u16) | 32B root | count(u32))
+	if err := bin.PutU32(&buf, uint32(len(s.SegFrontier))); err != nil {
+		return nil, err
+	}
+	for _, it := range s.SegFrontier {
+		if err := bin.PutU16(&buf, uint16(it.SID)); err != nil {
+			return nil, err
+		}
+		if _, err := buf.Write(it.Root[:]); err != nil {
+			return nil, err
+		}
+		if err := bin.PutU32(&buf, it.Count); err != nil {
+			return nil, err
+		}
+	}
+	dbg("codec.encode_summary", "leaves", len(s.Leaves), "frontier", len(s.Frontier), "seg_frontier", len(s.SegFrontier), "bytes", buf.Len())
+	return buf.Bytes(), nil
+}
+func EncodeSummary(s Summary) []byte { b, _ := MarshalSummary(s); return b }
+
+// SummaryReq <-> bytes (just the 32B root for now)
+func MarshalSummaryReq(r SummaryReq) ([]byte, error) { return MarshalRoot(Root{Hash: r.Root}) }
+func EncodeSummaryReq(r SummaryReq) []byte           { b, _ := MarshalSummaryReq(r); return b }
+func DecodeSummaryReq(b []byte) (SummaryReq, error) {
+	rt, err := DecodeRoot(b)
+	if err != nil {
+		return SummaryReq{}, err
+	}
+	return SummaryReq{Root: rt.Hash}, nil
 }
 
 func DecodeSummary(b []byte) (Summary, error) {
 	r := bytes.NewReader(b)
+	var root [32]byte
+	if _, err := io.ReadFull(r, root[:]); err != nil {
+		slog.Warn("codec.decode_summary_err", "stage", "root", "err", err)
+		return Summary{}, err
+	}
 	n, err := getU32(r)
 	if err != nil {
 		slog.Warn("codec.decode_summary_err", "stage", "count", "err", err)
@@ -105,26 +167,88 @@ func DecodeSummary(b []byte) (Summary, error) {
 		}
 		ls = append(ls, LeafSummary{Key: string(k), Hash: h})
 	}
+	// Optional Frontier (SV). Backward-compatible: only parse if at least 4 bytes remain.
+	var frontier []FrontierItem
+	if r.Len() >= 4 {
+		fn, err := getU32(r)
+		if err != nil {
+			slog.Warn("codec.decode_summary_err", "stage", "frontier.count", "err", err)
+			return Summary{}, err
+		}
+		frontier = make([]FrontierItem, 0, fn)
+		for range int(fn) {
+			fkl, err := getU16(r)
+			if err != nil {
+				slog.Warn("codec.decode_summary_err", "stage", "frontier.keyLen", "err", err)
+				return Summary{}, err
+			}
+			fk := make([]byte, fkl)
+			if _, err := r.Read(fk); err != nil {
+				slog.Warn("codec.decode_summary_err", "stage", "frontier.key", "err", err)
+				return Summary{}, err
+			}
+			from, err := getU32(r)
+			if err != nil {
+				slog.Warn("codec.decode_summary_err", "stage", "frontier.from", "err", err)
+				return Summary{}, err
+			}
+			frontier = append(frontier, FrontierItem{Key: string(fk), From: from})
+		}
+	}
+	// SegFrontier
+	var segFrontier []SegFrontierItem
+	if r.Len() >= 4 {
+		nseg, err := getU32(r)
+		if err != nil {
+			slog.Warn("codec.decode_summary_err", "stage", "segfrontier.count", "err", err)
+			return Summary{}, err
+		}
+		segFrontier = make([]SegFrontierItem, 0, nseg)
+		for range int(nseg) {
+			sidU16, err := getU16(r)
+			if err != nil {
+				return Summary{}, err
+			}
+			var rootSeg [32]byte
+			if _, err := io.ReadFull(r, rootSeg[:]); err != nil {
+				return Summary{}, err
+			}
+			cnt, err := getU32(r)
+			if err != nil {
+				return Summary{}, err
+			}
+			segFrontier = append(segFrontier, SegFrontierItem{SID: segment.ID(sidU16), Root: rootSeg, Count: cnt})
+		}
+	}
 	if r.Len() != 0 {
 		slog.Warn("codec.decode_summary_trailing", "bytes", r.Len())
 	}
 
-	dbg("codec.decode_summary", "leaves", len(ls), "bytes_in", len(b))
-	return Summary{Leaves: ls}, nil
+	dbg("codec.decode_summary", "leaves", len(ls), "frontier", len(frontier), "seg_frontier", len(segFrontier), "bytes_in", len(b))
+	return Summary{Root: root, Leaves: ls, Frontier: frontier, SegFrontier: segFrontier}, nil
 }
 
 // Req <-> bytes
-func EncodeReq(q Req) []byte {
+func MarshalReq(q Req) ([]byte, error) {
 	var buf bytes.Buffer
-	putU32(&buf, uint32(len(q.Needs)))
+	if err := bin.PutU32(&buf, uint32(len(q.Needs))); err != nil {
+		return nil, err
+	}
 	for _, n := range q.Needs {
-		putU16(&buf, uint16(len(n.Key)))
-		buf.WriteString(n.Key)
-		putU32(&buf, n.From)
+		if err := bin.PutU16(&buf, uint16(len(n.Key))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.WriteString(n.Key); err != nil {
+			return nil, err
+		}
+		if err := bin.PutU32(&buf, n.From); err != nil {
+			return nil, err
+		}
 	}
 	dbg("codec.encode_req", "needs", len(q.Needs), "bytes", buf.Len())
-	return buf.Bytes()
+	return buf.Bytes(), nil
 }
+func EncodeReq(q Req) []byte { b, _ := MarshalReq(q); return b }
 
 func DecodeReq(b []byte) (Req, error) {
 	r := bytes.NewReader(b)
@@ -162,28 +286,51 @@ func DecodeReq(b []byte) (Req, error) {
 // Delta <-> bytes
 // Entry: keyLen|key | count(u32) | repeated Op
 // Op: version(u16) kind(u8) | hlc(u64) wall(u64) | actor(16) hash(32) | vlen(u32)|value
-func EncodeDelta(d Delta) []byte {
+func MarshalDelta(d Delta) ([]byte, error) {
 	var buf bytes.Buffer
-	putU32(&buf, uint32(len(d.Entries)))
+	if err := bin.PutU32(&buf, uint32(len(d.Entries))); err != nil {
+		return nil, err
+	}
 	totalOps := 0
 	for _, e := range d.Entries {
-		putU16(&buf, uint16(len(e.Key)))
-		buf.WriteString(e.Key)
-		putU32(&buf, uint32(len(e.Ops)))
+		if err := bin.PutU16(&buf, uint16(len(e.Key))); err != nil {
+			return nil, err
+		}
+		if _, err := buf.WriteString(e.Key); err != nil {
+			return nil, err
+		}
+		if err := bin.PutU32(&buf, uint32(len(e.Ops))); err != nil {
+			return nil, err
+		}
 		totalOps += len(e.Ops)
 		for _, op := range e.Ops {
-			putU16(&buf, op.Version)
-			buf.WriteByte(op.Kind)
-			putU64(&buf, op.HLCTicks)
-			putU64(&buf, uint64(op.WallNanos))
-			buf.Write(op.Actor[:])
-			buf.Write(op.Hash[:])
-			putBytes(&buf, op.Value)
+			if err := bin.PutU16(&buf, op.Version); err != nil {
+				return nil, err
+			}
+			if err := buf.WriteByte(op.Kind); err != nil {
+				return nil, err
+			}
+			if err := bin.PutU64(&buf, op.HLCTicks); err != nil {
+				return nil, err
+			}
+			if err := bin.PutU64(&buf, uint64(op.WallNanos)); err != nil {
+				return nil, err
+			}
+			if _, err := buf.Write(op.Actor[:]); err != nil {
+				return nil, err
+			}
+			if _, err := buf.Write(op.Hash[:]); err != nil {
+				return nil, err
+			}
+			if err := bin.PutBytes(&buf, op.Value); err != nil {
+				return nil, err
+			}
 		}
 	}
 	dbg("codec.encode_delta", "entries", len(d.Entries), "ops", totalOps, "bytes", buf.Len())
-	return buf.Bytes()
+	return buf.Bytes(), nil
 }
+func EncodeDelta(d Delta) []byte { b, _ := MarshalDelta(d); return b }
 
 func DecodeDelta(b []byte) (Delta, error) {
 	r := bytes.NewReader(b)
@@ -264,16 +411,25 @@ func DecodeDelta(b []byte) (Delta, error) {
 
 // SegAd <-> bytes
 // wire format: u32 count | repeated (u16 sid | 32B root | u32 keyCount)
-func EncodeSegAd(ad SegAd) []byte {
+func MarshalSegAd(ad SegAd) ([]byte, error) {
 	var buf bytes.Buffer
-	putU32(&buf, uint32(len(ad.Items)))
-	for _, it := range ad.Items {
-		putU16(&buf, uint16(it.SID))
-		buf.Write(it.Root[:])
-		putU32(&buf, it.Count)
+	if err := bin.PutU32(&buf, uint32(len(ad.Items))); err != nil {
+		return nil, err
 	}
-	return buf.Bytes()
+	for _, it := range ad.Items {
+		if err := bin.PutU16(&buf, uint16(it.SID)); err != nil {
+			return nil, err
+		}
+		if _, err := buf.Write(it.Root[:]); err != nil {
+			return nil, err
+		}
+		if err := bin.PutU32(&buf, it.Count); err != nil {
+			return nil, err
+		}
+	}
+	return buf.Bytes(), nil
 }
+func EncodeSegAd(ad SegAd) []byte { b, _ := MarshalSegAd(ad); return b }
 
 func DecodeSegAd(b []byte) (SegAd, error) {
 	r := bytes.NewReader(b)
@@ -304,37 +460,70 @@ func DecodeSegAd(b []byte) (SegAd, error) {
 }
 
 // --- DeltaChunk ---
-func EncodeDeltaChunk(c DeltaChunk) []byte {
+func MarshalDeltaChunk(c DeltaChunk) ([]byte, error) {
 	var b bytes.Buffer
-	putU32(&b, c.Seq)
-	if c.Last {
-		b.WriteByte(1)
-	} else {
-		b.WriteByte(0)
+	if err := bin.PutU16(&b, uint16(c.SID)); err != nil {
+		return nil, err
 	}
-	putU32(&b, uint32(len(c.Entries)))
+	if err := bin.PutU32(&b, c.Seq); err != nil {
+		return nil, err
+	}
+	if err := b.WriteByte(func() byte {
+		if c.Last {
+			return 1
+		}
+		return 0
+	}()); err != nil {
+		return nil, err
+	}
+	if err := bin.PutU32(&b, uint32(len(c.Entries))); err != nil {
+		return nil, err
+	}
 	for _, e := range c.Entries {
-		putU16(&b, uint16(len(e.Key)))
-		b.WriteString(e.Key)
-		putU32(&b, uint32(len(e.Ops)))
+		if err := bin.PutU16(&b, uint16(len(e.Key))); err != nil {
+			return nil, err
+		}
+		if _, err := b.WriteString(e.Key); err != nil {
+			return nil, err
+		}
+		if err := bin.PutU32(&b, uint32(len(e.Ops))); err != nil {
+			return nil, err
+		}
 		for _, op := range e.Ops {
-			putU16(&b, op.Version)
-			b.WriteByte(op.Kind)
-			putU64(&b, op.HLCTicks)
-			putU64(&b, uint64(op.WallNanos))
-			b.Write(op.Actor[:])
-			b.Write(op.Hash[:])
-			putBytes(&b, op.Value)
+			if err := bin.PutU16(&b, op.Version); err != nil {
+				return nil, err
+			}
+			if err := b.WriteByte(op.Kind); err != nil {
+				return nil, err
+			}
+			if err := bin.PutU64(&b, op.HLCTicks); err != nil {
+				return nil, err
+			}
+			if err := bin.PutU64(&b, uint64(op.WallNanos)); err != nil {
+				return nil, err
+			}
+			if _, err := b.Write(op.Actor[:]); err != nil {
+				return nil, err
+			}
+			if _, err := b.Write(op.Hash[:]); err != nil {
+				return nil, err
+			}
+			if err := bin.PutBytes(&b, op.Value); err != nil {
+				return nil, err
+			}
 		}
 	}
-
 	sum := sha256.Sum256(b.Bytes())
 	var out bytes.Buffer
-	out.Write(b.Bytes())
-	out.Write(sum[:])
-
-	return out.Bytes()
+	if _, err := out.Write(b.Bytes()); err != nil {
+		return nil, err
+	}
+	if _, err := out.Write(sum[:]); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
 }
+func EncodeDeltaChunk(c DeltaChunk) []byte { b, _ := MarshalDeltaChunk(c); return b }
 
 func DecodeDeltaChunk(p []byte) (DeltaChunk, error) {
 	if len(p) < 32 {
@@ -346,6 +535,10 @@ func DecodeDeltaChunk(p []byte) (DeltaChunk, error) {
 	copy(got[:], p[len(p)-32:])
 
 	r := bytes.NewReader(payload)
+	sidU16, err := getU16(r)
+	if err != nil {
+		return DeltaChunk{}, err
+	}
 	seq, err := getU32(r)
 	if err != nil {
 		return DeltaChunk{}, err
@@ -414,7 +607,7 @@ func DecodeDeltaChunk(p []byte) (DeltaChunk, error) {
 		dbg("decode_delta_chunk_trailing", "bytes", r.Len())
 	}
 
-	c := DeltaChunk{Seq: seq, Last: lastb == 1, Entries: ents}
+	c := DeltaChunk{SID: segment.ID(sidU16), Seq: seq, Last: lastb == 1, Entries: ents}
 	want := sha256.Sum256(payload)
 	c.Hash = got
 	if got != want {
@@ -424,14 +617,24 @@ func DecodeDeltaChunk(p []byte) (DeltaChunk, error) {
 }
 
 // --- Ack ---
-func EncodeAck(a Ack) []byte {
+func MarshalAck(a Ack) ([]byte, error) {
 	var b bytes.Buffer
-	putU32(&b, a.Seq)
-	return b.Bytes()
+	if err := bin.PutU16(&b, uint16(a.SID)); err != nil {
+		return nil, err
+	}
+	if err := bin.PutU32(&b, a.Seq); err != nil {
+		return nil, err
+	}
+	return b.Bytes(), nil
 }
+func EncodeAck(a Ack) []byte { b, _ := MarshalAck(a); return b }
 
 func DecodeAck(p []byte) (Ack, error) {
 	r := bytes.NewReader(p)
+	sidU16, err := getU16(r)
+	if err != nil {
+		return Ack{}, err
+	}
 	seq, err := getU32(r)
 	if err != nil {
 		return Ack{}, err
@@ -439,14 +642,11 @@ func DecodeAck(p []byte) (Ack, error) {
 	if r.Len() != 0 {
 		dbg("decode_ack_trailing", "bytes", r.Len())
 	}
-	return Ack{Seq: seq}, nil
+	return Ack{SID: segment.ID(sidU16), Seq: seq}, nil
 }
 
-func EncodeRoot(r Root) []byte {
-	b := make([]byte, 32)
-	copy(b, r.Hash[:])
-	return b
-}
+func MarshalRoot(r Root) ([]byte, error) { b := make([]byte, 32); copy(b, r.Hash[:]); return b, nil }
+func EncodeRoot(r Root) []byte           { b, _ := MarshalRoot(r); return b }
 func DecodeRoot(b []byte) (Root, error) {
 	if len(b) < 32 {
 		return Root{}, errors.New("short root")
@@ -456,12 +656,17 @@ func DecodeRoot(b []byte) (Root, error) {
 	return r, nil
 }
 
-func EncodeDeltaNack(n DeltaNack) []byte {
+func MarshalDeltaNack(n DeltaNack) ([]byte, error) {
 	var buf bytes.Buffer
-	_ = binary.Write(&buf, binary.BigEndian, n.Seq)
-	buf.WriteByte(n.Code)
-	return buf.Bytes()
+	if err := binary.Write(&buf, binary.BigEndian, n.Seq); err != nil {
+		return nil, err
+	}
+	if err := buf.WriteByte(n.Code); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
+func EncodeDeltaNack(n DeltaNack) []byte { b, _ := MarshalDeltaNack(n); return b }
 
 func DecodeDeltaNack(b []byte) (DeltaNack, error) {
 	if len(b) < 5 {

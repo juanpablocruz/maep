@@ -16,10 +16,10 @@ func TestBuildDeltaForLimited_NoFallbackWhenUpToDate(t *testing.T) {
 
 	// Two ops for key K
 	op1 := model.Op{Version: model.OpSchemaV1, Kind: model.OpKindPut, Key: "K", Value: []byte("v1"), HLCTicks: clk.Now(), Actor: actor}
-	op1.Hash = model.HashOp(op1.Version, op1.Kind, op1.Key, op1.Value, op1.HLCTicks, op1.WallNanos, op1.Actor)
+    op1.Hash = model.HashOp(op1.Version, op1.Kind, op1.Key, op1.Value, op1.HLCTicks, op1.WallNanos, op1.Actor, op1.Pre)
 	l.Append(op1)
 	op2 := model.Op{Version: model.OpSchemaV1, Kind: model.OpKindPut, Key: "K", Value: []byte("v2"), HLCTicks: clk.Now(), Actor: actor}
-	op2.Hash = model.HashOp(op2.Version, op2.Kind, op2.Key, op2.Value, op2.HLCTicks, op2.WallNanos, op2.Actor)
+    op2.Hash = model.HashOp(op2.Version, op2.Kind, op2.Key, op2.Value, op2.HLCTicks, op2.WallNanos, op2.Actor, op2.Pre)
 	l.Append(op2)
 
 	// Request from a peer already at From=2 should yield an empty delta (no echo of history)
@@ -42,7 +42,7 @@ func TestBuildDeltaForLimited_TruncatesToBudget(t *testing.T) {
 	// Build several ops for K
 	for i := 0; i < 4; i++ {
 		op := model.Op{Version: model.OpSchemaV1, Kind: model.OpKindPut, Key: "K", Value: []byte{byte('a' + i)}, HLCTicks: clk.Now(), Actor: actor}
-		op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
+        op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor, op.Pre)
 		l.Append(op)
 	}
 	// Ask from 0 to get all, but set a very tight budget to force truncation

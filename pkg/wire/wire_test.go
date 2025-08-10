@@ -5,6 +5,20 @@ import (
 	"testing"
 )
 
+func TestDecodeShortFrame(t *testing.T) {
+	if _, _, err := Decode([]byte{0x01, 0x00}); err == nil {
+		t.Fatalf("expected error on short frame")
+	}
+}
+
+func TestDecodeLengthMismatch(t *testing.T) {
+	// type=0x01, len=5, but payload shorter
+	frame := []byte{0x01, 0, 0, 0, 5, 0xAA, 0xBB}
+	if _, _, err := Decode(frame); err == nil {
+		t.Fatalf("expected error on length mismatch")
+	}
+}
+
 func TestEncodeDecode(t *testing.T) {
 	payload := []byte("hello")
 	f := Encode(MT_PING, payload)

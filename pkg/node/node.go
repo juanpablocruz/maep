@@ -18,6 +18,7 @@ import (
 	"github.com/juanpablocruz/maep/pkg/merkle"
 	"github.com/juanpablocruz/maep/pkg/model"
 	"github.com/juanpablocruz/maep/pkg/oplog"
+	"github.com/juanpablocruz/maep/pkg/protoport"
 	"github.com/juanpablocruz/maep/pkg/segment"
 	"github.com/juanpablocruz/maep/pkg/syncproto"
 	"github.com/juanpablocruz/maep/pkg/transport"
@@ -29,9 +30,9 @@ type syncSession struct {
 	active      bool
 	lastRemote  syncproto.Summary
 	sndNext     uint32
-	sndInflight []syncproto.DeltaChunk
-	rcvExpect   uint32
-	ackCh       chan uint32
+	sndInflight map[segment.ID][]syncproto.DeltaChunk
+	rcvExpect   map[segment.ID]uint32
+	ackCh       chan syncproto.Ack
 	ctx         context.Context
 	cancel      context.CancelFunc
 	dqueue      [][]byte
@@ -49,6 +50,8 @@ type Node struct {
 	Peer   transport.MemAddr
 	EP     transport.EndpointIF
 	HB     transport.EndpointIF
+	ms     protoport.Messenger
+	hbms   protoport.Messenger
 	Log    *oplog.Log
 	Clock  *hlc.Clock
 	Ticker time.Duration
@@ -82,6 +85,10 @@ type Node struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// Persisted per-peer SV (SummaryResp) indexed by peer address
+	peerSVMu sync.Mutex
+	peerSV   map[string]syncproto.Summary
 }
 
 func New(name string, ep transport.EndpointIF, peer transport.MemAddr, tickEvery time.Duration) *Node {
@@ -104,18 +111,32 @@ func New(name string, ep transport.EndpointIF, peer transport.MemAddr, tickEvery
 		hbEvery:           350 * time.Millisecond,
 		hbMissK:           6,
 		ctx:               ctx, cancel: cancel,
+		peerSV: make(map[string]syncproto.Summary),
 	}
 
 	n.conn.Store(true)
 	n.paused.Store(false)
+	// initialize typed messenger for main endpoint
+	if ep != nil {
+		n.ms = protoport.WireMessenger{EP: ep}
+	}
 	return n
 }
 
-func (n *Node) AttachHB(ep transport.EndpointIF) { n.HB = ep }
+func (n *Node) AttachHB(ep transport.EndpointIF) {
+	n.HB = ep
+	if ep != nil {
+		n.hbms = protoport.WireMessenger{EP: ep}
+	}
+}
 
 func (n *Node) AttachEvents(ch chan Event) { n.Events = ch }
 
 func (n *Node) Start() {
+	// ensure messenger is present
+	if n.ms == nil && n.EP != nil {
+		n.ms = protoport.WireMessenger{EP: n.EP}
+	}
 	go n.recvLoop()
 	if n.HB != nil {
 		go n.recvHBLoop()
@@ -167,6 +188,11 @@ func (n *Node) GetEvents() <-chan Event { return n.Events } // if you prefer not
 func (n *Node) IsPaused() bool { return n.paused.Load() }
 
 func (n *Node) Put(key string, val []byte, actor model.ActorID) {
+	// set Pre to last known op hash for this key
+	var pre [32]byte
+	if last, ok := n.Log.LastOp(key); ok {
+		pre = last.Hash
+	}
 	op := model.Op{
 		Version:   model.OpSchemaV1,
 		Kind:      model.OpKindPut,
@@ -175,8 +201,9 @@ func (n *Node) Put(key string, val []byte, actor model.ActorID) {
 		HLCTicks:  n.Clock.Now(),
 		WallNanos: time.Now().UnixNano(),
 		Actor:     actor,
+		Pre:       pre,
 	}
-	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
+	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor, op.Pre)
 	n.Log.Append(op)
 	slog.Info("put", "node", n.Name, "key", key, "val", string(val), "hlc", op.HLCTicks)
 	n.emit(EventPut, map[string]any{"key": key, "val": string(val), "hlc": op.HLCTicks})
@@ -184,6 +211,10 @@ func (n *Node) Put(key string, val []byte, actor model.ActorID) {
 }
 
 func (n *Node) Delete(key string, actor model.ActorID) {
+	var pre [32]byte
+	if last, ok := n.Log.LastOp(key); ok {
+		pre = last.Hash
+	}
 	op := model.Op{
 		Version:   model.OpSchemaV1,
 		Kind:      model.OpKindDel,
@@ -191,8 +222,9 @@ func (n *Node) Delete(key string, actor model.ActorID) {
 		HLCTicks:  n.Clock.Now(),
 		WallNanos: time.Now().UnixNano(),
 		Actor:     actor,
+		Pre:       pre,
 	}
-	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
+	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor, op.Pre)
 	n.Log.Append(op)
 	slog.Info("del", "node", n.Name, "key", key, "hlc", op.HLCTicks)
 	n.emit(EventDel, map[string]any{"key": key, "hlc": op.HLCTicks})
@@ -271,11 +303,21 @@ func (n *Node) summaryLoop() {
 			"peer": n.Peer, "leaves": leafCount, "root": fmt.Sprintf("%x", root[:8]),
 		})
 
-		if err := n.send(wire.MT_SYNC_ROOT, syncproto.EncodeRoot(syncproto.Root{Hash: root})); err != nil {
-			n.warn("send_root_err", err)
-			backoff = minDur(n.backoffMax, maxDur(n.backoffBase, backoff*2))
-			nextAllowed = time.Now().Add(jitter(backoff))
-			return
+		// send root via messenger when available
+		if n.ms != nil {
+			if err := n.ms.Send(n.ctx, n.Peer, protoport.RootMsg{R: syncproto.Root{Hash: root}}); err != nil {
+				n.warn("send_root_err", err)
+				backoff = minDur(n.backoffMax, maxDur(n.backoffBase, backoff*2))
+				nextAllowed = time.Now().Add(jitter(backoff))
+				return
+			}
+		} else {
+			if err := n.send(wire.MT_SYNC_ROOT, syncproto.EncodeRoot(syncproto.Root{Hash: root})); err != nil {
+				n.warn("send_root_err", err)
+				backoff = minDur(n.backoffMax, maxDur(n.backoffBase, backoff*2))
+				nextAllowed = time.Now().Add(jitter(backoff))
+				return
+			}
 		}
 		backoff = n.backoffBase
 		nextAllowed = time.Now()
@@ -283,25 +325,41 @@ func (n *Node) summaryLoop() {
 		lastSend = time.Now()
 
 		if !n.DescentEnabled {
-			sum := syncproto.BuildSummaryFromLog(n.Log)
 			ad := syncproto.BuildSegAdFromLog(n.Log)
-			encAd := syncproto.EncodeSegAd(ad)
 			n.emit(EventSendSegAd, map[string]any{"items": len(ad.Items)})
-			if err := n.send(wire.MT_SEG_AD, encAd); err != nil {
-				slog.Warn("send_segad_err", "node", n.Name, "err", err)
-				n.emit(EventWarn, map[string]any{"msg": "send_segad_err", "err": err.Error()})
+			if n.ms != nil {
+				if err := n.ms.Send(n.ctx, n.Peer, protoport.SegAdMsg{A: ad}); err != nil {
+					slog.Warn("send_segad_err", "node", n.Name, "err", err)
+					n.emit(EventWarn, map[string]any{"msg": "send_segad_err", "err": err.Error()})
+				}
+			} else {
+				encAd := syncproto.EncodeSegAd(ad)
+				if err := n.send(wire.MT_SEG_AD, encAd); err != nil {
+					slog.Warn("send_segad_err", "node", n.Name, "err", err)
+					n.emit(EventWarn, map[string]any{"msg": "send_segad_err", "err": err.Error()})
+				}
 			}
 
-			slog.Info("send_summary", "node", n.Name, "peer", n.Peer, "leaves", len(sum.Leaves))
+			// Send a SummaryReq with our current root; receiver will reply with SummaryResp including SV/frontier
 			n.emit(EventSendSummary, map[string]any{
-				"peer": n.Peer, "leaves": len(sum.Leaves), "root": fmt.Sprintf("%x", root[:8]),
+				"peer": n.Peer, "root": fmt.Sprintf("%x", root[:8]),
 			})
-			if err := n.send(wire.MT_SYNC_SUMMARY, syncproto.EncodeSummary(sum)); err != nil {
-				slog.Warn("send_summary_err", "node", n.Name, "err", err)
-				n.emit(EventWarn, map[string]any{"msg": "send_summary_err", "err": err.Error()})
-				backoff = minDur(n.backoffMax, maxDur(n.backoffBase, backoff*2))
-				nextAllowed = time.Now().Add(jitter(backoff))
-				return
+			if n.ms != nil {
+				if err := n.ms.Send(n.ctx, n.Peer, protoport.SummaryReqMsg{R: syncproto.SummaryReq{Root: root}}); err != nil {
+					slog.Warn("send_summary_req_err", "node", n.Name, "err", err)
+					n.emit(EventWarn, map[string]any{"msg": "send_summary_req_err", "err": err.Error()})
+					backoff = minDur(n.backoffMax, maxDur(n.backoffBase, backoff*2))
+					nextAllowed = time.Now().Add(jitter(backoff))
+					return
+				}
+			} else {
+				if err := n.send(wire.MT_SYNC_SUMMARY_REQ, syncproto.EncodeSummaryReq(syncproto.SummaryReq{Root: root})); err != nil {
+					slog.Warn("send_summary_req_err", "node", n.Name, "err", err)
+					n.emit(EventWarn, map[string]any{"msg": "send_summary_req_err", "err": err.Error()})
+					backoff = minDur(n.backoffMax, maxDur(n.backoffBase, backoff*2))
+					nextAllowed = time.Now().Add(jitter(backoff))
+					return
+				}
 			}
 		}
 	}
@@ -370,82 +428,70 @@ func (n *Node) sendTo(to transport.MemAddr, mt byte, payload []byte) error {
 
 func (n *Node) recvLoop() {
 	for {
-		var from transport.MemAddr
-		var frame []byte
-		var ok bool
-
-		if ep, ok2 := n.EP.(transport.FromEndpoint); ok2 {
-			from, frame, ok = ep.RecvFrom(n.ctx)
-		} else {
-			frame, ok = n.EP.Recv(n.ctx)
-			from = n.Peer
-		}
+		from, m, ok := n.ms.Recv(n.ctx)
 		if !ok {
 			return
 		}
-		mt, payload, err := wire.Decode(frame)
-		if err != nil {
-			slog.Warn("wire_decode_err", "node", n.Name, "err", err)
-			n.emit(EventWarn, map[string]any{"msg": "wire_decode_err", "err": err.Error()})
-			continue
-		}
-		n.emit(EventWire, map[string]any{"proto": "tcp", "dir": "<-", "mt": int(mt), "bytes": len(frame)})
-		switch mt {
-		case wire.MT_SYNC_SUMMARY:
-			n.onSummary(from, payload)
-		case wire.MT_SYNC_REQ:
-			n.onReq(from, payload)
-		case wire.MT_SYNC_DELTA:
-			n.onDelta(from, payload)
-		case wire.MT_PING:
+		switch msg := m.(type) {
+		case protoport.PingMsg:
 			n.emit(EventHB, map[string]any{"dir": "<-tcp"})
-			if err := n.sendTo(from, wire.MT_PONG, nil); err != nil {
+			if n.ms != nil {
+				if err := n.ms.Send(n.ctx, from, protoport.PongMsg{}); err != nil {
+					n.emit(EventWarn, map[string]any{"msg": "send_pong_err", "err": err.Error()})
+				}
+			} else if err := n.sendTo(from, wire.MT_PONG, nil); err != nil {
 				n.emit(EventWarn, map[string]any{"msg": "send_pong_err", "err": err.Error()})
 			}
-		case wire.MT_PONG:
+		case protoport.PongMsg:
 			n.emit(EventHB, map[string]any{"dir": "<-tcp"})
 			n.onPong()
-		case wire.MT_SYNC_BEGIN:
-			n.beginSessionIfNeeded()
-		case wire.MT_SYNC_END:
-			n.endSessionTo(from, false, "peer_end")
-		case wire.MT_SEG_AD:
-			n.onSegAd(from, payload)
-		case wire.MT_SEG_KEYS_REQ:
-			n.onSegKeysReq(from, payload)
-		case wire.MT_SEG_KEYS:
-			n.onSegKeys(from, payload)
-		case wire.MT_SYNC_DELTA_CHUNK:
-			n.onDeltaChunk(from, payload)
-		case wire.MT_SYNC_ACK:
-			n.onAck(from, payload)
-		case wire.MT_SYNC_ROOT:
-			n.onRoot(from, payload)
-		case wire.MT_DESCENT_REQ:
-			n.onDescentReq(from, payload)
-		case wire.MT_DESCENT_RESP:
-			n.onDescentResp(from, payload)
-		case wire.MT_DELTA_NACK:
-			n.onDeltaNack(from, payload)
+		case protoport.SummaryRespMsg:
+			n.handleSummaryResp(from, msg.S)
+		case protoport.SummaryReqMsg:
+			n.handleSummaryReq(from, msg.R)
+		case protoport.ReqMsg:
+			n.handleReq(from, msg.R)
+		case protoport.DeltaMsg:
+			n.handleDelta(from, msg.D)
+		case protoport.DeltaChunkMsg:
+			n.handleDeltaChunk(from, msg.C)
+		case protoport.AckMsg:
+			n.handleAck(from, msg.A)
+		case protoport.RootMsg:
+			n.handleRoot(from, msg.R)
+		case protoport.DescentReqMsg:
+			n.handleDescentReq(from, msg.R)
+		case protoport.DescentRespMsg:
+			n.handleDescentResp(from, msg.R)
+		case protoport.SegAdMsg:
+			n.handleSegAd(from, msg.A)
+		case protoport.SegKeysReqMsg:
+			n.handleSegKeysReq(from, msg.R)
+		case protoport.SegKeysMsg:
+			n.onSegKeys(from, syncproto.EncodeSegKeys(msg.K))
+		case protoport.DeltaNackMsg:
+			n.onDeltaNackHandled(from, msg.N)
 		default:
-			slog.Warn("unknown_msg", "node", n.Name, "mt", mt)
-			n.emit(EventWarn, map[string]any{"msg": "unknown_msg", "mt": mt})
+			slog.Warn("unknown_msg", "node", n.Name)
+			n.emit(EventWarn, map[string]any{"msg": "unknown_msg"})
 		}
 	}
 }
 
-func (n *Node) onSummary(from transport.MemAddr, b []byte) {
-	sum, err := syncproto.DecodeSummary(b)
-	if err != nil {
-		slog.Warn("decode_summary_err", "node", n.Name, "err", err)
-		n.emit(EventWarn, map[string]any{"msg": "decode_summary_err", "err": err.Error()})
-		return
-	}
+// (no longer needed) byte-oriented compat helpers removed after typed migration
+
+// handleSummaryResp processes the receiver-advertised summary+SV frontier.
+func (n *Node) handleSummaryResp(from transport.MemAddr, sum syncproto.Summary) {
 	n.sessMu.Lock()
 	n.sess.lastRemote = sum
 	n.sessMu.Unlock()
+	// Persist per-peer SV
+	n.peerSVMu.Lock()
+	n.peerSV[string(from)] = sum
+	n.peerSVMu.Unlock()
 
-	req := syncproto.DiffForReq(n.Log, sum)
+	// Build needs bounded by the receiver-advertised frontier (SV)
+	req := syncproto.DiffForOutbound(n.Log, sum)
 	if len(req.Needs) == 0 {
 		n.endSessionTo(from, true, "no_diff")
 		slog.Debug("summary_noop", "node", n.Name)
@@ -456,7 +502,12 @@ func (n *Node) onSummary(from transport.MemAddr, b []byte) {
 
 	slog.Info("send_req", "node", n.Name, "needs", req.Needs)
 	n.emit(EventSendReq, map[string]any{"needs": req.Needs})
-	if err := n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
+	if n.ms != nil {
+		if err := n.ms.Send(n.ctx, from, protoport.ReqMsg{R: req}); err != nil {
+			slog.Warn("send_req_err", "node", n.Name, "err", err)
+			n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
+		}
+	} else if err := n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
 		slog.Warn("send_req_err", "node", n.Name, "err", err)
 		n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
 	}
@@ -469,11 +520,20 @@ func (n *Node) onSummary(from transport.MemAddr, b []byte) {
 	n.sessMu.Unlock()
 }
 
-func (n *Node) onReq(from transport.MemAddr, b []byte) {
-	req, err := syncproto.DecodeReq(b)
-	if err != nil {
-		return
+// handleSummaryReq replies with our summary + SV frontier for this peer.
+func (n *Node) handleSummaryReq(from transport.MemAddr, req syncproto.SummaryReq) {
+	// Build current summary and advertise our frontier (SV) for receiver-bounded deltas
+	sum := syncproto.BuildSummaryFromLog(n.Log)
+	// Log a compact SV snapshot
+	n.emit(EventSendSummary, map[string]any{"peer": from, "sv_keys": len(sum.Frontier), "sv_segs": len(sum.SegFrontier)})
+	if n.ms != nil {
+		_ = n.ms.Send(n.ctx, from, protoport.SummaryRespMsg{S: sum})
+	} else {
+		_ = n.sendTo(from, wire.MT_SYNC_SUMMARY_RESP, syncproto.EncodeSummary(sum))
 	}
+}
+
+func (n *Node) handleReq(from transport.MemAddr, req syncproto.Req) {
 	if len(req.Needs) == 0 {
 		n.endSessionTo(from, true, "no_need")
 		return
@@ -481,6 +541,7 @@ func (n *Node) onReq(from transport.MemAddr, b []byte) {
 
 	n.beginSessionIfNeeded()
 
+	// Build bounded delta according to the request (peer's From values derived from our prior SummaryResp SV)
 	delta, _ := syncproto.BuildDeltaForLimited(n.Log, req, n.DeltaMaxBytes)
 
 	// count ops
@@ -509,7 +570,13 @@ func (n *Node) onReq(from transport.MemAddr, b []byte) {
 				req0.Needs = append(req0.Needs, syncproto.Need{Key: need.Key, From: 0})
 			}
 			n.emit(EventSendReq, map[string]any{"needs": req0.Needs, "reason": "delta_empty_repair"})
-			_ = n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req0))
+			if n.ms != nil {
+				if err := n.ms.Send(n.ctx, from, protoport.ReqMsg{R: req0}); err != nil {
+					n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
+				}
+			} else if err := n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req0)); err != nil {
+				n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
+			}
 			return
 		}
 
@@ -518,7 +585,7 @@ func (n *Node) onReq(from transport.MemAddr, b []byte) {
 		n.endSessionTo(from, false, "delta_empty")
 		return
 	}
-	chunks := n.chunkDelta(delta, n.DeltaMaxBytes)
+	chunks := syncproto.ChunkDelta(delta, n.DeltaMaxBytes)
 	if len(chunks) == 0 {
 		_ = n.sendTo(from, wire.MT_SYNC_END, nil)
 		n.endSessionTo(from, false, "no_chunks")
@@ -526,7 +593,8 @@ func (n *Node) onReq(from transport.MemAddr, b []byte) {
 	}
 	n.sessMu.Lock()
 	n.sess.sndNext = 0
-	n.sess.sndInflight = []syncproto.DeltaChunk{chunks[0]}
+	// seed inflight per segment with first chunk of each segment (chunks currently may be single SID)
+	n.sess.sndInflight[chunks[0].SID] = []syncproto.DeltaChunk{chunks[0]}
 	ackCh := n.sess.ackCh
 	sessCtx := n.sess.ctx
 	n.sessMu.Unlock()
@@ -534,16 +602,22 @@ func (n *Node) onReq(from transport.MemAddr, b []byte) {
 	go n.streamChunks(from, chunks, ackCh, sessCtx)
 }
 
-func (n *Node) onDelta(from transport.MemAddr, b []byte) {
+func (n *Node) handleDelta(from transport.MemAddr, d syncproto.Delta) {
 	n.beginSessionIfNeeded()
-	d, err := syncproto.DecodeDelta(b)
-	if err != nil {
-		slog.Warn("decode_delta_err", "node", n.Name, "err", err)
-		n.emit(EventWarn, map[string]any{"msg": "decode_delta_err", "err": err.Error()})
-		return
-	}
 	before := n.Log.CountPerKey()
+	// Apply and merge HLC with max seen in this delta
+	var maxTick uint64
+	for _, e := range d.Entries {
+		for _, op := range e.Ops {
+			if op.HLCTicks > maxTick {
+				maxTick = op.HLCTicks
+			}
+		}
+	}
 	syncproto.ApplyDelta(n.Log, d)
+	if maxTick != 0 {
+		_ = n.Clock.Merge(maxTick)
+	}
 	after := n.Log.CountPerKey()
 	slog.Info("applied_delta", "node", n.Name, "keys", len(d.Entries), "counts_before", before, "counts_after", after)
 	n.emit(EventAppliedDelta, map[string]any{"keys": len(d.Entries), "before": before, "after": after})
@@ -574,7 +648,12 @@ func (n *Node) onDelta(from transport.MemAddr, b []byte) {
 	req := syncproto.DiffForReq(n.Log, lr)
 	if len(req.Needs) > 0 {
 		n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "continue"})
-		if err := n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
+		if n.ms != nil {
+			if err := n.ms.Send(n.ctx, from, protoport.ReqMsg{R: req}); err != nil {
+				slog.Warn("send_req_err", "node", n.Name, "err", err)
+				n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
+			}
+		} else if err := n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
 			slog.Warn("send_req_err", "node", n.Name, "err", err)
 			n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
 		}
@@ -591,38 +670,7 @@ func (n *Node) emit(t EventType, f map[string]any) {
 	}
 }
 
-func (n *Node) heartbeatLoop() {
-	t := time.NewTicker(n.hbEvery)
-	defer t.Stop()
-	for {
-		select {
-		case <-n.ctx.Done():
-			return
-		case <-t.C:
-			if !n.conn.Load() {
-				n.onMiss()
-				continue
-			}
-
-			if err := n.sendHB(wire.MT_PING, nil); err != nil {
-				dir := "->udp"
-				if n.HB == nil {
-					dir = "->tcp"
-				}
-				n.emit(EventHB, map[string]any{"dir": dir, "err": err.Error()})
-				n.onMiss()
-				continue
-			}
-			{
-				dir := "->udp"
-				if n.HB == nil {
-					dir = "->tcp"
-				}
-				n.emit(EventHB, map[string]any{"dir": dir})
-			}
-		}
-	}
-}
+// heartbeatLoop moved to heartbeat.go
 
 func (n *Node) onMiss() {
 	m := n.misses.Add(1)
@@ -645,12 +693,7 @@ func (n *Node) onPong() {
 	}
 }
 
-func (n *Node) onSegAd(from transport.MemAddr, b []byte) {
-	ad, err := syncproto.DecodeSegAd(b)
-	if err != nil {
-		n.emit(EventWarn, map[string]any{"msg": "decode_segad_err", "err": err.Error()})
-		return
-	}
+func (n *Node) handleSegAd(from transport.MemAddr, ad syncproto.SegAd) {
 	req := syncproto.DiffForReqFromSegAd(n.Log, ad)
 	if len(req.Needs) > 0 {
 		n.emit(EventSendReq, map[string]any{"needs": req.Needs})
@@ -675,22 +718,27 @@ func (n *Node) onSegAd(from transport.MemAddr, b []byte) {
 	}
 
 	n.emit(EventSendSegKeysReq, map[string]any{"sids": sids})
-	if err := n.sendTo(from, wire.MT_SEG_KEYS_REQ, syncproto.EncodeSegKeysReq(syncproto.SegKeysReq{SIDs: sids})); err != nil {
-		n.emit(EventWarn, map[string]any{"msg": "send_segkeys_req_err", "err": err.Error()})
+	if n.ms != nil {
+		if err := n.ms.Send(n.ctx, from, protoport.SegKeysReqMsg{R: syncproto.SegKeysReq{SIDs: sids}}); err != nil {
+			n.emit(EventWarn, map[string]any{"msg": "send_segkeys_req_err", "err": err.Error()})
+		}
+	} else {
+		if err := n.sendTo(from, wire.MT_SEG_KEYS_REQ, syncproto.EncodeSegKeysReq(syncproto.SegKeysReq{SIDs: sids})); err != nil {
+			n.emit(EventWarn, map[string]any{"msg": "send_segkeys_req_err", "err": err.Error()})
+		}
 	}
 }
 
-func (n *Node) onSegKeysReq(from transport.MemAddr, b []byte) {
-	req, err := syncproto.DecodeSegKeysReq(b)
-	if err != nil {
-		n.emit(EventWarn, map[string]any{"msg": "decode_segkeys_req_err", "err": err.Error()})
-		return
-	}
+func (n *Node) handleSegKeysReq(from transport.MemAddr, req syncproto.SegKeysReq) {
 	view := materialize.Snapshot(n.Log)
 	payload := syncproto.BuildSegKeys(view, req.SIDs)
 	enc := syncproto.EncodeSegKeys(payload)
 	n.emit(EventSendSegKeys, map[string]any{"items": len(payload.Items)})
-	if err := n.sendTo(from, wire.MT_SEG_KEYS, enc); err != nil {
+	if n.ms != nil {
+		if err := n.ms.Send(n.ctx, from, protoport.SegKeysMsg{K: payload}); err != nil {
+			n.emit(EventWarn, map[string]any{"msg": "send_segkeys_err", "err": err.Error()})
+		}
+	} else if err := n.sendTo(from, wire.MT_SEG_KEYS, enc); err != nil {
 		n.emit(EventWarn, map[string]any{"msg": "send_segkeys_err", "err": err.Error()})
 	}
 }
@@ -721,7 +769,11 @@ func (n *Node) onSegKeys(from transport.MemAddr, b []byte) {
 	}
 	req := syncproto.Req{Needs: needs}
 	n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "seg_keys"})
-	if err := n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
+	if n.ms != nil {
+		if err := n.ms.Send(n.ctx, from, protoport.ReqMsg{R: req}); err != nil {
+			n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
+		}
+	} else if err := n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
 		n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
 	}
 }
@@ -763,77 +815,24 @@ func countsEqual(a, b map[string]int) bool {
 	return true
 }
 
-func (n *Node) chunkDelta(d syncproto.Delta, maxBytes int) []syncproto.DeltaChunk {
-	if maxBytes <= 0 {
-		maxBytes = n.DeltaMaxBytes
-	}
-	seq := uint32(0)
-	var out []syncproto.DeltaChunk
-	cur := syncproto.DeltaChunk{Seq: seq, Last: false, Entries: nil}
-	room := maxBytes
+// chunking moved to syncproto.ChunkDelta
 
-	estEntrySize := func(e syncproto.DeltaEntry) int {
-		// rough upper bound: key + per-op fixed parts + values
-		s := 2 + len(e.Key) + 4
-		for _, op := range e.Ops {
-			s += 2 + 1 + 8 + 8 + 16 + 32 + 4 + len(op.Value)
-		}
-		return s
-	}
-	flush := func() {
-		if len(cur.Entries) == 0 {
-			return
-		}
-		out = append(out, cur)
-		seq++
-		cur = syncproto.DeltaChunk{Seq: seq}
-		room = maxBytes
-	}
-	for _, e := range d.Entries {
-		sz := estEntrySize(e)
-		if sz > maxBytes {
-			flush()
-			out = append(out, syncproto.DeltaChunk{Seq: seq, Entries: []syncproto.DeltaEntry{e}})
-			seq++
-			cur = syncproto.DeltaChunk{Seq: seq}
-			room = maxBytes
-			continue
-		}
-		if sz > room {
-			flush()
-		}
-		cur.Entries = append(cur.Entries, e)
-		room -= sz
-	}
-	flush()
-	if len(out) > 0 {
-		out[len(out)-1].Last = true
-	}
-	return out
-}
-
-func (n *Node) onDeltaChunk(from transport.MemAddr, b []byte) {
+func (n *Node) handleDeltaChunk(from transport.MemAddr, ch syncproto.DeltaChunk) {
 	n.beginSessionIfNeeded()
-	ch, err := syncproto.DecodeDeltaChunk(b)
-	if err != nil {
-		// If decoder populated Seq (bad hash case), NACK it.
-		if ch.Seq != 0 {
-			_ = n.sendTo(from, wire.MT_DELTA_NACK, syncproto.EncodeDeltaNack(syncproto.DeltaNack{
-				Seq:  ch.Seq,
-				Code: 0, // 0 = bad_hash
-			}))
-			n.emit(EventAck, map[string]any{"dir": "send", "nack": true, "seq": ch.Seq, "reason": "bad_hash"})
-		}
-		n.emit(EventWarn, map[string]any{"msg": "decode_delta_chunk_err", "err": err.Error()})
-		return
-	}
 
 	n.sessMu.Lock()
-	expect := n.sess.rcvExpect
+	expect := n.sess.rcvExpect[ch.SID]
 	n.sessMu.Unlock()
 
+	// Emit detailed receive event including SV snapshot if known
+	var sv any
+	n.peerSVMu.Lock()
+	if s, ok := n.peerSV[string(from)]; ok {
+		sv = map[string]any{"seg_frontier": len(s.SegFrontier), "keys_frontier": len(s.Frontier)}
+	}
+	n.peerSVMu.Unlock()
 	n.emit(EventRecvDeltaChunk, map[string]any{
-		"seq": ch.Seq, "last": ch.Last, "entries": len(ch.Entries), "expect": expect, "hash_ok": true,
+		"sid": int(ch.SID), "seq": ch.Seq, "last": ch.Last, "entries": len(ch.Entries), "expect": expect, "hash_ok": true, "peer_sv": sv,
 	})
 
 	// Reject anything not exactly the next expected chunk.
@@ -841,29 +840,42 @@ func (n *Node) onDeltaChunk(from transport.MemAddr, b []byte) {
 		if ch.Seq < expect {
 			// Duplicate/late: just ACK the last in-order; do not send a duplicate NACK.
 			if expect > 0 {
-				_ = n.sendTo(from, wire.MT_SYNC_ACK, syncproto.EncodeAck(syncproto.Ack{Seq: expect - 1}))
-				n.emit(EventAck, map[string]any{"dir": "send", "seq": expect - 1, "reason": "duplicate"})
+				if err := n.sendTo(from, wire.MT_SYNC_ACK, syncproto.EncodeAck(syncproto.Ack{SID: ch.SID, Seq: expect - 1})); err != nil {
+					n.emit(EventWarn, map[string]any{"msg": "send_ack_err", "err": err.Error(), "seq": expect - 1})
+				} else {
+					n.emit(EventAck, map[string]any{"dir": "send", "seq": expect - 1, "reason": "duplicate"})
+				}
 			}
 		} else { // ch.Seq > expect
 			// Out-of-window/skip: ACK last in-order and NACK the future chunk.
 			if expect > 0 {
-				_ = n.sendTo(from, wire.MT_SYNC_ACK, syncproto.EncodeAck(syncproto.Ack{Seq: expect - 1}))
-				n.emit(EventAck, map[string]any{"dir": "send", "seq": expect - 1, "reason": "out_of_order"})
+				if err := n.sendTo(from, wire.MT_SYNC_ACK, syncproto.EncodeAck(syncproto.Ack{SID: ch.SID, Seq: expect - 1})); err != nil {
+					n.emit(EventWarn, map[string]any{"msg": "send_ack_err", "err": err.Error(), "seq": expect - 1})
+				} else {
+					n.emit(EventAck, map[string]any{"dir": "send", "seq": expect - 1, "reason": "out_of_order"})
+				}
 			}
-			_ = n.sendTo(from, wire.MT_DELTA_NACK, syncproto.EncodeDeltaNack(syncproto.DeltaNack{
-				Seq:  ch.Seq,
-				Code: 1, // 1 = out_of_window
-			}))
-			n.emit(EventAck, map[string]any{"dir": "send", "nack": true, "seq": ch.Seq, "reason": "out_of_window"})
+			if err := n.sendTo(from, wire.MT_DELTA_NACK, syncproto.EncodeDeltaNack(syncproto.DeltaNack{Seq: ch.Seq, Code: 1})); err != nil {
+				n.emit(EventWarn, map[string]any{"msg": "send_nack_err", "err": err.Error(), "seq": ch.Seq})
+			} else {
+				n.emit(EventAck, map[string]any{"dir": "send", "nack": true, "seq": ch.Seq, "reason": "out_of_window"})
+			}
 		}
 		return
 	}
 
 	before := n.Log.CountPerKey()
+	var maxTick uint64
 	for _, e := range ch.Entries {
 		for _, op := range e.Ops {
+			if op.HLCTicks > maxTick {
+				maxTick = op.HLCTicks
+			}
 			n.Log.Append(op)
 		}
+	}
+	if maxTick != 0 {
+		_ = n.Clock.Merge(maxTick)
 	}
 	after := n.Log.CountPerKey()
 	n.emit(EventAppliedDelta, map[string]any{"keys": len(ch.Entries), "before": before, "after": after})
@@ -872,11 +884,14 @@ func (n *Node) onDeltaChunk(from transport.MemAddr, b []byte) {
 	noChange := countsEqual(before, after)
 
 	n.sessMu.Lock()
-	n.sess.rcvExpect++
+	n.sess.rcvExpect[ch.SID] = expect + 1
 	n.sessMu.Unlock()
 
-	_ = n.sendTo(from, wire.MT_SYNC_ACK, syncproto.EncodeAck(syncproto.Ack{Seq: ch.Seq}))
-	n.emit(EventAck, map[string]any{"dir": "send", "seq": ch.Seq})
+	if err := n.sendTo(from, wire.MT_SYNC_ACK, syncproto.EncodeAck(syncproto.Ack{SID: ch.SID, Seq: ch.Seq})); err != nil {
+		n.emit(EventWarn, map[string]any{"msg": "send_ack_err", "err": err.Error(), "seq": ch.Seq})
+	} else {
+		n.emit(EventAck, map[string]any{"dir": "send", "seq": ch.Seq})
+	}
 
 	if ch.Last {
 		// 1) Try summary-based continuation first (multiple deltas may be needed).
@@ -898,10 +913,16 @@ func (n *Node) onDeltaChunk(from transport.MemAddr, b []byte) {
 				req := syncproto.DiffForReq(n.Log, lr)
 				if len(req.Needs) > 0 {
 					n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "continue_after_chunk"})
-					_ = n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req))
+					if n.ms != nil {
+						if err := n.ms.Send(n.ctx, from, protoport.ReqMsg{R: req}); err != nil {
+							n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
+						}
+					} else if err := n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
+						n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
+					}
 					// next delta stream will start at seq=0
 					n.sessMu.Lock()
-					n.sess.rcvExpect = 0
+					n.sess.rcvExpect[ch.SID] = 0
 					n.sessMu.Unlock()
 					return
 				}
@@ -923,28 +944,29 @@ func (n *Node) onDeltaChunk(from transport.MemAddr, b []byte) {
 			next := n.sess.dqueue[0]
 			n.sess.dqueue = n.sess.dqueue[1:]
 			// reset expected seq for the next delta stream
-			n.sess.rcvExpect = 0
+			n.sess.rcvExpect[ch.SID] = 0
 			n.sessMu.Unlock()
 			n.emit(EventDescent, map[string]any{"dir": "->", "kind": "req_after_delta", "prefix": string(next)})
-			_ = n.sendTo(from, wire.MT_DESCENT_REQ, syncproto.EncodeDescentReq(syncproto.DescentReq{Prefix: next}))
+			if n.ms != nil {
+				if err := n.ms.Send(n.ctx, from, protoport.DescentReqMsg{R: syncproto.DescentReq{Prefix: next}}); err != nil {
+					n.emit(EventWarn, map[string]any{"msg": "send_descent_req_err", "err": err.Error()})
+				}
+			} else if err := n.sendTo(from, wire.MT_DESCENT_REQ, syncproto.EncodeDescentReq(syncproto.DescentReq{Prefix: next})); err != nil {
+				n.emit(EventWarn, map[string]any{"msg": "send_descent_req_err", "err": err.Error()})
+			}
 			return
 		}
 	}
 }
 
-func (n *Node) onAck(_ transport.MemAddr, b []byte) {
-	a, err := syncproto.DecodeAck(b)
-	if err != nil {
-		n.emit(EventWarn, map[string]any{"msg": "decode_ack_err", "err": err.Error()})
-		return
-	}
+func (n *Node) handleAck(_ transport.MemAddr, a syncproto.Ack) {
 
-	n.emit(EventAck, map[string]any{"dir": "recv", "seq": a.Seq})
+	n.emit(EventAck, map[string]any{"dir": "recv", "sid": int(a.SID), "seq": a.Seq})
 
 	n.sessMu.Lock()
 	if n.sess.ackCh != nil {
 		select {
-		case n.sess.ackCh <- a.Seq:
+		case n.sess.ackCh <- a:
 		default:
 		}
 	}
@@ -955,7 +977,7 @@ func (n *Node) onAck(_ transport.MemAddr, b []byte) {
 
 }
 
-func (n *Node) streamChunks(to transport.MemAddr, chunks []syncproto.DeltaChunk, ackCh chan uint32, sessCtx context.Context) {
+func (n *Node) streamChunks(to transport.MemAddr, chunks []syncproto.DeltaChunk, ackCh chan syncproto.Ack, sessCtx context.Context) {
 	window := n.DeltaWindowChunks
 	timeout := n.RetransTimeout
 	if sessCtx == nil || ackCh == nil {
@@ -977,22 +999,21 @@ func (n *Node) streamChunks(to transport.MemAddr, chunks []syncproto.DeltaChunk,
 	next := 0
 
 	// Keep sess.sndInflight in sync so onDeltaNack can find any in-flight seq.
-	snapshotInflight := func() {
-		n.sessMu.Lock()
-		n.sess.sndInflight = make([]syncproto.DeltaChunk, 0, len(unacked))
-		for _, inf := range unacked {
-			n.sess.sndInflight = append(n.sess.sndInflight, inf.ch)
-		}
-		n.sessMu.Unlock()
-	}
+	snapshotInflight := func() {}
 
 	// Helper to send one chunk
 	sendOne := func(ch syncproto.DeltaChunk) bool {
 		enc := syncproto.EncodeDeltaChunk(ch)
 		n.emit(EventSendDeltaChunk, map[string]any{
-			"seq": ch.Seq, "entries": len(ch.Entries), "bytes": len(enc), "last": ch.Last,
+			"sid": int(ch.SID), "seq": ch.Seq, "entries": len(ch.Entries), "bytes": len(enc), "last": ch.Last,
 		})
-		if err := n.sendTo(to, wire.MT_SYNC_DELTA_CHUNK, enc); err != nil {
+		var err error
+		if n.ms != nil {
+			err = n.ms.Send(n.ctx, to, protoport.DeltaChunkMsg{C: ch})
+		} else {
+			err = n.sendTo(to, wire.MT_SYNC_DELTA_CHUNK, enc)
+		}
+		if err != nil {
 			n.emit(EventWarn, map[string]any{"msg": "send_delta_chunk_err", "err": err.Error()})
 			return false
 		}
@@ -1023,9 +1044,10 @@ func (n *Node) streamChunks(to transport.MemAddr, chunks []syncproto.DeltaChunk,
 		case <-n.ctx.Done():
 			return
 
-		case seq := <-ackCh:
+		case ack := <-ackCh:
 			// Ack always increases by 1 (receiver is in-order)
-			delete(unacked, seq)
+			_ = ack.SID
+			delete(unacked, ack.Seq)
 			snapshotInflight()
 			// Top up window
 			for next < len(chunks) && len(unacked) < window {
@@ -1043,9 +1065,15 @@ func (n *Node) streamChunks(to transport.MemAddr, chunks []syncproto.DeltaChunk,
 					// resend
 					enc := syncproto.EncodeDeltaChunk(inf.ch)
 					n.emit(EventSendDeltaChunk, map[string]any{
-						"seq": inf.ch.Seq, "entries": len(inf.ch.Entries), "bytes": len(enc), "last": inf.ch.Last, "retrans": true,
+						"sid": int(inf.ch.SID), "seq": inf.ch.Seq, "entries": len(inf.ch.Entries), "bytes": len(enc), "last": inf.ch.Last, "retrans": true,
 					})
-					if err := n.sendTo(to, wire.MT_SYNC_DELTA_CHUNK, enc); err != nil {
+					var err error
+					if n.ms != nil {
+						err = n.ms.Send(n.ctx, to, protoport.DeltaChunkMsg{C: inf.ch})
+					} else {
+						err = n.sendTo(to, wire.MT_SYNC_DELTA_CHUNK, enc)
+					}
+					if err != nil {
 						n.emit(EventWarn, map[string]any{"msg": "send_delta_chunk_err", "err": err.Error()})
 						return
 					}
@@ -1059,12 +1087,7 @@ func (n *Node) streamChunks(to transport.MemAddr, chunks []syncproto.DeltaChunk,
 	}
 }
 
-func (n *Node) onRoot(from transport.MemAddr, b []byte) {
-	r, err := syncproto.DecodeRoot(b)
-	if err != nil {
-		n.emit(EventWarn, map[string]any{"msg": "decode_root_err", "err": err.Error()})
-		return
-	}
+func (n *Node) handleRoot(from transport.MemAddr, r syncproto.Root) {
 
 	my := n.computeRootFromLog()
 	if my == r.Hash {
@@ -1084,196 +1107,62 @@ func (n *Node) onRoot(from transport.MemAddr, b []byte) {
 
 	n.emit(EventDescent, map[string]any{"dir": "->", "kind": "req", "prefix": ""})
 	req := syncproto.DescentReq{Prefix: nil}
-	_ = n.sendTo(from, wire.MT_DESCENT_REQ, syncproto.EncodeDescentReq(req))
+	if err := n.sendTo(from, wire.MT_DESCENT_REQ, syncproto.EncodeDescentReq(req)); err != nil {
+		n.emit(EventWarn, map[string]any{"msg": "send_descent_req_err", "err": err.Error()})
+	}
 }
 
-func (n *Node) onDescentReq(from transport.MemAddr, b []byte) {
+func (n *Node) handleDescentReq(from transport.MemAddr, req syncproto.DescentReq) {
 	if !n.DescentEnabled {
 		return
 	}
-	req, err := syncproto.DecodeDescentReq(b)
-	if err != nil {
-		n.emit(EventWarn, map[string]any{"msg": "decode_descent_req_err", "err": err.Error()})
-		return
-	}
-	all := n.sortedLeaves()
-	span := leavesWithPrefix(all, req.Prefix)
-
-	// If small, return leaf list
-	if len(span) <= n.DescentLeafK {
-		out := make([]syncproto.LeafHash, 0, len(span))
-		for _, lf := range span {
-			out = append(out, syncproto.LeafHash{Key: lf.Key, Hash: lf.Hash})
-		}
-		resp := syncproto.DescentResp{Prefix: slices.Clone(req.Prefix), Leaves: out}
-
-		n.emit(EventDescent, map[string]any{"dir": "<-", "kind": "resp_leaves", "prefix": string(req.Prefix), "leaves": len(out)})
-		_ = n.sendTo(from, wire.MT_DESCENT_RESP, syncproto.EncodeDescentResp(resp))
-		return
-	}
-
-	// Otherwise return child hashes
-	groups := groupChildren(span, req.Prefix)
-	kids := make([]syncproto.ChildHash, 0, len(groups))
-	for lb, g := range groups {
-		h := merkle.Build(g)
-		kids = append(kids, syncproto.ChildHash{Label: lb, Hash: h, Count: uint32(len(g))})
-	}
-	// stable order
-	slices.SortFunc(kids, func(a, b syncproto.ChildHash) int {
-		if a.Label < b.Label {
-			return -1
-		}
-		if a.Label > b.Label {
-			return 1
-		}
-		return 0
-	})
-	resp := syncproto.DescentResp{Prefix: slices.Clone(req.Prefix), Children: kids}
-	n.emit(EventDescent, map[string]any{"dir": "<-", "kind": "resp_children", "prefix": string(req.Prefix), "children": len(kids)})
-	_ = n.sendTo(from, wire.MT_DESCENT_RESP, syncproto.EncodeDescentResp(resp))
-}
-
-func (n *Node) onDescentResp(from transport.MemAddr, b []byte) {
-	if !n.DescentEnabled {
-		return
-	}
-	resp, err := syncproto.DecodeDescentResp(b)
-	if err != nil {
-		n.emit(EventWarn, map[string]any{"msg": "decode_descent_resp_err", "err": err.Error()})
-		return
-	}
-
-	// compute local view once
-	all := n.sortedLeaves()
-
-	if len(resp.Children) > 0 {
-		// compare each child hash; queue the ones that differ
-		for _, ch := range resp.Children {
-			p := append(slices.Clone(resp.Prefix), ch.Label)
-			// local hash for this child
-			span := leavesWithPrefix(all, p)
-			lh := merkle.Build(span)
-			if lh != ch.Hash {
-				n.sessMu.Lock()
-				n.sess.dqueue = append(n.sess.dqueue, p)
-				n.sessMu.Unlock()
-			}
-		}
-		// pop next prefix and ask again
-		n.sessMu.Lock()
-		var next []byte
-		if len(n.sess.dqueue) > 0 {
-			next = n.sess.dqueue[0]
-			n.sess.dqueue = n.sess.dqueue[1:]
-		}
-		n.sessMu.Unlock()
-		if next != nil {
-			n.emit(EventDescent, map[string]any{"dir": "->", "kind": "req_next", "prefix": string(next)})
-			_ = n.sendTo(from, wire.MT_DESCENT_REQ, syncproto.EncodeDescentReq(syncproto.DescentReq{Prefix: next}))
-		}
-		return
-	}
-
+	view := materialize.Snapshot(n.Log)
+	resp := syncproto.BuildDescentResp(view, req.Prefix, n.DescentLeafK)
+	kind := "resp_children"
 	if len(resp.Leaves) > 0 {
-		// build precise Needs for keys whose leaf hash differs
-		local := make(map[string][32]byte, len(resp.Leaves))
-		for _, lf := range leavesWithPrefix(all, resp.Prefix) {
-			local[lf.Key] = lf.Hash
-		}
-		counts := n.Log.CountPerKey()
-		needs := make([]syncproto.Need, 0, len(resp.Leaves))
-		for _, rlf := range resp.Leaves {
-			if local[rlf.Key] != rlf.Hash {
-				fromCnt := uint32(0)
-				if c, ok := counts[rlf.Key]; ok && c > 0 {
-					if c > int(^uint32(0)) {
-						fromCnt = ^uint32(0)
-					} else {
-						fromCnt = uint32(c)
-					}
-				}
-				needs = append(needs, syncproto.Need{Key: rlf.Key, From: fromCnt})
-			}
-		}
-		if len(needs) > 0 {
-			req := syncproto.Req{Needs: needs}
-			n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "descent"})
-			_ = n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req))
-		}
-
-		// continue with next queued prefix if any
-		n.sessMu.Lock()
-		var next []byte
-		if len(n.sess.dqueue) > 0 {
-			next = n.sess.dqueue[0]
-			n.sess.dqueue = n.sess.dqueue[1:]
-		}
-		n.sessMu.Unlock()
-		if next != nil {
-			_ = n.sendTo(from, wire.MT_DESCENT_REQ, syncproto.EncodeDescentReq(syncproto.DescentReq{Prefix: next}))
-		}
-		return
+		kind = "resp_leaves"
 	}
-
-	// Fallback: if this response produced no immediate follow-up (e.g., empty remote subtree),
-	// continue with the next queued prefix instead of stalling.
-	n.sessMu.Lock()
-	var next []byte
-	if len(n.sess.dqueue) > 0 {
-		next = n.sess.dqueue[0]
-		n.sess.dqueue = n.sess.dqueue[1:]
-	}
-	n.sessMu.Unlock()
-	if next != nil {
-		_ = n.sendTo(from, wire.MT_DESCENT_REQ, syncproto.EncodeDescentReq(syncproto.DescentReq{Prefix: next}))
+	n.emit(EventDescent, map[string]any{"dir": "<-", "kind": kind, "prefix": string(req.Prefix)})
+	if err := n.sendTo(from, wire.MT_DESCENT_RESP, syncproto.EncodeDescentResp(resp)); err != nil {
+		n.emit(EventWarn, map[string]any{"msg": "send_descent_resp_err", "err": err.Error()})
 	}
 }
 
+func (n *Node) handleDescentResp(from transport.MemAddr, resp syncproto.DescentResp) {
+	if !n.DescentEnabled {
+		return
+	}
+
+	all := n.sortedLeaves()
+	counts := n.Log.CountPerKey()
+	needs, nextPrefixes := syncproto.DiffDescent(all, resp, counts)
+	if len(needs) > 0 {
+		req := syncproto.Req{Needs: needs}
+		n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "descent"})
+		if err := n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
+			n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
+		}
+	}
+	if len(nextPrefixes) > 0 {
+		n.sessMu.Lock()
+		n.sess.dqueue = append(n.sess.dqueue, nextPrefixes...)
+		next := n.sess.dqueue[0]
+		n.sess.dqueue = n.sess.dqueue[1:]
+		n.sessMu.Unlock()
+		n.emit(EventDescent, map[string]any{"dir": "->", "kind": "req_next", "prefix": string(next)})
+		if err := n.sendTo(from, wire.MT_DESCENT_REQ, syncproto.EncodeDescentReq(syncproto.DescentReq{Prefix: next})); err != nil {
+			n.emit(EventWarn, map[string]any{"msg": "send_descent_req_err", "err": err.Error()})
+		}
+		return
+	}
+}
+
+// sortedLeaves returns a sorted snapshot of leaves
 func (n *Node) sortedLeaves() []merkle.Leaf {
 	snap := materialize.Snapshot(n.Log)
 	ls := materialize.LeavesFromSnapshot(snap)
 	sortLeaves(ls)
 	return ls
-}
-
-func hasPrefix(s string, p []byte) bool {
-	if len(p) > len(s) {
-		return false
-	}
-	for i := range p {
-		if s[i] != p[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// leavesWithPrefix: O(n) scan — fine for now
-func leavesWithPrefix(all []merkle.Leaf, p []byte) []merkle.Leaf {
-	out := make([]merkle.Leaf, 0, 64)
-	for _, lf := range all {
-		if hasPrefix(lf.Key, p) {
-			out = append(out, lf)
-		}
-	}
-	return out
-}
-
-// groupChildren: group span by next byte after prefix; return label->slice
-func groupChildren(span []merkle.Leaf, p []byte) map[byte][]merkle.Leaf {
-	m := make(map[byte][]merkle.Leaf)
-	plen := len(p)
-	for _, lf := range span {
-		if len(lf.Key) <= plen {
-			// exact match — treat as its own tiny span; we’ll hit K-threshold anyway
-			// (no child label; will be covered when span size<=K)
-			continue
-		}
-		lb := lf.Key[plen]
-		m[lb] = append(m[lb], lf)
-	}
-	return m
 }
 
 func (n *Node) warn(msg string, err error) {
@@ -1291,13 +1180,13 @@ func (n *Node) beginSessionIfNeeded() {
 	n.sess.id = genSessionID()
 	n.sess.active = true
 	n.sess.sndNext = 0
-	n.sess.sndInflight = nil
-	n.sess.rcvExpect = 0
+	n.sess.sndInflight = make(map[segment.ID][]syncproto.DeltaChunk)
+	n.sess.rcvExpect = make(map[segment.ID]uint32)
 	bufCap := 32
 	if w := 4 * n.DeltaWindowChunks; w > bufCap {
 		bufCap = w
 	}
-	n.sess.ackCh = make(chan uint32, bufCap)
+	n.sess.ackCh = make(chan syncproto.Ack, bufCap)
 	n.sess.ctx, n.sess.cancel = context.WithCancel(n.ctx)
 	n.emit(EventSync, map[string]any{"action": "begin", "id": n.sess.id})
 }
@@ -1312,7 +1201,9 @@ func (n *Node) endSessionTo(to transport.MemAddr, sendEnd bool, reason string) {
 	n.sessMu.Unlock()
 	// Send END even if this side didn't mark the session active.
 	if sendEnd {
-		_ = n.sendTo(to, wire.MT_SYNC_END, nil)
+		if n.ms == nil {
+			_ = n.sendTo(to, wire.MT_SYNC_END, nil)
+		}
 	}
 	if active && cancel != nil {
 		cancel()
@@ -1369,12 +1260,7 @@ func (n *Node) maybeEndIfEqual(to transport.MemAddr) bool {
 	return true
 }
 
-func (n *Node) onDeltaNack(from transport.MemAddr, b []byte) {
-	nack, err := syncproto.DecodeDeltaNack(b)
-	if err != nil {
-		n.emit(EventWarn, map[string]any{"msg": "decode_delta_nack_err", "err": err.Error()})
-		return
-	}
+func (n *Node) onDeltaNackHandled(from transport.MemAddr, nack syncproto.DeltaNack) {
 	n.emit(EventAck, map[string]any{"dir": "recv", "nack": true, "seq": nack.Seq, "code": nack.Code})
 
 	// We keep the last sent chunk in sess.sndInflight (window is small).
@@ -1385,18 +1271,20 @@ func (n *Node) onDeltaNack(from transport.MemAddr, b []byte) {
 		n.emit(EventWarn, map[string]any{"msg": "nack_no_inflight"})
 		return
 	}
-	for _, ch := range infl {
-		if ch.Seq != nack.Seq {
-			continue
+	if inflist, ok := infl[0]; ok {
+		for _, ch := range inflist {
+			if ch.Seq != nack.Seq {
+				continue
+			}
+			enc := syncproto.EncodeDeltaChunk(ch)
+			n.emit(EventSendDeltaChunk, map[string]any{
+				"sid": int(ch.SID), "seq": ch.Seq, "entries": len(ch.Entries), "bytes": len(enc), "last": ch.Last, "retrans": true, "reason": "nack",
+			})
+			if err := n.sendTo(from, wire.MT_SYNC_DELTA_CHUNK, enc); err != nil {
+				n.emit(EventWarn, map[string]any{"msg": "retransmit_err", "seq": ch.Seq, "err": err.Error()})
+			}
+			return
 		}
-		enc := syncproto.EncodeDeltaChunk(ch)
-		n.emit(EventSendDeltaChunk, map[string]any{
-			"seq": ch.Seq, "entries": len(ch.Entries), "bytes": len(enc), "last": ch.Last, "retrans": true, "reason": "nack",
-		})
-		if err := n.sendTo(from, wire.MT_SYNC_DELTA_CHUNK, enc); err != nil {
-			n.emit(EventWarn, map[string]any{"msg": "retransmit_err", "seq": ch.Seq, "err": err.Error()})
-		}
-		return
 	}
 	// No match in inflight (could be stale); log and move on.
 	n.emit(EventWarn, map[string]any{"msg": "nack_unknown_seq", "seq": nack.Seq})

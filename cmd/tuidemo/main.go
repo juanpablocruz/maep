@@ -226,7 +226,12 @@ func (nm *NodeManager) updateRingTopology() {
 
 		// Recreate the node with the correct peer address
 		nm.nodes[i].Node.Stop()
-		newNode := node.New(nm.nodes[i].Name, nm.nodes[i].TCP, peerAddr, nm.cfg.SyncInterval)
+		newNode := node.NewWithOptions(
+			nm.nodes[i].Name,
+			node.WithEndpoint(nm.nodes[i].TCP),
+			node.WithPeer(peerAddr),
+			node.WithTickerEvery(nm.cfg.SyncInterval),
+		)
 		newNode.AttachHB(nm.nodes[i].UDP)
 		newNode.SetDeltaMaxBytes(nm.cfg.DeltaChunk)
 		newNode.SetHeartbeatEvery(nm.cfg.Heartbeat)
@@ -265,7 +270,12 @@ func (nm *NodeManager) createNode(index int) (*SimNode, error) {
 	nm.configureChaos(chaosTCP, chaosUDP)
 
 	// Create node with temporary peer address (will be set properly after ring setup)
-	n := node.New(fmt.Sprintf("%d", index), chaosTCP, transport.MemAddr("127.0.0.1:9999"), nm.cfg.SyncInterval)
+	n := node.NewWithOptions(
+		fmt.Sprintf("%d", index),
+		node.WithEndpoint(chaosTCP),
+		node.WithPeer(transport.MemAddr("127.0.0.1:9999")),
+		node.WithTickerEvery(nm.cfg.SyncInterval),
+	)
 	n.AttachHB(chaosUDP)
 	n.SetDeltaMaxBytes(nm.cfg.DeltaChunk)
 	n.SetHeartbeatEvery(nm.cfg.Heartbeat)

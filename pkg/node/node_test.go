@@ -185,14 +185,13 @@ func TestPutAndDelete(t *testing.T) {
 }
 
 func TestChunkingSplitsAndMarksLast(t *testing.T) {
-	n := &Node{DeltaMaxBytes: 128}
 	// Create a delta with two entries big enough to force split
 	big := make([]byte, 50)
 	d := syncproto.Delta{Entries: []syncproto.DeltaEntry{
 		{Key: "k1", Ops: []model.Op{{Version: model.OpSchemaV1, Kind: model.OpKindPut, Key: "k1", Value: big}}},
 		{Key: "k2", Ops: []model.Op{{Version: model.OpSchemaV1, Kind: model.OpKindPut, Key: "k2", Value: big}}},
 	}}
-	chunks := n.chunkDelta(d, 128)
+	chunks := syncproto.ChunkDelta(d, 128)
 	if len(chunks) < 1 {
 		t.Fatalf("expected at least one chunk")
 	}

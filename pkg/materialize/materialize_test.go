@@ -26,7 +26,7 @@ func TestSnapshotLWW(t *testing.T) {
 			HLCTicks: clk.Now(),
 			Actor:    actor,
 		}
-		op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
+		op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor, op.Pre)
 		l.Append(op)
 
 		op = model.Op{
@@ -36,7 +36,7 @@ func TestSnapshotLWW(t *testing.T) {
 			HLCTicks: clk.Now(),
 			Actor:    actor,
 		}
-		op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
+		op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor, op.Pre)
 		l.Append(op)
 	}
 
@@ -49,7 +49,7 @@ func TestSnapshotLWW(t *testing.T) {
 			HLCTicks: clk.Now(),
 			Actor:    actor,
 		}
-		op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
+		op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor, op.Pre)
 		l.Append(op)
 
 		op = model.Op{
@@ -60,7 +60,7 @@ func TestSnapshotLWW(t *testing.T) {
 			HLCTicks: clk.Now(),
 			Actor:    actor,
 		}
-		op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
+		op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor, op.Pre)
 		l.Append(op)
 	}
 

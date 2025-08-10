@@ -22,17 +22,21 @@ func TestDuplicateChunkAckNoNack(t *testing.T) {
 
 	// Node on B receiving from A
 	ev := make(chan Event, 64)
-	n := New("NB", b, "A", 100*time.Millisecond)
-	n.Log = oplog.New()
-	n.Clock = hlc.New()
+	n := NewWithOptions("NB",
+		WithEndpoint(b),
+		WithPeer("A"),
+		WithTickerEvery(100*time.Millisecond),
+		WithLog(oplog.New()),
+		WithClock(hlc.New()),
+	)
 	n.AttachEvents(ev)
 	n.Start()
 	defer n.Stop()
 
 	// Send an in-order chunk (seq 0)
 	op := model.Op{Version: model.OpSchemaV1, Kind: model.OpKindPut, Key: "x", HLCTicks: n.Clock.Now()}
-	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
-	ch0 := syncproto.DeltaChunk{Seq: 0, Last: false, Entries: []syncproto.DeltaEntry{{Key: "x", Ops: []model.Op{op}}}}
+	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor, op.Pre)
+	ch0 := syncproto.DeltaChunk{SID: 0, Seq: 0, Last: false, Entries: []syncproto.DeltaEntry{{Key: "x", Ops: []model.Op{op}}}}
 	if err := a.Send("B", wire.Encode(wire.MT_SYNC_DELTA_CHUNK, syncproto.EncodeDeltaChunk(ch0))); err != nil {
 		t.Fatal(err)
 	}
@@ -83,17 +87,21 @@ func TestFutureChunkNackOutOfWindow(t *testing.T) {
 	defer b.Close()
 
 	ev := make(chan Event, 64)
-	n := New("NB", b, "A", 100*time.Millisecond)
-	n.Log = oplog.New()
-	n.Clock = hlc.New()
+	n := NewWithOptions("NB",
+		WithEndpoint(b),
+		WithPeer("A"),
+		WithTickerEvery(100*time.Millisecond),
+		WithLog(oplog.New()),
+		WithClock(hlc.New()),
+	)
 	n.AttachEvents(ev)
 	n.Start()
 	defer n.Stop()
 
 	// Send seq=1 while expect=0
 	op := model.Op{Version: model.OpSchemaV1, Kind: model.OpKindPut, Key: "y", HLCTicks: n.Clock.Now()}
-	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
-	ch1 := syncproto.DeltaChunk{Seq: 1, Last: false, Entries: []syncproto.DeltaEntry{{Key: "y", Ops: []model.Op{op}}}}
+	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor, op.Pre)
+	ch1 := syncproto.DeltaChunk{SID: 0, Seq: 1, Last: false, Entries: []syncproto.DeltaEntry{{Key: "y", Ops: []model.Op{op}}}}
 	if err := a.Send("B", wire.Encode(wire.MT_SYNC_DELTA_CHUNK, syncproto.EncodeDeltaChunk(ch1))); err != nil {
 		t.Fatal(err)
 	}
@@ -113,5 +121,102 @@ func TestFutureChunkNackOutOfWindow(t *testing.T) {
 	}
 	if !sawNack {
 		t.Fatalf("expected NACK(reason=out_of_window) for future chunk")
+	}
+}
+
+// Spec compliance: In-order chunk applies ops, merges HLC, and ACKs
+func TestApplyDeltaChunk_InOrder_AckAndHLCMerge(t *testing.T) {
+	sw := transport.NewSwitch()
+	a, _ := sw.Listen("A")
+	b, _ := sw.Listen("B")
+	defer a.Close()
+	defer b.Close()
+
+	ev := make(chan Event, 128)
+	n := NewWithOptions("NB",
+		WithEndpoint(b),
+		WithPeer("A"),
+		WithTickerEvery(100*time.Millisecond),
+		WithLog(oplog.New()),
+		WithClock(hlc.New()),
+	)
+	n.AttachEvents(ev)
+	n.Start()
+	defer n.Stop()
+
+	// Build a chunk with HLC higher than node clock
+	var actor model.ActorID
+	actor[0] = 0x01
+	hlcTick := n.Clock.Now() + 1000
+	op := model.Op{Version: model.OpSchemaV1, Kind: model.OpKindPut, Key: "k", Value: []byte("v"), HLCTicks: hlcTick, Actor: actor}
+	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor, op.Pre)
+	ch := syncproto.DeltaChunk{SID: 0, Seq: 0, Last: true, Entries: []syncproto.DeltaEntry{{Key: "k", Ops: []model.Op{op}}}}
+
+	if err := a.Send("B", wire.Encode(wire.MT_SYNC_DELTA_CHUNK, syncproto.EncodeDeltaChunk(ch))); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait a bit for processing and ACK
+	time.Sleep(30 * time.Millisecond)
+
+	// Verify that we saw a send ACK for seq 0 and that the log contains the op
+	sawAck := false
+	for len(ev) > 0 {
+		e := <-ev
+		if e.Type == EventAck {
+			if dir, _ := e.Fields["dir"].(string); dir == "send" {
+				if seq, _ := e.Fields["seq"].(uint32); seq == 0 {
+					sawAck = true
+				}
+			}
+		}
+	}
+	if !sawAck {
+		t.Fatalf("expected ACK seq 0 to be sent")
+	}
+	snap := n.Log.Snapshot()
+	if ops := snap["k"]; len(ops) != 1 || string(ops[0].Value) != "v" {
+		t.Fatalf("op not applied: %+v", ops)
+	}
+	// HLC should have merged to at least hlcTick
+	if n.Clock.Now() < hlcTick {
+		t.Fatalf("clock did not merge to max tick: now=%d want>=%d", n.Clock.Now(), hlcTick)
+	}
+}
+
+// Spec compliance: Duplicate chunk replay should not re-append operations (idempotence)
+func TestIdempotentChunkReplay_NoDuplication(t *testing.T) {
+	sw := transport.NewSwitch()
+	a, _ := sw.Listen("A")
+	b, _ := sw.Listen("B")
+	defer a.Close()
+	defer b.Close()
+
+	n := NewWithOptions("NB",
+		WithEndpoint(b),
+		WithPeer("A"),
+		WithTickerEvery(100*time.Millisecond),
+		WithLog(oplog.New()),
+		WithClock(hlc.New()),
+	)
+	n.Start()
+	defer n.Stop()
+
+	var actor model.ActorID
+	actor[0] = 0x02
+	op := model.Op{Version: model.OpSchemaV1, Kind: model.OpKindPut, Key: "k", Value: []byte("v"), HLCTicks: n.Clock.Now(), Actor: actor}
+	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor, op.Pre)
+	ch := syncproto.DeltaChunk{SID: 0, Seq: 0, Last: false, Entries: []syncproto.DeltaEntry{{Key: "k", Ops: []model.Op{op}}}}
+	enc := syncproto.EncodeDeltaChunk(ch)
+	if err := a.Send("B", wire.Encode(wire.MT_SYNC_DELTA_CHUNK, enc)); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Send("B", wire.Encode(wire.MT_SYNC_DELTA_CHUNK, enc)); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	if ops := n.Log.Snapshot()["k"]; len(ops) != 1 {
+		t.Fatalf("expected single op after duplicate replay, got %d", len(ops))
 	}
 }

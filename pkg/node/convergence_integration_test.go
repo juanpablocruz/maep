@@ -23,9 +23,9 @@ func TestThreeNodeConvergesAfterQuiesce(t *testing.T) {
 	defer ep2.Close()
 
 	// Ring peers
-	n0 := New("N0", ep0, "N1", 200*time.Millisecond)
-	n1 := New("N1", ep1, "N2", 200*time.Millisecond)
-	n2 := New("N2", ep2, "N0", 200*time.Millisecond)
+	n0 := NewWithOptions("N0", WithEndpoint(ep0), WithPeer("N1"), WithTickerEvery(200*time.Millisecond))
+	n1 := NewWithOptions("N1", WithEndpoint(ep1), WithPeer("N2"), WithTickerEvery(200*time.Millisecond))
+	n2 := NewWithOptions("N2", WithEndpoint(ep2), WithPeer("N0"), WithTickerEvery(200*time.Millisecond))
 	n0.AttachEvents(make(chan Event, 1024))
 	n1.AttachEvents(make(chan Event, 1024))
 	n2.AttachEvents(make(chan Event, 1024))

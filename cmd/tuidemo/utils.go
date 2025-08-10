@@ -56,8 +56,10 @@ func formatWireEvent(e node.Event) string {
 
 func mtName(mt byte) string {
 	switch mt {
-	case wire.MT_SYNC_SUMMARY:
-		return "SUMMARY"
+	case wire.MT_SYNC_SUMMARY_REQ:
+		return "SUMMARY_REQ"
+	case wire.MT_SYNC_SUMMARY_RESP:
+		return "SUMMARY_RESP"
 	case wire.MT_SYNC_REQ:
 		return "REQ"
 	case wire.MT_SYNC_DELTA:

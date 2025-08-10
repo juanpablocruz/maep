@@ -19,12 +19,12 @@ func TestSnapshotToMerkleLeavesAndRoot(t *testing.T) {
 
 	// Key A: Put "v1"
 	op := model.Op{Version: model.OpSchemaV1, Kind: model.OpKindPut, Key: "A", Value: []byte("v1"), HLCTicks: clk.Now(), Actor: actor}
-	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
+	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor, op.Pre)
 	l.Append(op)
 
 	// Key B: Put "v2"
 	op = model.Op{Version: model.OpSchemaV1, Kind: model.OpKindPut, Key: "B", Value: []byte("v2"), HLCTicks: clk.Now(), Actor: actor}
-	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
+	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor, op.Pre)
 	l.Append(op)
 
 	// Build root #1
@@ -34,7 +34,7 @@ func TestSnapshotToMerkleLeavesAndRoot(t *testing.T) {
 
 	// Change A to "v3" -> root must change
 	op = model.Op{Version: model.OpSchemaV1, Kind: model.OpKindPut, Key: "A", Value: []byte("v3"), HLCTicks: clk.Now(), Actor: actor}
-	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
+	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor, op.Pre)
 	l.Append(op)
 
 	view2 := Snapshot(l)
@@ -47,7 +47,7 @@ func TestSnapshotToMerkleLeavesAndRoot(t *testing.T) {
 
 	// Delete B -> root must change again
 	op = model.Op{Version: model.OpSchemaV1, Kind: model.OpKindDel, Key: "B", HLCTicks: clk.Now(), Actor: actor}
-	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
+	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor, op.Pre)
 	l.Append(op)
 
 	view3 := Snapshot(l)

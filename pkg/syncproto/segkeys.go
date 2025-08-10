@@ -6,6 +6,7 @@ import (
 	"io"
 	"sort"
 
+	bin "github.com/juanpablocruz/maep/pkg/internal/bin"
 	"github.com/juanpablocruz/maep/pkg/materialize"
 	"github.com/juanpablocruz/maep/pkg/segment"
 )
@@ -58,14 +59,19 @@ func BuildSegKeys(view map[string]materialize.State, sids []segment.ID) SegKeys 
 
 // ----- codec (simple, fixed-endian like others) -----
 
-func EncodeSegKeysReq(r SegKeysReq) []byte {
+func MarshalSegKeysReq(r SegKeysReq) ([]byte, error) {
 	var buf bytes.Buffer
-	putU32(&buf, uint32(len(r.SIDs)))
-	for _, sid := range r.SIDs {
-		putU16(&buf, uint16(sid))
+	if err := bin.PutU32(&buf, uint32(len(r.SIDs))); err != nil {
+		return nil, err
 	}
-	return buf.Bytes()
+	for _, sid := range r.SIDs {
+		if err := bin.PutU16(&buf, uint16(sid)); err != nil {
+			return nil, err
+		}
+	}
+	return buf.Bytes(), nil
 }
+func EncodeSegKeysReq(r SegKeysReq) []byte { b, _ := MarshalSegKeysReq(r); return b }
 
 func DecodeSegKeysReq(b []byte) (SegKeysReq, error) {
 	r := bytes.NewReader(b)
@@ -87,20 +93,33 @@ func DecodeSegKeysReq(b []byte) (SegKeysReq, error) {
 	return SegKeysReq{SIDs: sids}, nil
 }
 
-func EncodeSegKeys(sk SegKeys) []byte {
+func MarshalSegKeys(sk SegKeys) ([]byte, error) {
 	var buf bytes.Buffer
-	putU32(&buf, uint32(len(sk.Items)))
+	if err := bin.PutU32(&buf, uint32(len(sk.Items))); err != nil {
+		return nil, err
+	}
 	for _, it := range sk.Items {
-		putU16(&buf, uint16(it.SID))
-		putU32(&buf, uint32(len(it.Pairs)))
+		if err := bin.PutU16(&buf, uint16(it.SID)); err != nil {
+			return nil, err
+		}
+		if err := bin.PutU32(&buf, uint32(len(it.Pairs))); err != nil {
+			return nil, err
+		}
 		for _, p := range it.Pairs {
-			putU16(&buf, uint16(len(p.Key)))
-			buf.WriteString(p.Key)
-			buf.Write(p.Hash[:])
+			if err := bin.PutU16(&buf, uint16(len(p.Key))); err != nil {
+				return nil, err
+			}
+			if _, err := buf.WriteString(p.Key); err != nil {
+				return nil, err
+			}
+			if _, err := buf.Write(p.Hash[:]); err != nil {
+				return nil, err
+			}
 		}
 	}
-	return buf.Bytes()
+	return buf.Bytes(), nil
 }
+func EncodeSegKeys(sk SegKeys) []byte { b, _ := MarshalSegKeys(sk); return b }
 
 func DecodeSegKeys(b []byte) (SegKeys, error) {
 	r := bytes.NewReader(b)

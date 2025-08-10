@@ -33,7 +33,7 @@ func main() {
 			HLCTicks: clk.Now(),
 			Actor:    actor,
 		}
-		op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
+		op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor, op.Pre)
 		l.Append(op)
 	}
 	del := func(key string) {
@@ -44,7 +44,7 @@ func main() {
 			HLCTicks: clk.Now(),
 			Actor:    actor,
 		}
-		op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
+		op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor, op.Pre)
 		l.Append(op)
 	}
 

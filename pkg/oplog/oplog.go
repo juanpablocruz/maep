@@ -53,3 +53,14 @@ func (l *Log) CountPerKey() map[string]int {
 	}
 	return m
 }
+
+// LastOp returns the last operation for a key (if any).
+func (l *Log) LastOp(key string) (model.Op, bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	s := l.data[key]
+	if len(s) == 0 {
+		return model.Op{}, false
+	}
+	return s[len(s)-1], true
+}

@@ -7,9 +7,11 @@ import (
 )
 
 const (
-	MT_SYNC_SUMMARY byte = 0x01
-	MT_SYNC_REQ     byte = 0x02
-	MT_SYNC_DELTA   byte = 0x03
+	// Summary path
+	MT_SYNC_SUMMARY_RESP byte = 0x01
+	MT_SYNC_SUMMARY_REQ  byte = 0x34
+	MT_SYNC_REQ          byte = 0x02
+	MT_SYNC_DELTA        byte = 0x03
 
 	MT_SYNC_DELTA_CHUNK byte = 0x06
 	MT_SYNC_ACK         byte = 0x07
