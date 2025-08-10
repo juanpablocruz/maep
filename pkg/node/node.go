@@ -348,7 +348,7 @@ func (n *Node) summaryLoop() {
 				"peer": n.Peer, "root": fmt.Sprintf("%x", root[:8]),
 			})
 			if n.ms != nil {
-				if err := n.ms.Send(n.ctx, n.Peer, protoport.SummaryReqMsg{R: syncproto.SummaryReq{Root: root}}); err != nil {
+				if err := n.sendMsgWithTimeout(n.Peer, protoport.SummaryReqMsg{R: syncproto.SummaryReq{Root: root}}); err != nil {
 					slog.Warn("send_summary_req_err", "node", n.Name, "err", err)
 					n.emit(EventWarn, map[string]any{"msg": "send_summary_req_err", "err": err.Error()})
 					backoff = minDur(n.backoffMax, maxDur(n.backoffBase, backoff*2))
@@ -560,7 +560,7 @@ func (n *Node) handleSummaryResp(from transport.MemAddr, sum syncproto.Summary) 
 	slog.Info("send_req", "node", n.Name, "needs", req.Needs)
 	n.emit(EventSendReq, map[string]any{"needs": req.Needs})
 	if n.ms != nil {
-		if err := n.ms.Send(n.ctx, from, protoport.ReqMsg{R: req}); err != nil {
+		if err := n.sendMsgWithTimeout(from, protoport.ReqMsg{R: req}); err != nil {
 			slog.Warn("send_req_err", "node", n.Name, "err", err)
 			n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
 		}
@@ -706,7 +706,7 @@ func (n *Node) handleDelta(from transport.MemAddr, d syncproto.Delta) {
 	if len(req.Needs) > 0 {
 		n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "continue"})
 		if n.ms != nil {
-			if err := n.ms.Send(n.ctx, from, protoport.ReqMsg{R: req}); err != nil {
+			if err := n.sendMsgWithTimeout(from, protoport.ReqMsg{R: req}); err != nil {
 				slog.Warn("send_req_err", "node", n.Name, "err", err)
 				n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
 			}
@@ -827,7 +827,7 @@ func (n *Node) onSegKeys(from transport.MemAddr, b []byte) {
 	req := syncproto.Req{Needs: needs}
 	n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "seg_keys"})
 	if n.ms != nil {
-		if err := n.ms.Send(n.ctx, from, protoport.ReqMsg{R: req}); err != nil {
+		if err := n.sendMsgWithTimeout(from, protoport.ReqMsg{R: req}); err != nil {
 			n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
 		}
 	} else if err := n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
@@ -992,9 +992,9 @@ func (n *Node) handleDeltaChunk(from transport.MemAddr, ch syncproto.DeltaChunk)
 				if len(req.Needs) > 0 {
 					n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "continue_after_chunk"})
 					if n.ms != nil {
-						if err := n.ms.Send(n.ctx, from, protoport.ReqMsg{R: req}); err != nil {
-							n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
-						}
+											if err := n.sendMsgWithTimeout(from, protoport.ReqMsg{R: req}); err != nil {
+						n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
+					}
 					} else if err := n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req)); err != nil {
 						n.emit(EventWarn, map[string]any{"msg": "send_req_err", "err": err.Error()})
 					}
@@ -1425,4 +1425,17 @@ func (n *Node) onDeltaNackHandled(from transport.MemAddr, nack syncproto.DeltaNa
 	}
 	// No match in inflight (could be stale); log and move on.
 	n.emit(EventWarn, map[string]any{"msg": "nack_unknown_seq", "seq": nack.Seq})
+}
+
+func (n *Node) sendMsgWithTimeout(to transport.MemAddr, m protoport.Message) error {
+	if n.ms == nil {
+		return fmt.Errorf("no messenger")
+	}
+	ctx := n.ctx
+	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > 2*time.Second {
+		c, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		return n.ms.Send(c, to, m)
+	}
+	return n.ms.Send(ctx, to, m)
 }

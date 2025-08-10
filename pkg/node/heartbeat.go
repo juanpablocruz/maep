@@ -1,6 +1,7 @@
 package node
 
 import (
+	"math/rand"
 	"time"
 
 	"github.com/juanpablocruz/maep/pkg/protoport"
@@ -18,6 +19,18 @@ func (n *Node) heartbeatLoop() {
 			if !n.conn.Load() {
 				n.onMiss()
 				continue
+			}
+
+			// Small jitter to avoid lockstep heartbeats when many nodes co-reside
+			if n.hbEvery > 0 {
+				maxJ := n.hbEvery / 10
+				if maxJ > 25*time.Millisecond {
+					maxJ = 25 * time.Millisecond
+				}
+				if maxJ > 0 {
+					d := time.Duration(rand.Int63n(int64(maxJ)))
+					time.Sleep(d)
+				}
 			}
 
 			// Prefer messenger for HB if available

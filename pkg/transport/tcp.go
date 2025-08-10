@@ -31,6 +31,9 @@ type tcpPeer struct {
 	c    net.Conn
 	r    *bufio.Reader
 	wmu  sync.Mutex
+
+	mu          sync.Mutex
+	lastActUnix int64
 }
 
 func ListenTCP(addr string) (*TCPEndpoint, error) {
@@ -46,6 +49,7 @@ func ListenTCP(addr string) (*TCPEndpoint, error) {
 		conns:  make(map[MemAddr]*tcpPeer),
 	}
 	go ep.acceptLoop()
+	go ep.pruneLoop(2 * time.Minute)
 	return ep, nil
 }
 
@@ -111,6 +115,9 @@ func (e *TCPEndpoint) Send(to MemAddr, frame []byte) error {
 		e.mu.Unlock()
 		return err
 	}
+	p.mu.Lock()
+	p.lastActUnix = time.Now().Unix()
+	p.mu.Unlock()
 	return nil
 }
 
@@ -128,6 +135,7 @@ func (e *TCPEndpoint) getOrDial(to MemAddr) *tcpPeer {
 		return nil
 	}
 	p := &tcpPeer{addr: to, c: d, r: bufio.NewReader(d)}
+	p.lastActUnix = time.Now().Unix()
 
 	// reader goroutine (for replies/unsolicited frames)
 	go func() {
@@ -137,6 +145,9 @@ func (e *TCPEndpoint) getOrDial(to MemAddr) *tcpPeer {
 			if err != nil {
 				return
 			}
+			p.mu.Lock()
+			p.lastActUnix = time.Now().Unix()
+			p.mu.Unlock()
 			select {
 			case e.in <- tcpEnv{from: to, data: b}:
 			case <-e.closed:
@@ -178,6 +189,7 @@ func (e *TCPEndpoint) acceptLoop() {
 func (e *TCPEndpoint) handleConn(c net.Conn) {
 	peer := MemAddr(c.RemoteAddr().String())
 	p := &tcpPeer{addr: peer, c: c, r: bufio.NewReader(c)}
+	p.lastActUnix = time.Now().Unix()
 
 	// make this inbound conn replyable
 	e.mu.Lock()
@@ -199,10 +211,38 @@ func (e *TCPEndpoint) handleConn(c net.Conn) {
 		if err != nil {
 			return
 		}
+		p.mu.Lock()
+		p.lastActUnix = time.Now().Unix()
+		p.mu.Unlock()
 		select {
 		case e.in <- tcpEnv{from: peer, data: b}:
 		case <-e.closed:
 			return
+		}
+	}
+}
+
+func (e *TCPEndpoint) pruneLoop(maxIdle time.Duration) {
+	t := time.NewTicker(maxIdle / 2)
+	defer t.Stop()
+	for {
+		select {
+		case <-e.closed:
+			return
+		case <-t.C:
+			now := time.Now().Unix()
+			cut := now - int64(maxIdle.Seconds())
+			e.mu.Lock()
+			for addr, p := range e.conns {
+				p.mu.Lock()
+				last := p.lastActUnix
+				p.mu.Unlock()
+				if last != 0 && last < cut {
+					_ = p.c.Close()
+					delete(e.conns, addr)
+				}
+			}
+			e.mu.Unlock()
 		}
 	}
 }
