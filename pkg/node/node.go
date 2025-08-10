@@ -1222,7 +1222,11 @@ func (n *Node) handleRoot(from transport.MemAddr, r syncproto.Root) {
 
 	n.emit(EventDescent, map[string]any{"dir": "->", "kind": "req", "prefix": ""})
 	req := syncproto.DescentReq{Prefix: nil}
-	if err := n.sendTo(from, wire.MT_DESCENT_REQ, syncproto.EncodeDescentReq(req)); err != nil {
+	if n.ms != nil {
+		if err := n.ms.Send(n.ctx, from, protoport.DescentReqMsg{R: req}); err != nil {
+			n.emit(EventWarn, map[string]any{"msg": "send_descent_req_err", "err": err.Error()})
+		}
+	} else if err := n.sendTo(from, wire.MT_DESCENT_REQ, syncproto.EncodeDescentReq(req)); err != nil {
 		n.emit(EventWarn, map[string]any{"msg": "send_descent_req_err", "err": err.Error()})
 	}
 }
@@ -1238,7 +1242,11 @@ func (n *Node) handleDescentReq(from transport.MemAddr, req syncproto.DescentReq
 		kind = "resp_leaves"
 	}
 	n.emit(EventDescent, map[string]any{"dir": "<-", "kind": kind, "prefix": string(req.Prefix)})
-	if err := n.sendTo(from, wire.MT_DESCENT_RESP, syncproto.EncodeDescentResp(resp)); err != nil {
+	if n.ms != nil {
+		if err := n.ms.Send(n.ctx, from, protoport.DescentRespMsg{R: resp}); err != nil {
+			n.emit(EventWarn, map[string]any{"msg": "send_descent_resp_err", "err": err.Error()})
+		}
+	} else if err := n.sendTo(from, wire.MT_DESCENT_RESP, syncproto.EncodeDescentResp(resp)); err != nil {
 		n.emit(EventWarn, map[string]any{"msg": "send_descent_resp_err", "err": err.Error()})
 	}
 }
@@ -1380,7 +1388,13 @@ func (n *Node) onDeltaNackHandled(from transport.MemAddr, nack syncproto.DeltaNa
 
 	// We keep the last sent chunk in sess.sndInflight (window is small).
 	n.sessMu.Lock()
-	infl := n.sess.sndInflight
+	// Snapshot inflight to avoid races with the sender updating it
+	infl := make(map[segment.ID][]syncproto.DeltaChunk, len(n.sess.sndInflight))
+	for sid, list := range n.sess.sndInflight {
+		copyList := make([]syncproto.DeltaChunk, len(list))
+		copy(copyList, list)
+		infl[sid] = copyList
+	}
 	n.sessMu.Unlock()
 	if len(infl) == 0 {
 		n.emit(EventWarn, map[string]any{"msg": "nack_no_inflight"})
