@@ -95,7 +95,11 @@ func (e *TCPEndpoint) Send(to MemAddr, frame []byte) error {
 		return errors.New("dial failed")
 	}
 	p.wmu.Lock()
+	// prevent indefinite blocking on slow/broken peers
+	_ = p.c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	err := writeFrame(p.c, frame)
+	// clear deadline for future ops
+	_ = p.c.SetWriteDeadline(time.Time{})
 	p.wmu.Unlock()
 	if err != nil {
 		// drop broken conn from cache so next Send() will re-dial

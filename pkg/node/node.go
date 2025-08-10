@@ -168,6 +168,7 @@ func (n *Node) Put(key string, val []byte, actor model.ActorID) {
 		Key:      key,
 		Value:    slices.Clone(val),
 		HLCTicks: n.Clock.Now(),
+		WallNanos: time.Now().UnixNano(),
 		Actor:    actor,
 	}
 	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
@@ -183,6 +184,7 @@ func (n *Node) Delete(key string, actor model.ActorID) {
 		Kind:     model.OpKindDel,
 		Key:      key,
 		HLCTicks: n.Clock.Now(),
+		WallNanos: time.Now().UnixNano(),
 		Actor:    actor,
 	}
 	op.Hash = model.HashOp(op.Version, op.Kind, op.Key, op.Value, op.HLCTicks, op.WallNanos, op.Actor)
