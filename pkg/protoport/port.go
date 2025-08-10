@@ -24,6 +24,7 @@ type (
 	AckMsg         struct{ A syncproto.Ack }
 	DeltaNackMsg   struct{ N syncproto.DeltaNack }
 	SyncBeginMsg   struct{}
+	SyncEndMsg     struct{}
 	RootMsg        struct{ R syncproto.Root }
 	DescentReqMsg  struct{ R syncproto.DescentReq }
 	DescentRespMsg struct{ R syncproto.DescentResp }
@@ -43,6 +44,7 @@ func (DeltaChunkMsg) isMessage()  {}
 func (AckMsg) isMessage()         {}
 func (DeltaNackMsg) isMessage()   {}
 func (SyncBeginMsg) isMessage()   {}
+func (SyncEndMsg) isMessage()     {}
 func (RootMsg) isMessage()        {}
 func (DescentReqMsg) isMessage()  {}
 func (DescentRespMsg) isMessage() {}
@@ -108,6 +110,8 @@ func EncodeMessage(m Message) (mt byte, payload []byte, ok bool) {
 		return wire.MT_DELTA_NACK, syncproto.EncodeDeltaNack(x.N), true
 	case SyncBeginMsg:
 		return wire.MT_SYNC_BEGIN, nil, true
+	case SyncEndMsg:
+		return wire.MT_SYNC_END, nil, true
 	case RootMsg:
 		return wire.MT_SYNC_ROOT, syncproto.EncodeRoot(x.R), true
 	case DescentReqMsg:
@@ -217,8 +221,10 @@ func decodeFrame(frame []byte) (Message, bool) {
 		return PingMsg{}, true
 	case wire.MT_PONG:
 		return PongMsg{}, true
+	case wire.MT_SYNC_BEGIN:
+		return SyncBeginMsg{}, true
 	case wire.MT_SYNC_END:
-		return SummaryReqMsg{}, true // placeholder to avoid unknown type; node handles END on wire path
+		return SyncEndMsg{}, true
 	default:
 		return nil, false
 	}

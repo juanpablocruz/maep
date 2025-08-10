@@ -456,6 +456,9 @@ func (n *Node) recvLoop() {
 		case protoport.PongMsg:
 			n.emit(EventHB, map[string]any{"dir": "<-tcp"})
 			n.onPong()
+		case protoport.SyncEndMsg:
+			// Peer indicates end of sync session
+			n.endSessionTo(from, false, "peer_end")
 		case protoport.SummaryRespMsg:
 			n.handleSummaryResp(from, msg.S)
 		case protoport.SummaryReqMsg:
