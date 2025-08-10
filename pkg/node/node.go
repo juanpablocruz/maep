@@ -43,6 +43,9 @@ type syncSession struct {
 	lastReq         syncproto.Req
 	awaitingDelta   bool
 	repairAttempted bool
+
+	// Summary we most recently advertised to the peer (for SV-bounded checks)
+	sentFrontier map[string]uint32
 }
 
 type Node struct {
@@ -360,6 +363,14 @@ func (n *Node) summaryLoop() {
 					nextAllowed = time.Now().Add(jitter(backoff))
 					return
 				}
+				// Cache our per-key frontier snapshot for SV-bounded receive checks
+				sum := syncproto.BuildSummaryFromLog(n.Log)
+				n.sessMu.Lock()
+				n.sess.sentFrontier = make(map[string]uint32, len(sum.Frontier))
+				for _, it := range sum.Frontier {
+					n.sess.sentFrontier[it.Key] = it.From
+				}
+				n.sessMu.Unlock()
 			}
 		}
 	}
@@ -865,6 +876,27 @@ func (n *Node) handleDeltaChunk(from transport.MemAddr, ch syncproto.DeltaChunk)
 	}
 
 	before := n.Log.CountPerKey()
+	// SV-bounded acceptance: ensure this chunk does not start before our advertised frontier
+	n.sessMu.Lock()
+	sent := n.sess.sentFrontier
+	n.sessMu.Unlock()
+	if len(sent) > 0 {
+		for _, e := range ch.Entries {
+			if len(e.Ops) == 0 {
+				continue
+			}
+			if fromCount, ok := sent[e.Key]; ok && fromCount > 0 {
+				// We expect sender to start at our From (or include one predecessor for chaining)
+				if before[e.Key] < int(fromCount)-1 {
+					// Reject as out-of-window per SV
+					if err := n.sendTo(from, wire.MT_DELTA_NACK, syncproto.EncodeDeltaNack(syncproto.DeltaNack{Seq: ch.Seq, Code: 2})); err == nil {
+						n.emit(EventAck, map[string]any{"dir": "send", "nack": true, "seq": ch.Seq, "reason": "sv_out_of_window"})
+					}
+					return
+				}
+			}
+		}
+	}
 	var maxTick uint64
 	for _, e := range ch.Entries {
 		for _, op := range e.Ops {
@@ -970,9 +1002,7 @@ func (n *Node) handleAck(_ transport.MemAddr, a syncproto.Ack) {
 		default:
 		}
 	}
-	if a.Seq+1 > n.sess.sndNext {
-		n.sess.sndNext = a.Seq + 1
-	}
+	// Track next seq per SID if needed later
 	n.sessMu.Unlock()
 
 }
