@@ -176,3 +176,9 @@ The reference document is included as `Merkle_Anti_Entropy_Protocol__MAEP_.pdf` 
 This is a reference implementation intended for experimentation and evaluation. Production deployments may require further hardening, persistence, batching, flow control, authentication, and compatibility considerations.
 
 
+### CI and Branch Protection
+
+- CI runs on pushes and pull requests to `main`/`master`. It builds, vets, and runs tests with `-race`, shuffles tests to surface flakes, and uploads artifacts (JUnit XML, coverage) under the `test-artifacts` artifact.
+- To prevent merging failing branches, enable branch protection in GitHub settings and require the `ci / test` check to pass before merging. Also enable "Require branches to be up to date" to re-run CI on the latest base.
+
+

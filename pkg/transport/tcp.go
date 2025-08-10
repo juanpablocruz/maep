@@ -32,8 +32,8 @@ type tcpPeer struct {
 	r    *bufio.Reader
 	wmu  sync.Mutex
 
-	mu          sync.Mutex
-	lastActUnix int64
+	mu      sync.Mutex
+	lastAct time.Time
 }
 
 func ListenTCP(addr string) (*TCPEndpoint, error) {
@@ -116,7 +116,7 @@ func (e *TCPEndpoint) Send(to MemAddr, frame []byte) error {
 		return err
 	}
 	p.mu.Lock()
-	p.lastActUnix = time.Now().Unix()
+	p.lastAct = time.Now()
 	p.mu.Unlock()
 	return nil
 }
@@ -135,7 +135,7 @@ func (e *TCPEndpoint) getOrDial(to MemAddr) *tcpPeer {
 		return nil
 	}
 	p := &tcpPeer{addr: to, c: d, r: bufio.NewReader(d)}
-	p.lastActUnix = time.Now().Unix()
+	p.lastAct = time.Now()
 
 	// reader goroutine (for replies/unsolicited frames)
 	go func() {
@@ -146,7 +146,7 @@ func (e *TCPEndpoint) getOrDial(to MemAddr) *tcpPeer {
 				return
 			}
 			p.mu.Lock()
-			p.lastActUnix = time.Now().Unix()
+			p.lastAct = time.Now()
 			p.mu.Unlock()
 			select {
 			case e.in <- tcpEnv{from: to, data: b}:
@@ -189,7 +189,7 @@ func (e *TCPEndpoint) acceptLoop() {
 func (e *TCPEndpoint) handleConn(c net.Conn) {
 	peer := MemAddr(c.RemoteAddr().String())
 	p := &tcpPeer{addr: peer, c: c, r: bufio.NewReader(c)}
-	p.lastActUnix = time.Now().Unix()
+	p.lastAct = time.Now()
 
 	// make this inbound conn replyable
 	e.mu.Lock()
@@ -212,7 +212,7 @@ func (e *TCPEndpoint) handleConn(c net.Conn) {
 			return
 		}
 		p.mu.Lock()
-		p.lastActUnix = time.Now().Unix()
+		p.lastAct = time.Now()
 		p.mu.Unlock()
 		select {
 		case e.in <- tcpEnv{from: peer, data: b}:
@@ -230,14 +230,12 @@ func (e *TCPEndpoint) pruneLoop(maxIdle time.Duration) {
 		case <-e.closed:
 			return
 		case <-t.C:
-			now := time.Now().Unix()
-			cut := now - int64(maxIdle.Seconds())
 			e.mu.Lock()
 			for addr, p := range e.conns {
 				p.mu.Lock()
-				last := p.lastActUnix
+				last := p.lastAct
 				p.mu.Unlock()
-				if last != 0 && last < cut {
+				if !last.IsZero() && time.Since(last) > maxIdle {
 					_ = p.c.Close()
 					delete(e.conns, addr)
 				}

@@ -9,6 +9,8 @@ on:
 
 permissions:
   contents: read
+  checks: write
+  pull-requests: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -29,19 +31,43 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Show Go environment
+        run: |
+          go version
+          go env
+
       - name: Download dependencies
         run: go mod download
 
       - name: Build
         run: go build ./...
 
-      - name: Run tests
-        run: go test ./... -race -coverprofile=coverage.out -covermode=atomic
+      - name: Vet
+        run: go vet ./...
 
-      - name: Upload coverage artifact
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
+      - name: Run tests (race, shuffled)
+        run: |
+          mkdir -p artifacts
+          gotestsum --junitfile artifacts/junit.xml --format=short-verbose -- \
+            -race -coverprofile=artifacts/coverage.out -covermode=atomic -shuffle=on -count=1 ./...
+        env:
+          PATH: ${{ env.PATH }}:$(go env GOPATH)/bin
+
+      - name: Upload test artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage
-          path: coverage.out
-          if-no-files-found: ignore
+          name: test-artifacts
+          path: artifacts/
+          if-no-files-found: warn
+
+      - name: Publish JUnit Report
+        if: always()
+        uses: mikepenz/action-junit-report@v4
+        with:
+          report_paths: artifacts/junit.xml
+          detailed_summary: true
+          include_passed: true
