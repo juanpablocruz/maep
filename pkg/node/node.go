@@ -478,11 +478,13 @@ func (n *Node) onReq(from transport.MemAddr, b []byte) {
 	if ops == 0 {
 		slog.Info("send_delta_empty", "node", n.Name)
 		_ = n.sendTo(from, wire.MT_SYNC_END, nil)
+		n.endSessionTo(from, false, "delta_empty")
 		return
 	}
 	chunks := n.chunkDelta(delta, n.DeltaMaxBytes)
 	if len(chunks) == 0 {
 		_ = n.sendTo(from, wire.MT_SYNC_END, nil)
+		n.endSessionTo(from, false, "no_chunks")
 		return
 	}
 	n.sessMu.Lock()
@@ -496,6 +498,7 @@ func (n *Node) onReq(from transport.MemAddr, b []byte) {
 }
 
 func (n *Node) onDelta(from transport.MemAddr, b []byte) {
+	n.beginSessionIfNeeded()
 	d, err := syncproto.DecodeDelta(b)
 	if err != nil {
 		slog.Warn("decode_delta_err", "node", n.Name, "err", err)
@@ -575,7 +578,6 @@ func (n *Node) heartbeatLoop() {
 				}
 				n.emit(EventHB, map[string]any{"dir": dir})
 			}
-			n.onMiss()
 		}
 	}
 }
@@ -769,6 +771,7 @@ func (n *Node) chunkDelta(d syncproto.Delta, maxBytes int) []syncproto.DeltaChun
 }
 
 func (n *Node) onDeltaChunk(from transport.MemAddr, b []byte) {
+	n.beginSessionIfNeeded()
 	ch, err := syncproto.DecodeDeltaChunk(b)
 	if err != nil {
 		// If decoder populated Seq (bad hash case), NACK it.
@@ -835,17 +838,50 @@ func (n *Node) onDeltaChunk(from transport.MemAddr, b []byte) {
 	_ = n.sendTo(from, wire.MT_SYNC_ACK, syncproto.EncodeAck(syncproto.Ack{Seq: ch.Seq}))
 	n.emit(EventAck, map[string]any{"dir": "send", "seq": ch.Seq})
 
-	if ch.Last && n.maybeEndIfEqual(from) {
-		return
-	}
 	if ch.Last {
+		// 1) Try summary-based continuation first (multiple deltas may be needed).
+		if n.maybeEndIfEqual(from) {
+			return
+		}
 		n.sessMu.Lock()
+		lr := n.sess.lastRemote
+		active := n.sess.active
 		haveRoot := n.sess.haveRoot
 		peerRoot := n.sess.lastRoot
 		n.sessMu.Unlock()
 
-		if haveRoot && n.computeRootFromLog() == peerRoot {
-			n.endSessionTo(from, true, "caught_up_root")
+		if active && len(lr.Leaves) > 0 {
+			req := syncproto.DiffForReq(n.Log, lr)
+			if len(req.Needs) > 0 {
+				n.emit(EventSendReq, map[string]any{"needs": req.Needs, "reason": "continue_after_chunk"})
+				_ = n.sendTo(from, wire.MT_SYNC_REQ, syncproto.EncodeReq(req))
+				// next delta stream will start at seq=0
+				n.sessMu.Lock()
+				n.sess.rcvExpect = 0
+				n.sessMu.Unlock()
+				return
+			}
+			// If no more needs by summary, equality will be detected by the root path below.
+		}
+
+		// 2) Root/descent path: if still unequal, keep descending.
+		if haveRoot {
+			if n.computeRootFromLog() == peerRoot {
+				n.endSessionTo(from, true, "caught_up_root")
+				return
+			}
+			// Still different: continue descent. If nothing queued, restart at root.
+			n.sessMu.Lock()
+			if len(n.sess.dqueue) == 0 {
+				n.sess.dqueue = append(n.sess.dqueue, []byte{})
+			}
+			next := n.sess.dqueue[0]
+			n.sess.dqueue = n.sess.dqueue[1:]
+			// reset expected seq for the next delta stream
+			n.sess.rcvExpect = 0
+			n.sessMu.Unlock()
+			n.emit(EventDescent, map[string]any{"dir": "->", "kind": "req_after_delta", "prefix": string(next)})
+			_ = n.sendTo(from, wire.MT_DESCENT_REQ, syncproto.EncodeDescentReq(syncproto.DescentReq{Prefix: next}))
 			return
 		}
 	}
@@ -1134,6 +1170,19 @@ func (n *Node) onDescentResp(from transport.MemAddr, b []byte) {
 		}
 		return
 	}
+
+	// Fallback: if this response produced no immediate follow-up (e.g., empty remote subtree),
+	// continue with the next queued prefix instead of stalling.
+	n.sessMu.Lock()
+	var next []byte
+	if len(n.sess.dqueue) > 0 {
+		next = n.sess.dqueue[0]
+		n.sess.dqueue = n.sess.dqueue[1:]
+	}
+	n.sessMu.Unlock()
+	if next != nil {
+		_ = n.sendTo(from, wire.MT_DESCENT_REQ, syncproto.EncodeDescentReq(syncproto.DescentReq{Prefix: next}))
+	}
 }
 
 func (n *Node) sortedLeaves() []merkle.Leaf {
@@ -1199,25 +1248,33 @@ func (n *Node) beginSessionIfNeeded() {
 	n.sess.sndNext = 0
 	n.sess.sndInflight = nil
 	n.sess.rcvExpect = 0
-	n.sess.ackCh = make(chan uint32, 8)
+	bufCap := 32
+	if w := 4 * n.DeltaWindowChunks; w > bufCap {
+		bufCap = w
+	}
+	n.sess.ackCh = make(chan uint32, bufCap)
 	n.sess.ctx, n.sess.cancel = context.WithCancel(n.ctx)
 	n.emit(EventSync, map[string]any{"action": "begin", "id": n.sess.id})
 }
 
 func (n *Node) endSessionTo(to transport.MemAddr, sendEnd bool, reason string) {
 	n.sessMu.Lock()
-	defer n.sessMu.Unlock()
-	if !n.sess.active {
-		return
-	}
+	active := n.sess.active
+	id := n.sess.id
+	cancel := n.sess.cancel
+	// Clear session state regardless so we don't leave stale inflight.
+	n.sess = syncSession{}
+	n.sessMu.Unlock()
+	// Send END even if this side didn't mark the session active.
 	if sendEnd {
 		_ = n.sendTo(to, wire.MT_SYNC_END, nil)
 	}
-	if n.sess.cancel != nil {
-		n.sess.cancel()
+	if active && cancel != nil {
+		cancel()
 	}
-	n.emit(EventSync, map[string]any{"action": "end", "id": n.sess.id, "reason": reason})
-	n.sess = syncSession{}
+	if active {
+		n.emit(EventSync, map[string]any{"action": "end", "id": id, "reason": reason})
+	}
 }
 
 func sortLeaves(ls []merkle.Leaf) {

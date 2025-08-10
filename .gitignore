@@ -3,3 +3,6 @@ out/
 
 maep_sim
 *.pdf
+logs/
+
+logreport$

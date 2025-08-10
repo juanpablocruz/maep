@@ -63,6 +63,17 @@ type simNode struct {
 	Actor    model.ActorID
 }
 
+// syncState holds run-time metrics and timestamps for convergence measurement.
+type syncState struct {
+	firstSync       time.Time
+	roundBeg        map[string]time.Time
+	latencies       []time.Duration
+	convergedAt     time.Time
+	sawUnequal      bool
+	writesStoppedAt time.Time
+	mu              sync.Mutex
+}
+
 func main() {
 	flag.Parse()
 
@@ -175,10 +186,18 @@ func main() {
 			writerLoop(writersCtx, s, *flWriteInterval)
 		}(sns[i])
 	}
+	// metrics state (before timers that may reference it)
+	ss := &syncState{roundBeg: make(map[string]time.Time)}
+	// ensure we remember the time writes stopped for convergence measurement
 	if flStopWritesAt != nil && *flStopWritesAt > 0 {
 		go func() {
 			select {
 			case <-time.After(*flStopWritesAt):
+				ss.mu.Lock()
+				if ss.writesStoppedAt.IsZero() {
+					ss.writesStoppedAt = time.Now()
+				}
+				ss.mu.Unlock()
 				stopWriters()
 			case <-ctx.Done():
 			}
@@ -189,22 +208,70 @@ func main() {
 	}
 
 	if *flQuiesceLast > 0 && *flDuration > *flQuiesceLast {
-		time.AfterFunc(*flDuration-*flQuiesceLast, stopWriters)
+		time.AfterFunc(*flDuration-*flQuiesceLast, func() {
+			ss.mu.Lock()
+			if ss.writesStoppedAt.IsZero() {
+				ss.writesStoppedAt = time.Now()
+			}
+			ss.mu.Unlock()
+			stopWriters()
+		})
 	}
+
+	// Convergence watcher: after writers stop, poll roots frequently until equal
+	go func() {
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				ss.mu.Lock()
+				stopped := !ss.writesStoppedAt.IsZero()
+				already := !ss.convergedAt.IsZero()
+				ss.mu.Unlock()
+				if !stopped || already {
+					continue
+				}
+				// compute current roots equality
+				buf := make([][32]byte, len(sns))
+				allEq := true
+				for i, s := range sns {
+					view := materialize.Snapshot(s.Node.Log)
+					leaves := materialize.LeavesFromSnapshot(view)
+					slices.SortFunc(leaves, func(a, b merkle.Leaf) int {
+						switch {
+						case a.Key < b.Key:
+							return -1
+						case a.Key > b.Key:
+							return 1
+						default:
+							return 0
+						}
+					})
+					buf[i] = merkle.Build(leaves)
+					if i > 0 && buf[i] != buf[0] {
+						allEq = false
+						break
+					}
+				}
+				if allEq {
+					ss.mu.Lock()
+					if ss.convergedAt.IsZero() {
+						ss.convergedAt = time.Now()
+					}
+					ss.mu.Unlock()
+					return
+				}
+			}
+		}
+	}()
 
 	rootsCSV, roundsCSV, sumTxt, closeFiles := mustOpenCSVs(*flOutDir, *flNodes)
 	defer closeFiles()
 
-	// metrics
-	type syncState struct {
-		firstSync   time.Time
-		roundBeg    map[string]time.Time
-		latencies   []time.Duration
-		convergedAt time.Time
-		sawUnequal  bool
-		mu          sync.Mutex
-	}
-	ss := &syncState{roundBeg: make(map[string]time.Time)}
+	// metrics (rest handled below)
 
 	// sample roots @1Hz
 	rootTickerCtx, rootCancel := context.WithCancel(ctx)
@@ -246,18 +313,20 @@ func main() {
 				_ = rootsCSV.Write(row)
 				if allEq {
 					ss.mu.Lock()
-					if !ss.firstSync.IsZero() {
-						// we’ll compute convergence later from timestamps
+					if ss.convergedAt.IsZero() {
+						ss.convergedAt = time.Now()
 					}
 					ss.mu.Unlock()
 				}
 				ss.mu.Lock()
-				// Track divergence then first global equality after first sync began
+				// Track divergence (kept for diagnostics), but do not gate convergence on it.
 				if !allEq && !ss.firstSync.IsZero() {
 					ss.sawUnequal = true
 				}
-				if allEq && !ss.firstSync.IsZero() && ss.sawUnequal && ss.convergedAt.IsZero() {
-					ss.convergedAt = time.Now()
+				// Fallback: if we have not seen a session-begin event for any reason,
+				// consider the first observed divergence as the start of the convergence window.
+				if !allEq && ss.firstSync.IsZero() {
+					ss.firstSync = time.Now()
 				}
 				ss.mu.Unlock()
 			case <-rootTickerCtx.Done():
@@ -309,6 +378,11 @@ func main() {
 	half := time.NewTimer(*flDuration / 2)
 	go func() {
 		<-half.C
+		ss.mu.Lock()
+		if ss.writesStoppedAt.IsZero() {
+			ss.writesStoppedAt = time.Now()
+		}
+		ss.mu.Unlock()
 		stopWriters()
 	}()
 
@@ -341,6 +415,35 @@ func main() {
 	rootWG.Wait()
 	evWG.Wait()
 
+	// Final convergence check at shutdown (in case last ticker tick missed)
+	if ss.convergedAt.IsZero() {
+		buf := make([][32]byte, len(sns))
+		allEq := true
+		for i, s := range sns {
+			view := materialize.Snapshot(s.Node.Log)
+			leaves := materialize.LeavesFromSnapshot(view)
+			slices.SortFunc(leaves, func(a, b merkle.Leaf) int {
+				switch {
+				case a.Key < b.Key:
+					return -1
+				case a.Key > b.Key:
+					return 1
+				default:
+					return 0
+				}
+			})
+			buf[i] = merkle.Build(leaves)
+			if i > 0 && buf[i] != buf[0] {
+				allEq = false
+			}
+		}
+		ss.mu.Lock()
+		if allEq && ss.convergedAt.IsZero() {
+			ss.convergedAt = time.Now()
+		}
+		ss.mu.Unlock()
+	}
+
 	// aggregate + write summary
 	mean, stdev := meanStdevSeconds(ss.latencies)
 	fmt.Fprintf(sumTxt, "Nodes: %d\nDuration: %s\nSync interval: %s\nWrite interval: %s\nHB: %s\nSuspect: %s\nDelta max: %d\n",
@@ -349,7 +452,9 @@ func main() {
 		*flLoss, *flDup, *flReord, flDelay.String(), flJitter.String())
 	fmt.Fprintf(sumTxt, "SyncLatency(s): mean=%.3f stdev=%.3f samples=%d\n", mean, stdev, len(ss.latencies))
 	ss.mu.Lock()
-	if !ss.firstSync.IsZero() && !ss.convergedAt.IsZero() {
+	if !ss.convergedAt.IsZero() && !ss.writesStoppedAt.IsZero() {
+		fmt.Fprintf(sumTxt, "Convergence(s): %.3f\n", ss.convergedAt.Sub(ss.writesStoppedAt).Seconds())
+	} else if !ss.convergedAt.IsZero() && !ss.firstSync.IsZero() {
 		fmt.Fprintf(sumTxt, "Convergence(s): %.3f\n", ss.convergedAt.Sub(ss.firstSync).Seconds())
 	} else {
 		fmt.Fprintf(sumTxt, "Convergence(s): n/a\n")
@@ -366,7 +471,9 @@ func main() {
 	fmt.Fprintf(sumTxt, "SyncLatency(s): mean=%.3f stdev=%.3f samples=%d\n", mean, stdev, len(ss.latencies))
 
 	ss.mu.Lock()
-	if !ss.firstSync.IsZero() && !ss.convergedAt.IsZero() {
+	if !ss.convergedAt.IsZero() && !ss.writesStoppedAt.IsZero() {
+		fmt.Fprintf(sumTxt, "Convergence(s): %.3f\n", ss.convergedAt.Sub(ss.writesStoppedAt).Seconds())
+	} else if !ss.convergedAt.IsZero() && !ss.firstSync.IsZero() {
 		fmt.Fprintf(sumTxt, "Convergence(s): %.3f\n", ss.convergedAt.Sub(ss.firstSync).Seconds())
 	} else {
 		fmt.Fprintf(sumTxt, "Convergence(s): n/a\n")

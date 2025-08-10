@@ -2,203 +2,496 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"flag"
 	"fmt"
-	"os"
-	"os/signal"
-	"sort"
+	"io"
+	"log"
+	"log/slog"
+	"math/rand"
+	"strconv"
 	"strings"
-	"syscall"
+	"sync"
 	"time"
 
-	"golang.org/x/term"
-
-	"slices"
+	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/juanpablocruz/maep/pkg/materialize"
 	"github.com/juanpablocruz/maep/pkg/merkle"
 	"github.com/juanpablocruz/maep/pkg/model"
 	"github.com/juanpablocruz/maep/pkg/node"
-	"github.com/juanpablocruz/maep/pkg/segment"
-	"github.com/juanpablocruz/maep/pkg/syncproto"
 	"github.com/juanpablocruz/maep/pkg/transport"
-	"github.com/juanpablocruz/maep/pkg/wire"
 )
 
-// ---------- layout & widths ----------
+// ============================================================================
+// Configuration and Constants
+// ============================================================================
+
 const (
-	headerRowsTop = 4 // header + status lines
-	panelHeaderH  = 3 // title + 2 header lines in each panel
-	maxEvents     = 30
+	// Default values
+	defaultNodes         = 3
+	defaultWriteInterval = 3 * time.Second
+	defaultSyncInterval  = 7 * time.Second
+	defaultHeartbeat     = 750 * time.Millisecond
+	defaultSuspectTO     = 2250 * time.Millisecond
+	defaultDeltaChunk    = 64 * 1024
+	defaultBasePort      = 9001
+
+	// Writer constants
+	writerKeys = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 )
 
-func calcLayout() (screenW, rightPanelX, leftW, rightW int) {
-	w, _, err := term.GetSize(int(os.Stdout.Fd()))
-	if err != nil || w <= 0 {
-		w = 200
-	}
-	screenW = w
-	rightPanelX = w / 2
-	leftW = rightPanelX - 2
-	rightW = w - rightPanelX - 2
-	return
+// ============================================================================
+// Configuration
+// ============================================================================
+
+type Config struct {
+	Nodes         int
+	WriteInterval time.Duration
+	SyncInterval  time.Duration
+	Heartbeat     time.Duration
+	SuspectTO     time.Duration
+	DeltaChunk    int
+	BasePort      int
+
+	// Chaos network parameters
+	Loss   float64
+	Dup    float64
+	Reord  float64
+	Delay  time.Duration
+	Jitter time.Duration
+
+	// Failure simulation
+	FailurePeriod time.Duration
+	RecoveryDelay time.Duration
+
+	// Protocol tuning
+	DeltaWindowChunks int
+	RetransTimeout    time.Duration
+	Descent           bool
+	Auto              bool
 }
 
-// ---------- ANSI colors ----------
-const (
-	clrReset   = "\x1b[0m"
-	clrBold    = "\x1b[1m"
-	clrDim     = "\x1b[2m"
-	clrRed     = "\x1b[31m"
-	clrGreen   = "\x1b[32m"
-	clrYellow  = "\x1b[33m"
-	clrBlue    = "\x1b[34m"
-	clrMagenta = "\x1b[35m"
-	clrCyan    = "\x1b[36m"
-	clrGray    = "\x1b[90m"
-)
+func parseFlags() *Config {
+	cfg := &Config{}
 
-type chaosPair struct{ tcp, udp *transport.ChaosEP }
+	flag.IntVar(&cfg.Nodes, "nodes", defaultNodes, "number of nodes in ring")
+	flag.DurationVar(&cfg.WriteInterval, "write-interval", defaultWriteInterval, "mean interval between local writes per node")
+	flag.DurationVar(&cfg.SyncInterval, "sync-interval", defaultSyncInterval, "period between sync attempts")
+	flag.DurationVar(&cfg.Heartbeat, "heartbeat", defaultHeartbeat, "heartbeat period")
+	flag.DurationVar(&cfg.SuspectTO, "suspect-timeout", defaultSuspectTO, "failure-suspect threshold (>=3*heartbeat)")
+	flag.IntVar(&cfg.DeltaChunk, "delta-chunk-bytes", defaultDeltaChunk, "max bytes per SYNC_DELTA frame")
+	flag.IntVar(&cfg.BasePort, "base-port", defaultBasePort, "base TCP/UDP port (node i uses base+i)")
 
-func main() {
-	// Transport & nodes
-	// sw := transport.NewSwitch()
-	// epA, _ := sw.Listen("A")
-	// epB, _ := sw.Listen("B")
+	// Chaos knobs
+	flag.Float64Var(&cfg.Loss, "loss", 0.0, "drop probability [0..1]")
+	flag.Float64Var(&cfg.Dup, "dup", 0.0, "dup probability [0..1]")
+	flag.Float64Var(&cfg.Reord, "reorder", 0.0, "reorder probability [0..1]")
+	flag.DurationVar(&cfg.Delay, "delay", 0, "base one-way delay")
+	flag.DurationVar(&cfg.Jitter, "jitter", 0, "jitter (+/-)")
 
-	epATCPraw, err := transport.ListenTCP("127.0.0.1:9001")
+	// Failure simulation
+	flag.DurationVar(&cfg.FailurePeriod, "failure-period", 0, "mean time between random link failures (0=off)")
+	flag.DurationVar(&cfg.RecoveryDelay, "recovery-delay", 5*time.Second, "time a failed link stays down before reconnect")
+
+	// Protocol tuning
+	flag.IntVar(&cfg.DeltaWindowChunks, "delta-window-chunks", 1, "max delta chunks in flight per session")
+	flag.DurationVar(&cfg.RetransTimeout, "retrans-timeout", 2*time.Second, "retransmit timeout for unacked chunks")
+	flag.BoolVar(&cfg.Descent, "descent", true, "use Merkle descent for summaries")
+	flag.BoolVar(&cfg.Auto, "auto", false, "enable automatic writers")
+
+	flag.Parse()
+	return cfg
+}
+
+func (cfg *Config) Validate() error {
+	if cfg.Nodes < 2 {
+		return fmt.Errorf("need at least 2 nodes, got %d", cfg.Nodes)
+	}
+	if cfg.Loss < 0 || cfg.Loss > 1 {
+		return fmt.Errorf("loss must be between 0 and 1, got %f", cfg.Loss)
+	}
+	if cfg.Dup < 0 || cfg.Dup > 1 {
+		return fmt.Errorf("dup must be between 0 and 1, got %f", cfg.Dup)
+	}
+	if cfg.Reord < 0 || cfg.Reord > 1 {
+		return fmt.Errorf("reorder must be between 0 and 1, got %f", cfg.Reord)
+	}
+	if cfg.Delay < 0 {
+		return fmt.Errorf("delay cannot be negative, got %v", cfg.Delay)
+	}
+	if cfg.Jitter < 0 {
+		return fmt.Errorf("jitter cannot be negative, got %v", cfg.Jitter)
+	}
+
+	return nil
+}
+
+// ============================================================================
+// Node Management
+// ============================================================================
+
+type SimNode struct {
+	Name     string
+	TCP, UDP *transport.ChaosEP
+	PeerAddr transport.MemAddr
+	Node     *node.Node
+	Actor    model.ActorID
+	Port     int
+}
+
+type NodeManager struct {
+	nodes  []*SimNode
+	cfg    *Config
+	mu     sync.RWMutex
+	nextID int
+}
+
+func NewNodeManager(cfg *Config) *NodeManager {
+	return &NodeManager{
+		nodes:  make([]*SimNode, 0, cfg.Nodes),
+		cfg:    cfg,
+		nextID: 0,
+	}
+}
+
+func (nm *NodeManager) CreateNodes() error {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+
+	// Create initial nodes
+	for i := 0; i < nm.cfg.Nodes; i++ {
+		if err := nm.addNode(); err != nil {
+			return fmt.Errorf("failed to create node %d: %w", i, err)
+		}
+	}
+
+	return nil
+}
+
+func (nm *NodeManager) addNode() error {
+	index := nm.nextID
+	nm.nextID++
+
+	node, err := nm.createNode(index)
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("failed to create node %d: %w", index, err)
 	}
-	epBTCPraw, err := transport.ListenTCP("127.0.0.1:9002")
+
+	nm.nodes = append(nm.nodes, node)
+
+	// Update ring topology
+	nm.updateRingTopology()
+
+	return nil
+}
+
+func (nm *NodeManager) removeNode(index int) error {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+
+	if index < 0 || index >= len(nm.nodes) {
+		return fmt.Errorf("invalid node index: %d", index)
+	}
+
+	// Stop and cleanup the node
+	node := nm.nodes[index]
+	node.Node.Stop()
+	node.TCP.Close()
+	node.UDP.Close()
+
+	// Remove from slice
+	nm.nodes = append(nm.nodes[:index], nm.nodes[index+1:]...)
+
+	// Update ring topology
+	nm.updateRingTopology()
+
+	return nil
+}
+
+func (nm *NodeManager) updateRingTopology() {
+	if len(nm.nodes) < 2 {
+		return
+	}
+
+	// Recreate all nodes with correct peer addresses
+	for i := range nm.nodes {
+		next := (i + 1) % len(nm.nodes)
+		// Use the peer node's actual listening port directly
+		peerAddr := transport.MemAddr(fmt.Sprintf("127.0.0.1:%d", nm.nodes[next].Port))
+		nm.nodes[i].PeerAddr = peerAddr
+
+		// Recreate the node with the correct peer address
+		nm.nodes[i].Node.Stop()
+		newNode := node.New(nm.nodes[i].Name, nm.nodes[i].TCP, peerAddr, nm.cfg.SyncInterval)
+		newNode.AttachHB(nm.nodes[i].UDP)
+		newNode.SetDeltaMaxBytes(nm.cfg.DeltaChunk)
+		newNode.SetHeartbeatEvery(nm.cfg.Heartbeat)
+		hbK := max(int((nm.cfg.SuspectTO+nm.cfg.Heartbeat-1)/nm.cfg.Heartbeat), 3)
+		newNode.SetSuspectThreshold(hbK)
+		newNode.SetDeltaWindowChunks(nm.cfg.DeltaWindowChunks)
+		newNode.SetRetransTimeout(nm.cfg.RetransTimeout)
+		newNode.DescentEnabled = nm.cfg.Descent
+		// IMPORTANT: attach events channel so protocol emits
+		newNode.AttachEvents(make(chan node.Event, 1024))
+		nm.nodes[i].Node = newNode
+	}
+}
+
+func (nm *NodeManager) createNode(index int) (*SimNode, error) {
+	port := nm.cfg.BasePort + index
+
+	// Create TCP endpoint
+	tcp, err := transport.ListenTCP(fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("failed to create TCP endpoint: %w", err)
 	}
-	epAUDPraw, err := transport.ListenUDP("127.0.0.1:9001")
+
+	// Create UDP endpoint
+	udp, err := transport.ListenUDP(fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
-		panic(err)
-	}
-	epBUDPraw, err := transport.ListenUDP("127.0.0.1:9002")
-	if err != nil {
-		panic(err)
+		tcp.Close()
+		return nil, fmt.Errorf("failed to create UDP endpoint: %w", err)
 	}
 
-	chaosA_TCP := transport.WrapChaos(epATCPraw, transport.ChaosConfig{Up: true})
-	chaosB_TCP := transport.WrapChaos(epBTCPraw, transport.ChaosConfig{Up: true})
-	chaosA_UDP := transport.WrapChaos(epAUDPraw, transport.ChaosConfig{Up: true})
-	chaosB_UDP := transport.WrapChaos(epBUDPraw, transport.ChaosConfig{Up: true})
+	// Wrap with chaos
+	chaosTCP := transport.WrapChaos(tcp, transport.ChaosConfig{Up: true})
+	chaosUDP := transport.WrapChaos(udp, transport.ChaosConfig{Up: true})
 
-	nA := node.New("A", chaosA_TCP, transport.MemAddr("127.0.0.1:9002"), 500*time.Millisecond)
-	nB := node.New("B", chaosB_TCP, transport.MemAddr("127.0.0.1:9001"), 500*time.Millisecond)
+	// Configure chaos parameters
+	nm.configureChaos(chaosTCP, chaosUDP)
 
-	nA.AttachHB(chaosA_UDP)
-	nB.AttachHB(chaosB_UDP)
+	// Create node with temporary peer address (will be set properly after ring setup)
+	n := node.New(fmt.Sprintf("%d", index), chaosTCP, transport.MemAddr("127.0.0.1:9999"), nm.cfg.SyncInterval)
+	n.AttachHB(chaosUDP)
+	n.SetDeltaMaxBytes(nm.cfg.DeltaChunk)
+	n.SetHeartbeatEvery(nm.cfg.Heartbeat)
+	hbK := max(int((nm.cfg.SuspectTO+nm.cfg.Heartbeat-1)/nm.cfg.Heartbeat), 3)
+	n.SetSuspectThreshold(hbK)
+	n.SetDeltaWindowChunks(nm.cfg.DeltaWindowChunks)
+	n.SetRetransTimeout(nm.cfg.RetransTimeout)
+	n.DescentEnabled = nm.cfg.Descent
+	// IMPORTANT: attach events channel so protocol emits
+	n.AttachEvents(make(chan node.Event, 1024))
 
-	defer chaosA_TCP.Close()
-	defer chaosB_TCP.Close()
-	defer chaosA_UDP.Close()
-	defer chaosB_UDP.Close()
+	// Create actor ID
+	var actor model.ActorID
+	copy(actor[:], bytes.Repeat([]byte{byte(0xA0 + index)}, 16))
 
-	nets := map[string]chaosPair{
-		"a": {tcp: chaosA_TCP, udp: chaosA_UDP},
-		"b": {tcp: chaosB_TCP, udp: chaosB_UDP},
+	return &SimNode{
+		Name:  fmt.Sprintf("%d", index),
+		TCP:   chaosTCP,
+		UDP:   chaosUDP,
+		Node:  n,
+		Actor: actor,
+		Port:  port,
+	}, nil
+}
+
+func (nm *NodeManager) configureChaos(tcp, udp *transport.ChaosEP) {
+	tcp.SetLoss(nm.cfg.Loss)
+	tcp.SetDup(nm.cfg.Dup)
+	tcp.SetReorder(nm.cfg.Reord)
+	tcp.SetBaseDelay(nm.cfg.Delay)
+	tcp.SetJitter(nm.cfg.Jitter)
+
+	udp.SetLoss(nm.cfg.Loss)
+	udp.SetDup(nm.cfg.Dup)
+	udp.SetReorder(nm.cfg.Reord)
+	udp.SetBaseDelay(nm.cfg.Delay)
+	udp.SetJitter(nm.cfg.Jitter)
+}
+
+func (nm *NodeManager) StartNodes() error {
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+
+	for _, node := range nm.nodes {
+		// Start the node (peer address is already set in constructor)
+		node.Node.Start()
 	}
 
-	// Events
-	evCh := make(chan node.Event, 256)
-	nA.AttachEvents(evCh)
-	nB.AttachEvents(evCh)
-
-	nA.Start()
-	nB.Start()
-	defer nA.Stop()
-	defer nB.Stop()
-
-	// Actors
-	var actA, actB model.ActorID
-	copy(actA[:], bytes.Repeat([]byte{0xA1}, 16))
-	copy(actB[:], bytes.Repeat([]byte{0xB2}, 16))
-
-	// Seed ops on A
-	nA.Put("A", []byte("v1"), actA)
-	nA.Put("B", []byte("v2"), actA)
-	nA.Delete("B", actA)
-	nA.Put("C", []byte("v3"), actA)
-
-	// Raw terminal
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-	if err != nil {
-		panic(err)
+	// Add initial seed data
+	if len(nm.nodes) > 0 {
+		nm.nodes[0].Node.Put("A", []byte("v1"), nm.nodes[0].Actor)
 	}
 
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
-	installUI()
-	defer restoreUI()
+	return nil
+}
 
-	events := make([]node.Event, 0, 256)
-	wireLog := make([]node.Event, 0, 256)
-	input := "" // live command buffer
+func (nm *NodeManager) StopNodes() {
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
 
-	// key/command reader
-	inputEditCh := make(chan string, 64) // live edits
-	cmdCh := make(chan string, 16)       // completed lines
-	quitCh := make(chan struct{})
-	go readKeys(inputEditCh, cmdCh, quitCh)
+	log.Println("Stopping all nodes...")
+	for _, node := range nm.nodes {
+		log.Printf("Stopping node %s...", node.Name)
 
-	// exit on Ctrl-C too (raw reader also exits on ^C)
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		// Stop the node first
+		node.Node.Stop()
 
-	// repaint timer
-	tick := time.NewTicker(120 * time.Millisecond)
-	defer tick.Stop()
+		// Close TCP endpoint
+		log.Printf("Closing TCP endpoint for %s...", node.Name)
+		node.TCP.Close()
 
-	for {
-		select {
-		case e := <-evCh:
-			if e.Type == node.EventHB {
-				break
-			}
-			if e.Type == node.EventWire {
-				wireLog = append(wireLog, e)
-				if len(wireLog) > maxEvents {
-					wireLog = wireLog[len(wireLog)-maxEvents:]
-				}
-			} else {
-				events = append(events, e)
-				if len(events) > maxEvents {
-					events = events[len(events)-maxEvents:]
-				}
-			}
-		case <-tick.C:
-			render(nA, nB, events, wireLog, input)
-		case s := <-inputEditCh:
-			input = s
-			render(nA, nB, events, wireLog, input)
-		case line := <-cmdCh:
-			input = ""
-			if handleCmd(strings.TrimSpace(line), nA, nB, actA, actB, &events, nets) {
-				return
-			}
-		case <-quitCh:
-			return
-		case <-sig:
-			return
+		// Close UDP endpoint
+		log.Printf("Closing UDP endpoint for %s...", node.Name)
+		node.UDP.Close()
+
+		log.Printf("Node %s stopped successfully", node.Name)
+	}
+	log.Println("All nodes stopped.")
+}
+
+func (nm *NodeManager) GetNodes() []*SimNode {
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+
+	result := make([]*SimNode, len(nm.nodes))
+	copy(result, nm.nodes)
+	return result
+}
+
+func (nm *NodeManager) GetNode(index int) *SimNode {
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+
+	if index >= 0 && index < len(nm.nodes) {
+		return nm.nodes[index]
+	}
+	return nil
+}
+
+func (nm *NodeManager) AddNode() error {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+
+	return nm.addNode()
+}
+
+func (nm *NodeManager) RemoveNode(index int) error {
+	return nm.removeNode(index)
+}
+
+// ============================================================================
+// Event Management
+// ============================================================================
+
+type EventManager struct {
+	events   []node.Event
+	wireLog  []node.Event
+	cmdLog   []node.Event
+	mu       sync.RWMutex
+	eventCh  chan node.Event
+	capacity int
+}
+
+func NewEventManager(capacity int) *EventManager {
+	return &EventManager{
+		events:   make([]node.Event, 0, capacity),
+		wireLog:  make([]node.Event, 0, capacity),
+		cmdLog:   make([]node.Event, 0, 256),
+		eventCh:  make(chan node.Event, capacity),
+		capacity: capacity,
+	}
+}
+
+func (em *EventManager) AddEvent(event node.Event) {
+	em.mu.Lock()
+	defer em.mu.Unlock()
+
+	if event.Type == node.EventHB {
+		return // Skip heartbeat events to reduce noise
+	}
+
+	// route command echoes to separate log
+	if string(event.Type) == "cmd" {
+		em.cmdLog = append(em.cmdLog, event)
+		if len(em.cmdLog) > 200 {
+			em.cmdLog = em.cmdLog[len(em.cmdLog)-200:]
+		}
+		return
+	}
+
+	if event.Type == node.EventWire {
+		em.wireLog = append(em.wireLog, event)
+		if len(em.wireLog) > 50 {
+			em.wireLog = em.wireLog[len(em.wireLog)-50:]
+		}
+	} else {
+		em.events = append(em.events, event)
+		if len(em.events) > em.capacity {
+			em.events = em.events[len(em.events)-em.capacity:]
 		}
 	}
 }
 
-// -------- Commands --------
+func (em *EventManager) GetEvents() []node.Event {
+	em.mu.RLock()
+	defer em.mu.RUnlock()
 
-func handleCmd(line string, nA, nB *node.Node, actA, actB model.ActorID, events *[]node.Event, nets map[string]chaosPair) bool {
+	result := make([]node.Event, len(em.events))
+	copy(result, em.events)
+	return result
+}
+
+func (em *EventManager) GetWireLog() []node.Event {
+	em.mu.RLock()
+	defer em.mu.RUnlock()
+
+	result := make([]node.Event, len(em.wireLog))
+	copy(result, em.wireLog)
+	return result
+}
+
+func (em *EventManager) GetCmdLog() []node.Event {
+	em.mu.RLock()
+	defer em.mu.RUnlock()
+	result := make([]node.Event, len(em.cmdLog))
+	copy(result, em.cmdLog)
+	return result
+}
+
+func (em *EventManager) GetEventChannel() <-chan node.Event {
+	return em.eventCh
+}
+
+func (em *EventManager) Close() {
+	close(em.eventCh)
+}
+
+// ============================================================================
+// Command System
+// ============================================================================
+
+type CommandHandler struct {
+	nodeMgr  *NodeManager
+	eventMgr *EventManager
+}
+
+func NewCommandHandler(nodeMgr *NodeManager, eventMgr *EventManager) *CommandHandler {
+	return &CommandHandler{
+		nodeMgr:  nodeMgr,
+		eventMgr: eventMgr,
+	}
+}
+
+func (ch *CommandHandler) HandleCommand(line string) bool {
 	if line == "" {
 		return false
 	}
+
 	parts := strings.Fields(line)
 	cmd := strings.ToLower(parts[0])
 
 	emit := func(s string) {
-		*events = append(*events, node.Event{
-			Time: time.Now(), Node: "UI", Type: node.EventType("cmd"),
+		ch.eventMgr.AddEvent(node.Event{
+			Time:   time.Now(),
+			Node:   "UI",
+			Type:   node.EventType("cmd"),
 			Fields: map[string]any{"cmd": s},
 		})
 	}
@@ -207,739 +500,972 @@ func handleCmd(line string, nA, nB *node.Node, actA, actB model.ActorID, events 
 	case "q", "quit", "exit":
 		return true
 	case "help", "h", "?":
-		emit("help")
-	case "wa", "wb":
-		if len(parts) < 3 {
-			emit("usage: wa|wb <key> <val>")
-			return false
-		}
-		key, val := parts[1], strings.Join(parts[2:], " ")
-		if cmd == "wa" {
-			nA.Put(key, []byte(val), actA)
-		} else {
-			nB.Put(key, []byte(val), actB)
-		}
-	case "da", "db":
-		if len(parts) < 2 {
-			emit("usage: da|db <key>")
-			return false
-		}
-		key := parts[1]
-		if cmd == "da" {
-			nA.Delete(key, actA)
-		} else {
-			nB.Delete(key, actB)
-		}
+		ch.showHelp(emit)
+	case "put":
+		return ch.handlePut(parts, emit)
+	case "del":
+		return ch.handleDelete(parts, emit)
 	case "rand":
-		target := "a"
-		if len(parts) >= 2 {
-			target = strings.ToLower(parts[1])
-		}
-		k := randKey()
-		v := fmt.Sprintf("v%d", time.Now().UnixNano()%1000)
-		if target == "b" {
-			nB.Put(k, []byte(v), actB)
-		} else {
-			nA.Put(k, []byte(v), actA)
-		}
+		return ch.handleRandom(parts, emit)
 	case "link":
-		if len(parts) < 3 {
-			emit("usage: link <a|b> <up|down>")
-			return false
-		}
-		nodeSel := strings.ToLower(parts[1])
-		up := parts[2] == "up"
-		switch nodeSel {
-		case "a":
-			nA.SetConnected(up)
-		case "b":
-			nB.SetConnected(up)
-		default:
-			emit("usage: link <a|b> <up|down>")
-		}
+		return ch.handleLink(parts, emit)
 	case "pause":
-		if len(parts) < 3 {
-			emit("usage: pause <a|b> <on|off>")
-			return false
-		}
-		nodeSel := strings.ToLower(parts[1])
-		on := parts[2] == "on"
-		switch nodeSel {
-		case "a":
-			nA.SetPaused(on)
-		case "b":
-			nB.SetPaused(on)
-		default:
-			emit("usage: pause <a|b> <on|off>")
-		}
+		return ch.handlePause(parts, emit)
 	case "burst":
-		if len(parts) < 3 {
-			emit("usage: burst <a|b> <n>")
-			return false
-		}
-		nodeSel := strings.ToLower(parts[1])
-		n := atoiSafe(parts[2])
-		for i := range n {
-			k := randKey()
-			v := fmt.Sprintf("v%d", time.Now().UnixNano()%(1000+int64(i)))
-			if nodeSel == "b" {
-				nB.Put(k, []byte(v), actB)
-			} else {
-				nA.Put(k, []byte(v), actA)
-			}
-		}
+		return ch.handleBurst(parts, emit)
 	case "net":
-		// net <a|b> <path> <param> <value...>
-		// path: tcp|udp|both
-		// params:
-		//   loss <p>           (0..1)
-		//   dup <p>            (0..1)
-		//   reorder <p>        (0..1)
-		//   delay <base> [jit] (e.g. 80ms 20ms)
-		//   up|down
-		if len(parts) < 3 {
-			emit("usage: net <a|b> <tcp|udp|both> <loss|dup|reorder|delay|up|down> [args]")
-			return false
-		}
-		nodeSel := strings.ToLower(parts[1])
-		path := strings.ToLower(parts[2])
-		cp, ok := nets[nodeSel]
-		if !ok {
-			emit("unknown node (a|b)")
-			return false
-		}
-		targets := []*transport.ChaosEP{}
-		switch path {
-		case "tcp":
-			targets = []*transport.ChaosEP{cp.tcp}
-		case "udp":
-			targets = []*transport.ChaosEP{cp.udp}
-		case "both":
-			targets = []*transport.ChaosEP{cp.tcp, cp.udp}
-		default:
-			emit("path must be tcp|udp|both")
-			return false
-		}
-		if len(parts) < 4 {
-			emit("missing param")
-			return false
-		}
-		param := strings.ToLower(parts[3])
-
-		setAll := func(fn func(*transport.ChaosEP)) {
-			for _, t := range targets {
-				fn(t)
-			}
-		}
-
-		switch param {
-		case "up":
-			setAll(func(t *transport.ChaosEP) { t.SetUp(true) })
-			emit("net link up")
-		case "down":
-			setAll(func(t *transport.ChaosEP) { t.SetUp(false) })
-			emit("net link down")
-		case "loss":
-			if len(parts) < 5 {
-				emit("usage: net <n> <p> loss <0..1>")
-				return false
-			}
-			p := parseFloat(parts[4])
-			setAll(func(t *transport.ChaosEP) { t.SetLoss(p) })
-			emit(fmt.Sprintf("loss=%.2f", p))
-		case "dup":
-			if len(parts) < 5 {
-				emit("usage: net <n> <p> dup <0..1>")
-				return false
-			}
-			p := parseFloat(parts[4])
-			setAll(func(t *transport.ChaosEP) { t.SetDup(p) })
-			emit(fmt.Sprintf("dup=%.2f", p))
-		case "reorder":
-			if len(parts) < 5 {
-				emit("usage: net <n> <p> reorder <0..1>")
-				return false
-			}
-			p := parseFloat(parts[4])
-			setAll(func(t *transport.ChaosEP) { t.SetReorder(p) })
-			emit(fmt.Sprintf("reorder=%.2f", p))
-		case "delay":
-			if len(parts) < 5 {
-				emit("usage: net <n> <p> delay <base> [jitter]")
-				return false
-			}
-			base, err1 := time.ParseDuration(parts[4])
-			jit := time.Duration(0)
-			var err2 error
-			if len(parts) >= 6 {
-				jit, err2 = time.ParseDuration(parts[5])
-			}
-			if err1 != nil || (len(parts) >= 6 && err2 != nil) {
-				emit("bad duration (e.g. 80ms 20ms)")
-				return false
-			}
-			setAll(func(t *transport.ChaosEP) {
-				t.SetBaseDelay(base)
-				t.SetJitter(jit)
-			})
-			emit(fmt.Sprintf("delay base=%s jitter=%s", base, jit))
-		default:
-			emit("unknown net param")
-		}
+		return ch.handleNetwork(parts, emit)
+	case "add":
+		return ch.handleAddNode(parts, emit)
+	case "remove":
+		return ch.handleRemoveNode(parts, emit)
+	case "stats":
+		ch.showStats(emit)
+	case "clear":
+		ch.eventMgr.mu.Lock()
+		ch.eventMgr.events = ch.eventMgr.events[:0]
+		ch.eventMgr.wireLog = ch.eventMgr.wireLog[:0]
+		ch.eventMgr.cmdLog = ch.eventMgr.cmdLog[:0]
+		ch.eventMgr.mu.Unlock()
+		emit("events cleared")
+	case "cleanup":
+		ch.nodeMgr.StopNodes()
+		emit("All nodes stopped and ports released.")
+	case "dump":
+		return ch.handleDump(parts, emit)
 	default:
-		emit("unknown: " + line)
+		emit(fmt.Sprintf("unknown command: %s (type 'help' for available commands)", line))
 	}
 	return false
 }
 
-// Raw key reader (single-keystroke). Shows live prompt and emits full lines.
-func readKeys(editOut chan<- string, lineOut chan<- string, quit chan<- struct{}) {
-	buf := make([]byte, 1)
-	cur := []rune{}
-	for {
-		if _, err := os.Stdin.Read(buf); err != nil {
-			continue
-		}
-		b := buf[0]
-		switch b {
-		case 3: // Ctrl-C
-			close(quit)
-			return
-		case '\r', '\n':
-			lineOut <- string(cur)
-			cur = cur[:0]
-			editOut <- ""
-		case 127, 8: // Backspace / Ctrl-H
-			if len(cur) > 0 {
-				cur = cur[:len(cur)-1]
-				editOut <- string(cur)
-			}
-		case 27: // swallow ESC [ X (arrow keys)
-			rest := make([]byte, 2)
-			_, _ = os.Stdin.Read(rest)
-		default:
-			if b >= 32 && b <= 126 {
-				cur = append(cur, rune(b))
-				editOut <- string(cur)
-			}
-		}
-	}
+func (ch *CommandHandler) showHelp(emit func(string)) {
+	help := `Available commands:
+  put <node> <key> <value>    - Put a key-value pair on specified node (0,1,2...)
+  del <node> <key>           - Delete a key from specified node (0,1,2...)
+  rand [node]                - Put random key-value on random or specified node
+  link <node> <up|down>      - Control node connectivity (0,1,2...)
+  pause <node> <on|off>      - Pause/unpause a node (0,1,2...)
+  burst <node> <count>       - Put multiple random key-values (0,1,2...)
+  net <node> <tcp|udp|both> <param> [value] - Configure network chaos
+  add                        - Add a new node to the ring
+  remove <node>              - Remove a node from the ring (0,1,2...)
+  stats                      - Show current statistics
+  clear                      - Clear event logs
+  cleanup                    - Stop all nodes and release ports
+  help                       - Show this help
+  quit                       - Exit the application`
+	emit(help)
 }
 
-// -------- Rendering --------
-
-func render(nA, nB *node.Node, events []node.Event, wireLog []node.Event, input string) {
-	clearScreen()
-
-	screenW, rightPanelX, leftW, rightW := calcLayout()
-	// Snapshots + roots
-	viewA := materialize.Snapshot(nA.Log)
-	viewB := materialize.Snapshot(nB.Log)
-	leavesA := materialize.LeavesFromSnapshot(viewA)
-	leavesB := materialize.LeavesFromSnapshot(viewB)
-	rootA := merkle.Build(leavesA)
-	rootB := merkle.Build(leavesB)
-	segA := segment.RootsBySegment(viewA)
-	segB := segment.RootsBySegment(viewB)
-	segDiff := diffSegments(segA, segB)
-
-	diff := diffKeys(leavesA, leavesB)
-	inSync := rootA == rootB
-
-	// Header (full-line clears)
-	printFull(0, fmt.Sprintf(" %sMAEP Sync TUI%s — %s  (type '%shelp%s' for commands; Enter to run)",
-		clrBold, clrReset, time.Now().Format("15:04:05"), clrCyan, clrReset))
-	printFull(1, stringsRepeat("─", screenW))
-
-	status := colorize("IN SYNC", clrGreen)
-	if !inSync {
-		status = colorize("OUT OF SYNC", clrRed)
+func (ch *CommandHandler) handleAddNode(parts []string, emit func(string)) bool {
+	if err := ch.nodeMgr.AddNode(); err != nil {
+		emit(fmt.Sprintf("failed to add node: %v", err))
+		return false
 	}
-	printFull(2, fmt.Sprintf(" %s   differ: %s  %s   segs differ: %s  %s",
-		status,
-		colorize(fmt.Sprintf("%d", len(diff)), clrYellow), truncateList(diff, 8),
-		colorize(fmt.Sprintf("%d", len(segDiff)), clrYellow), truncateSegList(segDiff, 8)))
-	printFull(3, stringsRepeat("─", screenW))
-
-	// Panels + flags (box prints within columns)
-	row := headerRowsTop
-	drawPanel(0, row, leftW,
-		fmt.Sprintf("%sNode A%s [link:%s pause:%s health:%s]",
-			clrCyan, clrReset, onOff(nA.IsConnected()), onOff(nA.IsPaused()), healthLabel(nA)),
-		viewA, rootA[:])
-
-	drawPanel(rightPanelX, row, rightW,
-		fmt.Sprintf("%sNode B%s [link:%s pause:%s health:%s]",
-			clrCyan, clrReset, onOff(nB.IsConnected()), onOff(nB.IsPaused()), healthLabel(nB)),
-		viewB, rootB[:])
-
-	// Compute space used by panels to place events area
-	rowsA := panelRows(viewA)
-	rowsB := panelRows(viewB)
-	usedRows := panelHeaderH + maxInt(rowsA, rowsB)
-
-	evStart := row + usedRows + 1
-	printFull(evStart, stringsRepeat("─", screenW))
-
-	printBox(0, evStart+1, leftW, " Events (latest first):")
-	printBox(rightPanelX, evStart+1, rightW, " Wire (latest first):")
-
-	linesEv := formatEvents(events)
-	linesWire := formatWire(wireLog)
-	for i := range maxEvents {
-		y := evStart + 2 + i
-		if i < len(linesEv) {
-			printBox(0, y, leftW, " "+linesEv[len(linesEv)-1-i])
-		} else {
-			printBox(0, y, leftW, "")
-		}
-
-		if i < len(linesWire) {
-			printBox(rightPanelX, y, rightW, " "+linesWire[len(linesWire)-1-i])
-		} else {
-			printBox(rightPanelX, y, rightW, "")
-		}
-	}
-
-	// Footer: commands & prompt
-	footerY := evStart + 2 + maxEvents + 1
-	printFull(footerY, stringsRepeat("─", screenW))
-	printFull(footerY+1, fmt.Sprintf(" %sCommands%s: %swa|wb%s <key> <val> | %sda|db%s <key> | %srand%s [a|b] | %slink%s <a|b> <up|down> | %spause%s <a|b> <on|off> | %sburst%s <a|b> <n> | %sq%s",
-		clrBold, clrReset,
-		clrYellow, clrReset,
-		clrYellow, clrReset,
-		clrYellow, clrReset,
-		clrYellow, clrReset,
-		clrYellow, clrReset,
-		clrYellow, clrReset,
-		clrYellow, clrReset))
-	printFull(footerY+2, fmt.Sprintf(" %scmd>%s %s", clrBlue, clrReset, input))
+	emit("node added successfully")
+	return false
 }
 
-// panelRows returns number of data rows for a panel
-func panelRows(view map[string]materialize.State) int { return len(view) }
-
-// drawPanel prints a panel strictly inside its column using printBox
-func drawPanel(x, y, w int, title string, view map[string]materialize.State, root []byte) {
-
-	printBox(x, y+0, w, fmt.Sprintf("[%s]  root: %s", title, shortHex(root, 12)))
-	printBox(x, y+1, w, " Key     Present  Value")
-	printBox(x, y+2, w, stringsRepeat("-", minInt(w, 36)))
-
-	keys := make([]string, 0, len(view))
-	for k := range view {
-		keys = append(keys, k)
+func (ch *CommandHandler) handleRemoveNode(parts []string, emit func(string)) bool {
+	if len(parts) < 2 {
+		emit("usage: remove <node>")
+		return false
 	}
-	sort.Strings(keys)
 
-	row := 0
-	for _, k := range keys {
-		st := view[k]
-		val := ""
-		if st.Present {
-			val = string(st.Value)
-		}
-		present := colorize(fmt.Sprintf("%-7v", st.Present), ifThen(st.Present, clrGreen, clrRed))
-		printBox(x, y+3+row, w, fmt.Sprintf(" %-7s %s  %s", k, present, colorize(truncate(val, 16), clrBlue)))
-		row++
+	nodeIndex, err := ch.parseNodeIndex(parts[1])
+	if err != nil {
+		emit(err.Error())
+		return false
 	}
-	// clear a couple extra lines within the panel box to avoid stale rows
-	for i := range 2 {
-		printBox(x, y+3+row+i, w, "")
+
+	if err := ch.nodeMgr.RemoveNode(nodeIndex); err != nil {
+		emit(fmt.Sprintf("failed to remove node: %v", err))
+		return false
 	}
+	emit(fmt.Sprintf("node %d removed successfully", nodeIndex))
+	return false
 }
 
-// ----- Event formatting -----
-
-func formatEvents(ev []node.Event) []string {
-	out := make([]string, 0, len(ev))
-	for _, e := range ev {
-		switch e.Type {
-		case node.EventSync:
-			act, _ := e.Fields["action"].(string)
-			id := e.Fields["id"]
-			col := clrMagenta
-			if act == "end" {
-				col = clrCyan
-			}
-			out = append(out, fmt.Sprintf("%s%-6s%s %s SYNC %s id=%v",
-				clrGray, e.Node, clrReset, col, act, id))
-		case node.EventPut:
-			out = append(out, fmt.Sprintf("%s%-6s%s %s PUT  %s=%s %s=%s %s=%v",
-				clrGray, e.Node, clrReset, clrGreen, "key", e.Fields["key"], "val", e.Fields["val"], "hlc", e.Fields["hlc"]))
-		case node.EventDel:
-			out = append(out, fmt.Sprintf("%s%-6s%s %s DEL  %s=%s %s=%v",
-				clrGray, e.Node, clrReset, clrRed, "key", e.Fields["key"], "hlc", e.Fields["hlc"]))
-		case node.EventSendSummary:
-			out = append(out, fmt.Sprintf("%s%-6s%s %s SUMMARY%s → %s peer=%v leaves=%v root=%v",
-				clrGray, e.Node, clrReset, clrCyan, clrReset, clrDim, e.Fields["peer"], e.Fields["leaves"], e.Fields["root"]))
-		case node.EventSendReq:
-			out = append(out, fmt.Sprintf("%s%-6s%s %s REQ%s needs=%s",
-				clrGray, e.Node, clrReset, clrYellow, clrReset, colorize(fmtNeeds(e.Fields["needs"]), clrYellow)))
-		case node.EventSendDelta:
-			bytesField := e.Fields["bytes"]
-			out = append(out, fmt.Sprintf("%s%-6s%s %s DELTA%s entries=%v ops=%v bytes=%v",
-				clrGray, e.Node, clrReset, clrMagenta, clrReset, e.Fields["entries"], e.Fields["ops"], bytesField))
-		case node.EventAppliedDelta:
-			out = append(out, fmt.Sprintf("%s%-6s%s %s APPLIED%s keys=%v before=%s after=%s",
-				clrGray, e.Node, clrReset, clrGreen, clrReset,
-				e.Fields["keys"], fmtCounts(e.Fields["before"]), fmtCounts(e.Fields["after"])))
-		case node.EventConnChange:
-			up := e.Fields["up"] == true
-			col := clrRed
-			label := "down"
-			if up {
-				col = clrGreen
-				label = "up"
-			}
-			out = append(out, fmt.Sprintf("%s%-6s%s %s LINK %s", clrGray, e.Node, clrReset, col, label))
-		case node.EventPauseChange:
-			on := e.Fields["paused"] == true
-			col := clrGreen
-			label := "off"
-			if on {
-				col = clrYellow
-				label = "on"
-			}
-			out = append(out, fmt.Sprintf("%s%-6s%s %s PAUSE %s", clrGray, e.Node, clrReset, col, label))
-		case node.EventWarn:
-			out = append(out, fmt.Sprintf("%s%-6s%s %s WARN%s %v", clrGray, e.Node, clrReset, clrRed, clrReset, e.Fields))
-		case node.EventSendSegAd:
-			out = append(out, fmt.Sprintf("%s%-6s%s %s SEG_AD%s items=%v",
-				clrGray, e.Node, clrReset, clrCyan, clrReset, e.Fields["items"]))
-
-		case node.EventSendSegKeysReq:
-			out = append(out, fmt.Sprintf("%s%-6s%s %s SEG_KEYS_REQ%s sids=%v",
-				clrGray, e.Node, clrReset, clrYellow, clrReset, e.Fields["sids"]))
-
-		case node.EventSendSegKeys:
-			out = append(out, fmt.Sprintf("%s%-6s%s %s SEG_KEYS%s items=%v",
-				clrGray, e.Node, clrReset, clrCyan, clrReset, e.Fields["items"]))
-
-		case node.EventHB:
-			// ignore to reduce noise
-			// (do nothing)
-			continue
-		default:
-			out = append(out, fmt.Sprintf("%s%-6s%s %s %v", clrGray, e.Node, clrReset, string(e.Type), e.Fields))
-		}
+func (ch *CommandHandler) handlePut(parts []string, emit func(string)) bool {
+	if len(parts) < 4 {
+		emit("usage: put <node> <key> <value>")
+		return false
 	}
-	return out
+
+	nodeIndex, err := ch.parseNodeIndex(parts[1])
+	if err != nil {
+		emit(err.Error())
+		return false
+	}
+
+	node := ch.nodeMgr.GetNode(nodeIndex)
+	if node == nil {
+		emit(fmt.Sprintf("node %d not found", nodeIndex))
+		return false
+	}
+
+	key := parts[2]
+	value := strings.Join(parts[3:], " ")
+	node.Node.Put(key, []byte(value), node.Actor)
+	emit(fmt.Sprintf("put %s=%s on %s", key, value, node.Name))
+	return false
 }
 
-func formatWire(ev []node.Event) []string {
-	out := make([]string, 0, len(ev))
-	for _, e := range ev {
-		proto, _ := e.Fields["proto"].(string) // tcp or udp
-		dir, _ := e.Fields["dir"].(string)     // <- or ->
-		mt, _ := e.Fields["mt"].(int)          // wire protocol type
-		bytes, _ := e.Fields["bytes"].(int)    // wire protocol payload size
-
-		name := mtName(byte(mt))
-		line := fmt.Sprintf("%-3s  %2s  %-12s %4dB", proto, dir, name, bytes)
-
-		if name == "PING" || name == "PONG" {
-			line = clrGray + line + clrReset
-		}
-
-		switch proto {
-		case "udp":
-			line = colorize(line, clrBlue)
-		case "tcp":
-			line = colorize(line, clrCyan)
-		}
-		out = append(out, line)
+func (ch *CommandHandler) handleDelete(parts []string, emit func(string)) bool {
+	if len(parts) < 3 {
+		emit("usage: del <node> <key>")
+		return false
 	}
-	return out
+
+	nodeIndex, err := ch.parseNodeIndex(parts[1])
+	if err != nil {
+		emit(err.Error())
+		return false
+	}
+
+	node := ch.nodeMgr.GetNode(nodeIndex)
+	if node == nil {
+		emit(fmt.Sprintf("node %d not found", nodeIndex))
+		return false
+	}
+
+	key := parts[2]
+	node.Node.Delete(key, node.Actor)
+	emit(fmt.Sprintf("deleted %s from %s", key, node.Name))
+	return false
 }
 
-func mtName(mt byte) string {
-	switch mt {
-	case wire.MT_SYNC_SUMMARY:
-		return "SUMMARY"
-	case wire.MT_SYNC_REQ:
-		return "REQ"
-	case wire.MT_SYNC_DELTA:
-		return "DELTA"
-	case wire.MT_PING:
-		return "PING"
-	case wire.MT_PONG:
-		return "PONG"
-	case wire.MT_SEG_AD:
-		return "SEG_AD"
-	case wire.MT_SEG_KEYS_REQ:
-		return "SEG_KEYS_REQ"
-	case wire.MT_SEG_KEYS:
-		return "SEG_KEYS"
-	case wire.MT_SYNC_BEGIN:
-		return "BEGIN"
-	case wire.MT_SYNC_END:
-		return "END"
+func (ch *CommandHandler) handleRandom(parts []string, emit func(string)) bool {
+	nodes := ch.nodeMgr.GetNodes()
+	if len(nodes) == 0 {
+		emit("no nodes available")
+		return false
+	}
+
+	var targetNode *SimNode
+	if len(parts) >= 2 {
+		nodeIndex, err := ch.parseNodeIndex(parts[1])
+		if err != nil {
+			emit(err.Error())
+			return false
+		}
+		targetNode = ch.nodeMgr.GetNode(nodeIndex)
+		if targetNode == nil {
+			emit(fmt.Sprintf("node %d not found", nodeIndex))
+			return false
+		}
+	} else {
+		targetNode = nodes[rand.Intn(len(nodes))]
+	}
+
+	k := generateRandomKey()
+	v := fmt.Sprintf("v%d", time.Now().UnixNano()%1000)
+	targetNode.Node.Put(k, []byte(v), targetNode.Actor)
+	emit(fmt.Sprintf("put random %s=%s on %s", k, v, targetNode.Name))
+	return false
+}
+
+func (ch *CommandHandler) handleLink(parts []string, emit func(string)) bool {
+	if len(parts) < 3 {
+		emit("usage: link <node> <up|down>")
+		return false
+	}
+
+	nodeIndex, err := ch.parseNodeIndex(parts[1])
+	if err != nil {
+		emit(err.Error())
+		return false
+	}
+
+	node := ch.nodeMgr.GetNode(nodeIndex)
+	if node == nil {
+		emit(fmt.Sprintf("node %d not found", nodeIndex))
+		return false
+	}
+
+	up := parts[2] == "up"
+	node.Node.SetConnected(up)
+	status := "up"
+	if !up {
+		status = "down"
+	}
+	emit(fmt.Sprintf("set %s link %s", node.Name, status))
+	return false
+}
+
+func (ch *CommandHandler) handlePause(parts []string, emit func(string)) bool {
+	if len(parts) < 3 {
+		emit("usage: pause <node> <on|off>")
+		return false
+	}
+
+	nodeIndex, err := ch.parseNodeIndex(parts[1])
+	if err != nil {
+		emit(err.Error())
+		return false
+	}
+
+	node := ch.nodeMgr.GetNode(nodeIndex)
+	if node == nil {
+		emit(fmt.Sprintf("node %d not found", nodeIndex))
+		return false
+	}
+
+	on := parts[2] == "on"
+	node.Node.SetPaused(on)
+	status := "paused"
+	if !on {
+		status = "resumed"
+	}
+	emit(fmt.Sprintf("%s %s", node.Name, status))
+	return false
+}
+
+func (ch *CommandHandler) handleBurst(parts []string, emit func(string)) bool {
+	if len(parts) < 3 {
+		emit("usage: burst <node> <count>")
+		return false
+	}
+
+	nodeIndex, err := ch.parseNodeIndex(parts[1])
+	if err != nil {
+		emit(err.Error())
+		return false
+	}
+
+	node := ch.nodeMgr.GetNode(nodeIndex)
+	if node == nil {
+		emit(fmt.Sprintf("node %d not found", nodeIndex))
+		return false
+	}
+
+	count, err := strconv.Atoi(parts[2])
+	if err != nil || count <= 0 {
+		emit("count must be a positive integer")
+		return false
+	}
+
+	for i := 0; i < count; i++ {
+		k := generateRandomKey()
+		v := fmt.Sprintf("v%d", time.Now().UnixNano()%(1000+int64(i)))
+		node.Node.Put(k, []byte(v), node.Actor)
+	}
+	emit(fmt.Sprintf("put %d random key-values on %s", count, node.Name))
+	return false
+}
+
+func (ch *CommandHandler) handleNetwork(parts []string, emit func(string)) bool {
+	if len(parts) < 4 {
+		emit("usage: net <node> <tcp|udp|both> <param> [value]")
+		return false
+	}
+
+	nodeIndex, err := ch.parseNodeIndex(parts[1])
+	if err != nil {
+		emit(err.Error())
+		return false
+	}
+
+	node := ch.nodeMgr.GetNode(nodeIndex)
+	if node == nil {
+		emit(fmt.Sprintf("node %d not found", nodeIndex))
+		return false
+	}
+
+	path := strings.ToLower(parts[2])
+	param := strings.ToLower(parts[3])
+
+	var targets []*transport.ChaosEP
+	switch path {
+	case "tcp":
+		targets = []*transport.ChaosEP{node.TCP}
+	case "udp":
+		targets = []*transport.ChaosEP{node.UDP}
+	case "both":
+		targets = []*transport.ChaosEP{node.TCP, node.UDP}
 	default:
-		return fmt.Sprintf("MT_%d", mt)
+		emit("path must be tcp|udp|both")
+		return false
 	}
+
+	return ch.applyNetworkParam(targets, param, parts[4:], emit)
 }
 
-func fmtNeeds(v any) string {
-	ns, ok := v.([]syncproto.Need)
-	if !ok {
-		return fmt.Sprint(v)
-	}
-	if len(ns) == 0 {
-		return "[]"
-	}
-	keys := make([]string, 0, len(ns))
-	for _, n := range ns {
-		keys = append(keys, fmt.Sprintf("%s:%d", n.Key, n.From))
-	}
-	return "[" + strings.Join(keys, " ") + "]"
-}
-
-func fmtCounts(v any) string {
-	m, ok := v.(map[string]int)
-	if !ok || len(m) == 0 {
-		return "{}"
-	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		parts = append(parts, fmt.Sprintf("%s:%d", k, m[k]))
-	}
-	return "{" + strings.Join(parts, " ") + "}"
-}
-
-// ----- panel, diff, ui helpers -----
-
-func diffKeys(a, b []merkle.Leaf) []string {
-	am := make(map[string][32]byte, len(a))
-	bm := make(map[string][32]byte, len(b))
-	for _, lf := range a {
-		am[lf.Key] = lf.Hash
-	}
-	for _, lf := range b {
-		bm[lf.Key] = lf.Hash
-	}
-	seen := map[string]struct{}{}
-	for k := range am {
-		seen[k] = struct{}{}
-	}
-	for k := range bm {
-		seen[k] = struct{}{}
-	}
-	out := make([]string, 0, len(seen))
-	for k := range seen {
-		if am[k] != bm[k] {
-			out = append(out, k)
+func (ch *CommandHandler) applyNetworkParam(targets []*transport.ChaosEP, param string, args []string, emit func(string)) bool {
+	setAll := func(fn func(*transport.ChaosEP)) {
+		for _, t := range targets {
+			fn(t)
 		}
 	}
-	sort.Strings(out)
-	return out
-}
 
-func shortHex(b []byte, n int) string {
-	const hexdigits = "0123456789abcdef"
-	out := make([]byte, 0, 2*n)
-	for i := 0; i < len(b) && len(out) < 2*n; i++ {
-		out = append(out, hexdigits[b[i]>>4], hexdigits[b[i]&0x0f])
-	}
-	return string(out)
-}
-
-func stringsRepeat(s string, n int) string {
-	var b bytes.Buffer
-	for range n {
-		b.WriteString(s)
-	}
-	return b.String()
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n-1] + "…"
-}
-
-func truncateList(keys []string, max int) string {
-	if len(keys) == 0 {
-		return ""
-	}
-	if len(keys) <= max {
-		return fmt.Sprintf("(%v)", keys)
-	}
-	return fmt.Sprintf("(%v … +%d)", keys[:max], len(keys)-max)
-}
-
-// printFull clears the entire line (y) and prints s from column 1
-func printFull(y int, s string) {
-	fmt.Printf("\x1b[%d;1H\x1b[2K%s", y+1, s)
-}
-
-// printBox prints inside a fixed-width column starting at (x,y) without clearing the other column
-func printBox(x, y, w int, s string) {
-	fmt.Printf("\x1b[%d;%dH", y+1, x+1) // move
-	if visLen(s) > w {
-		s = truncateToWidth(s, w)
-	}
-	fmt.Print(s)
-	if p := w - visLen(s); p > 0 {
-		fmt.Print(stringsRepeat(" ", p))
-	}
-}
-
-// visible length (strip ANSI escape sequences crudely)
-func visLen(s string) int { return len(stripANSI(s)) }
-
-func truncateToWidth(s string, w int) string {
-	if visLen(s) <= w {
-		return s
-	}
-	if w <= 1 {
-		return s[:w]
-	}
-	return s[:w-1] + "…"
-}
-
-func stripANSI(s string) string {
-	out := make([]byte, 0, len(s))
-	inEsc := false
-	for i := range len(s) {
-		c := s[i]
-		if inEsc {
-			if c >= '@' && c <= '~' { // end of CSI
-				inEsc = false
+	switch param {
+	case "up":
+		setAll(func(t *transport.ChaosEP) { t.SetUp(true) })
+		emit("network link up")
+	case "down":
+		setAll(func(t *transport.ChaosEP) { t.SetUp(false) })
+		emit("network link down")
+	case "loss":
+		if len(args) < 1 {
+			emit("usage: net <n> <p> loss <0..1>")
+			return false
+		}
+		p, err := strconv.ParseFloat(args[0], 64)
+		if err != nil || p < 0 || p > 1 {
+			emit("loss must be between 0 and 1")
+			return false
+		}
+		setAll(func(t *transport.ChaosEP) { t.SetLoss(p) })
+		emit(fmt.Sprintf("loss=%.2f", p))
+	case "dup":
+		if len(args) < 1 {
+			emit("usage: net <n> <p> dup <0..1>")
+			return false
+		}
+		p, err := strconv.ParseFloat(args[0], 64)
+		if err != nil || p < 0 || p > 1 {
+			emit("dup must be between 0 and 1")
+			return false
+		}
+		setAll(func(t *transport.ChaosEP) { t.SetDup(p) })
+		emit(fmt.Sprintf("dup=%.2f", p))
+	case "reorder":
+		if len(args) < 1 {
+			emit("usage: net <n> <p> reorder <0..1>")
+			return false
+		}
+		p, err := strconv.ParseFloat(args[0], 64)
+		if err != nil || p < 0 || p > 1 {
+			emit("reorder must be between 0 and 1")
+			return false
+		}
+		setAll(func(t *transport.ChaosEP) { t.SetReorder(p) })
+		emit(fmt.Sprintf("reorder=%.2f", p))
+	case "delay":
+		if len(args) < 1 {
+			emit("usage: net <n> <p> delay <base> [jitter]")
+			return false
+		}
+		base, err := time.ParseDuration(args[0])
+		if err != nil {
+			emit("bad duration (e.g. 80ms)")
+			return false
+		}
+		jit := time.Duration(0)
+		if len(args) >= 2 {
+			jit, err = time.ParseDuration(args[1])
+			if err != nil {
+				emit("bad jitter duration (e.g. 20ms)")
+				return false
 			}
+		}
+		setAll(func(t *transport.ChaosEP) {
+			t.SetBaseDelay(base)
+			t.SetJitter(jit)
+		})
+		emit(fmt.Sprintf("delay base=%s jitter=%s", base, jit))
+	default:
+		emit("unknown network parameter")
+		return false
+	}
+	return false
+}
+
+func (ch *CommandHandler) showStats(emit func(string)) {
+	nodes := ch.nodeMgr.GetNodes()
+	stats := fmt.Sprintf("Nodes: %d | ", len(nodes))
+
+	for i, node := range nodes {
+		if i > 0 {
+			stats += " | "
+		}
+		status := "healthy"
+		if node.Node.IsPaused() {
+			status = "paused"
+		} else if !node.Node.IsConnected() {
+			status = "disconnected"
+		}
+		stats += fmt.Sprintf("%s:%s", node.Name, status)
+	}
+
+	emit(stats)
+}
+
+func (ch *CommandHandler) parseNodeIndex(s string) (int, error) {
+	// Support both numeric and letter-based node selection
+	if s == "a" || s == "0" {
+		return 0, nil
+	}
+	if s == "b" || s == "1" {
+		return 1, nil
+	}
+	if s == "c" || s == "2" {
+		return 2, nil
+	}
+	if s == "d" || s == "3" {
+		return 3, nil
+	}
+	if s == "e" || s == "4" {
+		return 4, nil
+	}
+	if s == "f" || s == "5" {
+		return 5, nil
+	}
+	if s == "g" || s == "6" {
+		return 6, nil
+	}
+	if s == "h" || s == "7" {
+		return 7, nil
+	}
+	if s == "i" || s == "8" {
+		return 8, nil
+	}
+	if s == "j" || s == "9" {
+		return 9, nil
+	}
+
+	// Try parsing as number
+	if i, err := strconv.Atoi(s); err == nil {
+		return i, nil
+	}
+
+	return 0, fmt.Errorf("invalid node identifier: %s (use 0-9 or a-j)", s)
+}
+
+// handleDump writes leaf hashes for node <idx> or all nodes
+func (ch *CommandHandler) handleDump(parts []string, emit func(string)) bool {
+	nodes := ch.nodeMgr.GetNodes()
+	which := -1
+	if len(parts) >= 2 {
+		if idx, err := ch.parseNodeIndex(parts[1]); err == nil {
+			which = idx
+		}
+	}
+	ts := time.Now().Format("20060102-150405")
+	count := 0
+	for i, s := range nodes {
+		if which >= 0 && i != which {
 			continue
 		}
-		if c == 0x1b {
-			inEsc = true
+		view := materialize.Snapshot(s.Node.Log)
+		leaves := materialize.LeavesFromSnapshot(view)
+		out := make([]map[string]string, 0, len(leaves))
+		for k := 0; k < len(leaves) && k < 2000; k++ {
+			out = append(out, map[string]string{"key": leaves[k].Key, "hash": shortHex(leaves[k].Hash[:], 8)})
+		}
+		fname := fmt.Sprintf("logs/leafdump-%s-node%s.json", ts, s.Name)
+		if err := writeJSONFile(fname, out); err != nil {
+			emit(fmt.Sprintf("dump error for %s: %v", s.Name, err))
 			continue
 		}
-		out = append(out, c)
+		count++
 	}
-	return string(out)
-}
-
-func clearScreen() { fmt.Print("\x1b[2J\x1b[H") }
-
-func installUI() {
-	// fmt.Print("\x1b[?1049h")   // ALT SCREEN ON
-	fmt.Print("\x1b[?25l")     // hide cursor
-	fmt.Print("\x1b[H\x1b[2J") // home + clear
-}
-
-// leave alt screen + show cursor + reset attrs
-func restoreUI() {
-	fmt.Print("\x1b[0m")   // reset SGR
-	fmt.Print("\x1b[?25h") // show cursor
-	// fmt.Print("\x1b[?1049l\n") // ALT SCREEN OFF (restores previous screen)
-}
-
-func onOff(b bool) string {
-	if b {
-		return colorize("up", clrGreen)
+	if count == 0 {
+		emit("no nodes to dump")
+	} else {
+		emit(fmt.Sprintf("dumped %d node(s)", count))
 	}
-	return colorize("down", clrRed)
+	return false
 }
 
-func colorize(s, color string) string { return color + s + clrReset }
+// ============================================================================
+// Writer and Network Simulation
+// ============================================================================
 
-func ifThen[T any](cond bool, a, b T) T {
-	if cond {
-		return a
-	}
-	return b
-}
-
-func atoiSafe(s string) int {
-	n := 0
-	for _, r := range s {
-		if r >= '0' && r <= '9' {
-			n = n*10 + int(r-'0')
-		} else {
-			break
+// writerLoop generates random writes to a node at specified intervals
+func writerLoop(ctx context.Context, s *SimNode, mean time.Duration) {
+	lambda := 1.0 / mean.Seconds()
+	for {
+		// exponential backoff for Poisson process
+		sleep := time.Duration(rand.ExpFloat64()/lambda*1e9) * time.Nanosecond
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(sleep):
+			k := generateRandomKey()
+			v := fmt.Sprintf("v%d", rand.Intn(1000))
+			s.Node.Put(k, []byte(v), s.Actor)
 		}
 	}
-	return n
 }
 
-func randKey() string {
-	const letters = "ABCDEFGH"
-	i := time.Now().UnixNano() % int64(len(letters))
-	return string(letters[i])
-}
-
-func maxInt(a, b int) int {
-	if a > b {
-		return a
+// flapLoop periodically drops one ring link (i <-> i+1) then restores it.
+func flapLoop(ctx context.Context, nodes []*SimNode, meanPeriod, down time.Duration) {
+	if meanPeriod <= 0 || down <= 0 {
+		return
 	}
-	return b
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func healthLabel(n *node.Node) string {
-	if n.IsPaused() {
-		return colorize("suspect", clrRed)
-	}
-	return colorize("healthy", clrGreen)
-}
-
-func diffSegments(a, b map[segment.ID][32]byte) []segment.ID {
-	seen := map[segment.ID]struct{}{}
-	for sid := range a {
-		seen[sid] = struct{}{}
-	}
-	for sid := range b {
-		seen[sid] = struct{}{}
-	}
-	out := make([]segment.ID, 0, len(seen))
-	for sid := range seen {
-		if a[sid] != b[sid] {
-			out = append(out, sid)
+	lambda := 1.0 / meanPeriod.Seconds()
+	n := len(nodes)
+	for {
+		// next failure time ~ Exp(meanPeriod)
+		sleep := time.Duration(rand.ExpFloat64()/lambda*1e9) * time.Nanosecond
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(sleep):
+			i := rand.Intn(n)
+			j := (i + 1) % n
+			// simulate link down between i and j
+			nodes[i].Node.SetConnected(false)
+			nodes[j].Node.SetConnected(false)
+			time.Sleep(down)
+			nodes[i].Node.SetConnected(true)
+			nodes[j].Node.SetConnected(true)
 		}
 	}
-	slices.Sort(out)
-	return out
 }
 
-func truncateSegList(sids []segment.ID, max int) string {
-	if len(sids) == 0 {
-		return ""
-	}
-	if len(sids) <= max {
-		return fmt.Sprintf("(%v)", sids)
-	}
-	head := make([]segment.ID, len(sids[:max]))
-	copy(head, sids[:max])
-	return fmt.Sprintf("(%v … +%d)", head, len(sids)-max)
+// ============================================================================
+// Bubble Tea TUI Model
+// ============================================================================
+
+type tuiModel struct {
+	nodeMgr    *NodeManager
+	eventMgr   *EventManager
+	cmdHandler *CommandHandler
+	logs       *LogsManager
+
+	// UI components
+	nodesTable table.Model
+	eventsView viewport.Model
+	wireView   viewport.Model
+	cmdView    viewport.Model
+	input      string
+
+	// State
+	width  int
+	height int
 }
 
-func parseFloat(s string) float64 {
-	f := 0.0
-	sign := 1.0
-	if strings.HasPrefix(s, "-") {
-		sign = -1
-		s = s[1:]
+func initialModel(nodeMgr *NodeManager, eventMgr *EventManager, cmdHandler *CommandHandler, logs *LogsManager) tuiModel {
+	// Initialize table
+	columns := []table.Column{
+		{Title: "ID", Width: 3},
+		{Title: "Status", Width: 10},
+		{Title: "Link", Width: 6},
+		{Title: "Paused", Width: 6},
+		{Title: "Keys", Width: 6},
+		{Title: "Root", Width: 12},
+		{Title: "Port", Width: 6},
 	}
-	for _, r := range s {
-		if r == '.' {
-			break
-		} // keep it simple; you can use strconv if you prefer
-		if r >= '0' && r <= '9' {
-			f = f*10 + float64(r-'0')
-		} else {
-			break
+
+	t := table.New(
+		table.WithColumns(columns),
+		table.WithFocused(true),
+		table.WithHeight(5), // Start with a reasonable height
+	)
+
+	// Style the table
+	s := table.DefaultStyles()
+	s.Header = s.Header.
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		BorderBottom(true).
+		Bold(true)
+	s.Selected = s.Selected.
+		Foreground(lipgloss.Color("229")).
+		Background(lipgloss.Color("57")).
+		Bold(false)
+	t.SetStyles(s)
+
+	// Initialize viewports without inner borders (outer panels will provide borders)
+	eventsVP := viewport.New(80, 10)
+	eventsVP.Style = lipgloss.NewStyle()
+
+	wireVP := viewport.New(80, 10)
+	wireVP.Style = lipgloss.NewStyle()
+
+	cmdVP := viewport.New(80, 10)
+	cmdVP.Style = lipgloss.NewStyle()
+
+	return tuiModel{
+		nodeMgr:    nodeMgr,
+		eventMgr:   eventMgr,
+		cmdHandler: cmdHandler,
+		logs:       logs,
+		nodesTable: t,
+		eventsView: eventsVP,
+		wireView:   wireVP,
+		cmdView:    cmdVP,
+		input:      "",
+		width:      120, // Default width
+		height:     30,  // Default height
+	}
+}
+
+func (m tuiModel) Init() tea.Cmd {
+	return tea.Batch(
+		tea.EnterAltScreen,
+		tea.SetWindowTitle("MAEP Sync TUI"),
+		tea.Tick(time.Millisecond*100, func(t time.Time) tea.Msg {
+			return tickMsg(t)
+		}),
+	)
+}
+
+// tickMsg is a message sent on a timer
+type tickMsg time.Time
+
+func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "q":
+			return m, tea.Quit
+		case "enter":
+			if m.input != "" {
+				before := takeSnapshot(m.nodeMgr)
+				quit := m.cmdHandler.HandleCommand(m.input)
+				after := takeSnapshot(m.nodeMgr)
+				if m.logs != nil {
+					m.logs.LogCommand(m.input, before, after, time.Now())
+				}
+				if quit {
+					return m, tea.Quit
+				}
+				m.input = ""
+			}
+		case "backspace":
+			if len(m.input) > 0 {
+				m.input = m.input[:len(m.input)-1]
+			}
+		default:
+			if len(msg.String()) == 1 && msg.String()[0] >= 32 && msg.String()[0] <= 126 {
+				m.input += msg.String()
+			}
+		}
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.updateLayout()
+	case tickMsg:
+		m.updateData()
+		return m, tea.Tick(time.Millisecond*100, func(t time.Time) tea.Msg {
+			return tickMsg(t)
+		})
+	}
+
+	// Update table
+	m.nodesTable, cmd = m.nodesTable.Update(msg)
+
+	return m, cmd
+}
+
+func (m tuiModel) View() string {
+	// Header
+	header := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("63")).
+		Render("MAEP Sync TUI") +
+		lipgloss.NewStyle().
+			Foreground(lipgloss.Color("240")).
+			Render(fmt.Sprintf(" — %s", time.Now().Format("15:04:05")))
+
+	// Status line
+	nodes := m.nodeMgr.GetNodes()
+	status := "IN SYNC"
+	statusColor := lipgloss.Color("10")
+
+	if len(nodes) >= 2 {
+		// Check if all nodes are in sync
+		roots := make([][32]byte, len(nodes))
+		for i, node := range nodes {
+			view := materialize.Snapshot(node.Node.Log)
+			leaves := materialize.LeavesFromSnapshot(view)
+			roots[i] = merkle.Build(leaves)
+		}
+
+		allInSync := true
+		for i := 1; i < len(roots); i++ {
+			if roots[i] != roots[0] {
+				allInSync = false
+				break
+			}
+		}
+
+		if !allInSync {
+			status = "OUT OF SYNC"
+			statusColor = lipgloss.Color("9")
 		}
 	}
-	return f * sign
+
+	statusLine := lipgloss.NewStyle().
+		Foreground(statusColor).
+		Bold(true).
+		Render(status) +
+		lipgloss.NewStyle().
+			Foreground(lipgloss.Color("240")).
+			Render(fmt.Sprintf(" | Nodes: %d", len(nodes)))
+
+	// Update table data
+	m.updateTableData()
+
+	// Calculate available space
+	availableHeight := m.height - 8                     // Reserve space for header, status, input, etc.
+	tableHeight := min(len(nodes)+2, availableHeight/2) // Table takes half the available space
+	if tableHeight < 3 {
+		tableHeight = 3
+	}
+	viewportHeight := max(5, availableHeight-tableHeight-2) // Remaining space for viewports
+
+	// Update table height
+	m.nodesTable.SetHeight(tableHeight)
+
+	// Prepare panel style with minimal padding
+	panelStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("62"))
+	// No padding to maximize content area
+	// .Padding(0, 0) is default; ensure no padding applied
+
+	availableWidth := m.width - 4 // Account for some margin
+	if availableWidth < 60 {
+		availableWidth = 60
+	}
+	// Allocate widths: wire=12.5%, events=50%, cmds=rest (~37.5%)
+	wireW := max(12, availableWidth/8)
+	eventsW := availableWidth / 2
+	cmdW := availableWidth - wireW - eventsW
+	// Ensure reasonable minimums
+	if wireW < 14 {
+		wireW = 14
+	}
+	if eventsW < 24 {
+		eventsW = 24
+	}
+	if cmdW < 24 {
+		cmdW = 24
+	}
+
+	// Calculate inner content widths subtracting frame (border only)
+	hFrame, _ := panelStyle.GetFrameSize()
+	wireContentW := wireW - hFrame
+	eventsContentW := eventsW - hFrame
+	cmdContentW := cmdW - hFrame
+	if wireContentW < 8 {
+		wireContentW = 8
+	}
+	if eventsContentW < 10 {
+		eventsContentW = 10
+	}
+	if cmdContentW < 10 {
+		cmdContentW = 10
+	}
+
+	// Size viewports (events and wire existing, add commands viewport)
+	m.eventsView.Width = eventsContentW
+	m.eventsView.Height = viewportHeight
+	m.wireView.Width = wireContentW
+	m.wireView.Height = viewportHeight
+	m.cmdView.Width = cmdContentW
+	m.cmdView.Height = viewportHeight
+
+	// Build panels
+	wirePanel := panelStyle.
+		Width(wireW).
+		Height(viewportHeight + 1).
+		Render(lipgloss.NewStyle().Bold(true).Render("Wire") + "\n" + m.wireView.View())
+
+	// Events content already in eventsView
+	eventsPanel := panelStyle.
+		Width(eventsW).
+		Height(viewportHeight + 1).
+		Render(lipgloss.NewStyle().Bold(true).Render("Events") + "\n" + m.eventsView.View())
+
+	// Commands: render from cmd log into cmdView
+	cmds := m.eventMgr.GetCmdLog()
+	var cb strings.Builder
+	for i := len(cmds) - 1; i >= 0 && i >= len(cmds)-200; i-- {
+		cb.WriteString(formatEvent(cmds[i]))
+		cb.WriteByte('\n')
+	}
+	m.cmdView.SetContent(cb.String())
+	cmdPanel := panelStyle.
+		Width(cmdW).
+		Height(viewportHeight + 1).
+		Render(lipgloss.NewStyle().Bold(true).Render("Commands") + "\n" + m.cmdView.View())
+
+	doc := strings.Builder{}
+	doc.WriteString(header)
+	doc.WriteString("\n")
+	doc.WriteString(statusLine)
+	doc.WriteString("\n\n")
+
+	// Nodes table
+	doc.WriteString(lipgloss.NewStyle().Bold(true).Render("Nodes:"))
+	doc.WriteString("\n")
+	doc.WriteString(m.nodesTable.View())
+	doc.WriteString("\n\n")
+
+	// Panels: title + viewport content inside bordered boxes
+	doc.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, wirePanel, eventsPanel, cmdPanel))
+	doc.WriteString("\n\n")
+
+	// Input line
+	inputLine := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("63")).
+		Bold(true).
+		Render("> ") + m.input + "_"
+	doc.WriteString(inputLine)
+
+	return doc.String()
+}
+
+func (m *tuiModel) updateLayout() {
+	// Adjust table height based on available space and number of nodes
+	nodes := m.nodeMgr.GetNodes()
+	availableHeight := m.height - 8 // Reserve space for header, status, input, etc.
+
+	// Table should show all nodes plus header
+	tableHeight := min(len(nodes)+2, availableHeight/2)
+	if tableHeight < 3 {
+		tableHeight = 3 // Minimum height for table
+	}
+
+	m.nodesTable.SetHeight(tableHeight)
+
+	// Update viewport heights
+	viewportHeight := max(5, availableHeight-tableHeight-2)
+	m.eventsView.Height = viewportHeight
+	m.wireView.Height = viewportHeight
+	m.cmdView.Height = viewportHeight
+}
+
+func (m *tuiModel) updateData() {
+	// Update table data
+	m.updateTableData()
+
+	// Drain any pending events into buffers
+	for {
+		select {
+		case e := <-m.eventMgr.GetEventChannel():
+			m.eventMgr.AddEvent(e)
+		default:
+			goto drained
+		}
+	}
+
+drained:
+	// Update viewport content (no headers here; titles are rendered in panels)
+	events := m.eventMgr.GetEvents()
+	wireLog := m.eventMgr.GetWireLog()
+
+	var b strings.Builder
+	for i := len(events) - 1; i >= 0 && i >= len(events)-200; i-- {
+		b.WriteString(formatEvent(events[i]))
+		b.WriteByte('\n')
+	}
+	m.eventsView.SetContent(b.String())
+
+	b.Reset()
+	for i := len(wireLog) - 1; i >= 0 && i >= len(wireLog)-200; i-- {
+		b.WriteString(formatWireEvent(wireLog[i]))
+		b.WriteByte('\n')
+	}
+	m.wireView.SetContent(b.String())
+
+	// Update command view
+	cmds := m.eventMgr.GetCmdLog()
+	var cb strings.Builder
+	for i := len(cmds) - 1; i >= 0 && i >= len(cmds)-200; i-- {
+		cb.WriteString(formatEvent(cmds[i]))
+		cb.WriteByte('\n')
+	}
+	m.cmdView.SetContent(cb.String())
+}
+
+func (m *tuiModel) updateTableData() {
+	nodes := m.nodeMgr.GetNodes()
+	rows := make([]table.Row, len(nodes))
+
+	for i, node := range nodes {
+		// Get node status
+		status := "healthy"
+		if node.Node.IsPaused() {
+			status = "paused"
+		} else if !node.Node.IsConnected() {
+			status = "disconnected"
+		}
+
+		// Get node data
+		view := materialize.Snapshot(node.Node.Log)
+		leaves := materialize.LeavesFromSnapshot(view)
+		root := merkle.Build(leaves)
+
+		// Count keys
+		keyCount := 0
+		for _, state := range view {
+			if state.Present {
+				keyCount++
+			}
+		}
+
+		rows[i] = table.Row{
+			node.Name,
+			status,
+			ifThen(node.Node.IsConnected(), "up", "down"),
+			ifThen(node.Node.IsPaused(), "yes", "no"),
+			fmt.Sprintf("%d", keyCount),
+			shortHex(root[:], 8),
+			fmt.Sprintf("%d", node.Port),
+		}
+	}
+
+	m.nodesTable.SetRows(rows)
+}
+
+func main() {
+	// Parse and validate configuration
+	cfg := parseFlags()
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("Configuration error: %v", err)
+	}
+	// Silence node slog to avoid corrupting TUI on bursts
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	// Create managers
+	nodeMgr := NewNodeManager(cfg)
+	eventMgr := NewEventManager(4096)
+	cmdHandler := NewCommandHandler(nodeMgr, eventMgr)
+
+	// Create logs manager
+	logs, err := NewLogsManager("logs")
+	if err != nil {
+		log.Fatalf("Failed to init logs: %v", err)
+	}
+	defer logs.Close()
+
+	// Create nodes
+	if err := nodeMgr.CreateNodes(); err != nil {
+		log.Fatalf("Failed to create nodes: %v", err)
+	}
+	if err := nodeMgr.StartNodes(); err != nil {
+		log.Fatalf("Failed to start nodes: %v", err)
+	}
+	defer nodeMgr.StopNodes()
+
+	// Forward node events to memory and disk
+	nodes := nodeMgr.GetNodes()
+	for _, sn := range nodes {
+		ch := sn.Node.GetEvents()
+		go func(ch <-chan node.Event) {
+			for e := range ch {
+				eventMgr.AddEvent(e)
+				if e.Type == node.EventWire {
+					logs.LogWire(e.Node, e.Fields, e.Time)
+				} else {
+					logs.LogEvent(e.Node, string(e.Type), e.Fields, e.Time)
+				}
+			}
+		}(ch)
+	}
+
+	// Run TUI
+	p := tea.NewProgram(initialModel(nodeMgr, eventMgr, cmdHandler, logs))
+	if _, err := p.Run(); err != nil {
+		log.Fatalf("TUI error: %v", err)
+	}
 }
