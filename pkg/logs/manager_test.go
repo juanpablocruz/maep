@@ -1,0 +1,61 @@
+package logs
+
+import (
+	"bytes"
+	"log"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/juanpablocruz/maep/pkg/engine"
+	"github.com/juanpablocruz/maep/pkg/eventbus"
+	"github.com/juanpablocruz/maep/pkg/testutils"
+)
+
+func Test_LogManager_EventBus_Integration(t *testing.T) {
+	// Create EventBus
+	bus := eventbus.NewEventBus()
+
+	// Create a buffer to capture log output
+	var buf bytes.Buffer
+	logger := log.New(&buf, "", 0)
+
+	// Create LogManager and start it
+	logManager := NewLogManager(logger)
+	logManager.Start(bus)
+
+	// Create and publish different types of events
+	op := testutils.GenerateOp("test-key", "test-value", engine.OpPut)
+
+	opEvent := &engine.OpEvent{Op: &op}
+	bus.Publish(opEvent)
+
+	// Create a custom event
+	customEvent := &CustomEvent{Message: "Hello World"}
+	bus.Publish(customEvent)
+
+	// Wait for both events to be processed
+	logManager.WaitForProcessing()
+
+	// Add a small delay to ensure all events are processed
+	// This is needed because the EventBus publishes synchronously
+	// and there might be a small timing issue
+	time.Sleep(10 * time.Millisecond)
+
+	// Check that both events were logged
+	logOutput := buf.String()
+	t.Logf("Log output: %s", logOutput)
+	t.Logf("Log output lines: %d", strings.Count(logOutput, "\n"))
+
+	if !strings.Contains(logOutput, "OpEvent") {
+		t.Errorf("Expected log to contain OpEvent")
+	}
+
+	if !strings.Contains(logOutput, "CustomEvent") {
+		t.Errorf("Expected log to contain CustomEvent")
+	}
+
+	if !strings.Contains(logOutput, "Hello World") {
+		t.Errorf("Expected log to contain custom event message")
+	}
+}
