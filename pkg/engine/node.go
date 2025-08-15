@@ -79,10 +79,11 @@ func NewNode(bus *eventbus.EventBus, opts *NodeOptions) *Node {
 		opts.MerkleFanout = &defaultFanout
 	}
 
+	opsLog := NewOpLog()
 	node := &Node{
-		ops:     NewOpLog(),
+		ops:     opsLog,
 		ch:      make(chan eventbus.Event),
-		m:       NewMerkle(*opts.MerkleFanout, *opts.MerkleDepth),
+		m:       NewMerkle(*opts.MerkleFanout, *opts.MerkleDepth, opsLog.GetOpLogEntriesFrom),
 		HLC:     NewHLC(0, 0),
 		drainCh: make(chan struct{}, 100),
 		SV:      make(SV),

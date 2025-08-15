@@ -11,6 +11,7 @@ type LogManager struct {
 	subscriber *LogSubscriber
 	ch         chan eventbus.Event
 	started    bool
+	mu         sync.RWMutex // Protect started field
 	wg         sync.WaitGroup
 }
 
@@ -22,6 +23,9 @@ func NewLogManager(logger *log.Logger) *LogManager {
 }
 
 func (lm *LogManager) Start(bus *eventbus.EventBus) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
 	if lm.started {
 		return
 	}

@@ -249,7 +249,7 @@ func Test_Node_SummaryRound_DifferentOrder_SameRoot(t *testing.T) {
 	B.WaitForProcessing()
 
 	// Verify that despite different insertion order, roots are equal
-	require.Equal(t, A.m.root, B.m.root, "Roots should be equal despite different operation order")
+	require.Equal(t, A.m.root.Hash, B.m.root.Hash, "Roots should be equal despite different operation order")
 
 	// Perform SummaryRound from A to B
 	leavesAtoB, err := A.SummaryRound(B)

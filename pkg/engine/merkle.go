@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"iter"
+	"sync"
 )
 
 // fixed-fanout k-ary Merkle
@@ -48,10 +49,12 @@ type Merkle struct {
 	Depth  uint8
 	Fanout uint32
 	root   *MerkleNode
+	mu     sync.RWMutex
+	getOps func(low, high OpCannonicalKey) iter.Seq2[OpCannonicalKey, *OpLogEntry]
 }
 
-func NewMerkle(fanout uint32, depth uint8) *Merkle {
-	m := &Merkle{Depth: depth, Fanout: fanout}
+func NewMerkle(fanout uint32, depth uint8, getOps func(low, high OpCannonicalKey) iter.Seq2[OpCannonicalKey, *OpLogEntry]) *Merkle {
+	m := &Merkle{Depth: depth, Fanout: fanout, getOps: getOps}
 	m.root = NewMerkleNode(false, nil, fanout)
 	return m
 }
@@ -124,9 +127,19 @@ func (m *Merkle) Append(e OpLogEntry) {
 		leaf.LastK = e.key
 	}
 
+	// Recompute hash: we need to fetch all the OpLogEntry that are in this leaf, add the new
+	// one, sort them, and then recompute the hash.
+
+	allOps := []*OpLogEntry{}
+
+	for _, op := range m.getOps(leaf.LastK, e.key) {
+		allOps = append(allOps, op)
+	}
+
 	h := sha256.New()
-	h.Write(leaf.Hash[:])
-	h.Write(e.hash[:])
+	for _, op := range allOps {
+		h.Write(op.hash[:])
+	}
 	copy(leaf.Hash[:], h.Sum(nil))
 
 	// bubble up hash

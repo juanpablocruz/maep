@@ -119,3 +119,25 @@ func (o *OpLog) GetFrom(frontier Frontier) iter.Seq2[OpCannonicalKey, *OpLogEntr
 		}
 	}
 }
+
+func (o *OpLog) GetOpLogEntriesFrom(low, high OpCannonicalKey) iter.Seq2[OpCannonicalKey, *OpLogEntry] {
+	return func(yield func(OpCannonicalKey, *OpLogEntry) bool) {
+		o.mu.RLock()
+		// Create a copy of the order slice to avoid holding the lock during iteration
+		orderCopy := make([]OpLogEntry, len(o.order))
+		copy(orderCopy, o.order)
+		o.mu.RUnlock()
+
+		for _, entry := range orderCopy {
+			if bytes.Compare(entry.key[:], low[:]) < 0 {
+				continue
+			}
+			if bytes.Compare(entry.key[:], high[:]) > 0 {
+				break
+			}
+			if !yield(entry.key, &entry) {
+				return
+			}
+		}
+	}
+}

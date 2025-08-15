@@ -2,8 +2,36 @@ package engine
 
 import (
 	"bytes"
+	"iter"
 	"testing"
 )
+
+// Mock getOps function for testing - maintains a map of entries and returns them when requested
+type mockGetOpsFunc struct {
+	entries map[OpCannonicalKey]*OpLogEntry
+}
+
+func newMockGetOps() *mockGetOpsFunc {
+	return &mockGetOpsFunc{
+		entries: make(map[OpCannonicalKey]*OpLogEntry),
+	}
+}
+
+func (m *mockGetOpsFunc) getOps(low, high OpCannonicalKey) iter.Seq2[OpCannonicalKey, *OpLogEntry] {
+	return func(yield func(OpCannonicalKey, *OpLogEntry) bool) {
+		for key, entry := range m.entries {
+			if bytes.Compare(key[:], low[:]) >= 0 && bytes.Compare(key[:], high[:]) <= 0 {
+				if !yield(key, entry) {
+					return
+				}
+			}
+		}
+	}
+}
+
+func (m *mockGetOpsFunc) addEntry(entry OpLogEntry) {
+	m.entries[entry.key] = &entry
+}
 
 // Helper function to create a prefix from a key at a given depth
 func MakePrefix(K []byte, depth uint8) Prefix {
@@ -36,11 +64,14 @@ func makeKeyWithNybble(nybble int, position uint8) OpCannonicalKey {
 }
 
 func Test_Merkle_GetLeaf(t *testing.T) {
-	m := NewMerkle(16, 4)
+	mock := newMockGetOps()
+	m := NewMerkle(16, 4, mock.getOps)
 
 	op := generateOp("key", "value", OpPut)
 	K := op.CanonicalKey()
-	m.Append(OpLogEntry{key: K, hash: op.Hash(), op: &op})
+	entry := OpLogEntry{key: K, hash: op.Hash(), op: &op}
+	mock.addEntry(entry)
+	m.Append(entry)
 
 	leaf := m.GetLeaf(K[:])
 	t.Logf("leaf: %+v", leaf)
@@ -102,7 +133,8 @@ func Test_U_MER_nyb_001(t *testing.T) {
 
 // nodeat at empty tree
 func Test_U_MER_nodeat_001(t *testing.T) {
-	m := NewMerkle(16, 4)
+	mock := newMockGetOps()
+	m := NewMerkle(16, 4, mock.getOps)
 	p := Prefix{Path: []byte{0x23}, Depth: 1}
 	node := m.NodeAt(p)
 	if node != nil {
@@ -113,7 +145,8 @@ func Test_U_MER_nodeat_001(t *testing.T) {
 // nodeat never allocates
 // call NodeAt on missing path, verify child pointers remain nil
 func Test_U_MER_nodeat_002(t *testing.T) {
-	m := NewMerkle(16, 4)
+	mock := newMockGetOps()
+	m := NewMerkle(16, 4, mock.getOps)
 	p := Prefix{Path: []byte{0x23, 0x45}, Depth: 2}
 	node := m.NodeAt(p)
 	if node != nil {
@@ -124,7 +157,8 @@ func Test_U_MER_nodeat_002(t *testing.T) {
 // getleaf allocates path
 // getleaf(k) on empty tree creates Depth nodes, all indexes along K non-nil, returns leaf
 func Test_U_MER_getleaf_001(t *testing.T) {
-	m := NewMerkle(16, 2)
+	mock := newMockGetOps()
+	m := NewMerkle(16, 2, mock.getOps)
 	K := OpCannonicalKey{0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}
 	leaf := m.GetLeaf(K[:])
 	if leaf == nil {
@@ -186,7 +220,8 @@ func Test_U_MER_nyb_000(t *testing.T) {
 
 // U-MER-nodeat-001: NodeAt on empty tree (updated)
 func Test_U_MER_nodeat_001_updated(t *testing.T) {
-	m := NewMerkle(16, 4)
+	mock := newMockGetOps()
+	m := NewMerkle(16, 4, mock.getOps)
 
 	// Test root prefix
 	rootPrefix := MakePrefix([]byte{0x12, 0x34, 0x56, 0x78}, 0)
@@ -208,7 +243,8 @@ func Test_U_MER_nodeat_001_updated(t *testing.T) {
 
 // U-MER-getleaf-003: GetLeaf allocates path
 func Test_U_MER_getleaf_003(t *testing.T) {
-	m := NewMerkle(4, 2)
+	mock := newMockGetOps()
+	m := NewMerkle(4, 2, mock.getOps)
 	K := OpCannonicalKey{0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}
 
 	// GetLeaf should create the path
@@ -235,7 +271,8 @@ func Test_U_MER_getleaf_003(t *testing.T) {
 
 // U-MER-append-010: append increments leaf count and updates LastK
 func Test_U_MER_append_010(t *testing.T) {
-	m := NewMerkle(16, 4)
+	mock := newMockGetOps()
+	m := NewMerkle(16, 4, mock.getOps)
 
 	// Create two ops with different keys
 	op1 := generateOp("key1", "value1", OpPut)
@@ -251,6 +288,7 @@ func Test_U_MER_append_010(t *testing.T) {
 
 	// Append first op
 	entry1 := OpLogEntry{key: K1, hash: op1.Hash(), op: &op1}
+	mock.addEntry(entry1)
 	m.Append(entry1)
 
 	// Get the leaf and verify count
@@ -264,6 +302,7 @@ func Test_U_MER_append_010(t *testing.T) {
 
 	// Append second op
 	entry2 := OpLogEntry{key: K2, hash: op2.Hash(), op: &op2}
+	mock.addEntry(entry2)
 	m.Append(entry2)
 
 	// Verify count and LastK
@@ -277,7 +316,8 @@ func Test_U_MER_append_010(t *testing.T) {
 
 // U-MER-append-011: streaming leaf hash changes
 func Test_U_MER_append_011(t *testing.T) {
-	m := NewMerkle(16, 4)
+	mock := newMockGetOps()
+	m := NewMerkle(16, 4, mock.getOps)
 
 	op1 := generateOp("key1", "value1", OpPut)
 	op2 := generateOp("key2", "value2", OpPut)
@@ -287,12 +327,14 @@ func Test_U_MER_append_011(t *testing.T) {
 
 	// Append first op and capture hash
 	entry1 := OpLogEntry{key: K1, hash: op1.Hash(), op: &op1}
+	mock.addEntry(entry1)
 	m.Append(entry1)
 	leaf := m.GetLeaf(K1[:])
 	hash1 := leaf.Hash
 
 	// Append second op and verify hash changed
 	entry2 := OpLogEntry{key: K2, hash: op2.Hash(), op: &op2}
+	mock.addEntry(entry2)
 	m.Append(entry2)
 	hash2 := leaf.Hash
 
@@ -302,6 +344,7 @@ func Test_U_MER_append_011(t *testing.T) {
 
 	// Append same op again (current behavior: duplicates are allowed)
 	leafBefore := *leaf
+	mock.addEntry(entry1)
 	m.Append(entry1)
 	leafAfter := *leaf
 
@@ -316,7 +359,8 @@ func Test_U_MER_append_011(t *testing.T) {
 
 // U-MER-bubble-012: internal hash bubbles up
 func Test_U_MER_bubble_012(t *testing.T) {
-	m := NewMerkle(4, 2)
+	mock := newMockGetOps()
+	m := NewMerkle(4, 2, mock.getOps)
 
 	// Create a key that will go to a specific child
 	K := makeKeyWithNybble(1, 0) // This will go to child 1 at root level
@@ -338,6 +382,7 @@ func Test_U_MER_bubble_012(t *testing.T) {
 	siblingHashBefore := parent.Children[siblingIndex].Hash
 
 	// Append the op
+	mock.addEntry(entry)
 	m.Append(entry)
 
 	// Verify parent hash changed
@@ -359,7 +404,8 @@ func Test_U_MER_bubble_012(t *testing.T) {
 
 // U-MER-sum-020: Summarize root on empty → all ZERO_HASH
 func Test_U_MER_sum_020(t *testing.T) {
-	m := NewMerkle(4, 2)
+	mock := newMockGetOps()
+	m := NewMerkle(4, 2, mock.getOps)
 
 	kids, ok := m.Summarize(MakePrefix([]byte{0x12, 0x34}, 0))
 	if !ok {
@@ -380,7 +426,8 @@ func Test_U_MER_sum_020(t *testing.T) {
 
 // U-MER-sum-021: Summarize invalid depth
 func Test_U_MER_sum_021(t *testing.T) {
-	m := NewMerkle(4, 2)
+	mock := newMockGetOps()
+	m := NewMerkle(4, 2, mock.getOps)
 
 	// Test depth > m.Depth
 	invalidPrefix := MakePrefix([]byte{0x12, 0x34, 0x56}, 3) // depth = 3, m.Depth = 2
@@ -395,7 +442,8 @@ func Test_U_MER_sum_021(t *testing.T) {
 
 // U-MER-sum-022: Summarize on populated branch
 func Test_U_MER_sum_022(t *testing.T) {
-	m := NewMerkle(4, 2)
+	mock := newMockGetOps()
+	m := NewMerkle(4, 2, mock.getOps)
 
 	// Create ops that hit specific indices
 	op1 := generateOp("key1", "value1", OpPut)
@@ -408,6 +456,8 @@ func Test_U_MER_sum_022(t *testing.T) {
 	entry1 := OpLogEntry{key: K1, hash: op1.Hash(), op: &op1}
 	entry2 := OpLogEntry{key: K2, hash: op2.Hash(), op: &op2}
 
+	mock.addEntry(entry1)
+	mock.addEntry(entry2)
 	m.Append(entry1)
 	m.Append(entry2)
 
@@ -441,9 +491,11 @@ func Test_U_MER_sum_022(t *testing.T) {
 
 // U-MER-det-030: root determinism under different arrival orders
 func Test_U_MER_det_030(t *testing.T) {
-	// Create two trees
-	m1 := NewMerkle(16, 4)
-	m2 := NewMerkle(16, 4)
+	// Create two trees with separate mocks
+	mock1 := newMockGetOps()
+	mock2 := newMockGetOps()
+	m1 := NewMerkle(16, 4, mock1.getOps)
+	m2 := NewMerkle(16, 4, mock2.getOps)
 
 	// Create ops
 	op1 := generateOp("key1", "value1", OpPut)
@@ -462,11 +514,17 @@ func Test_U_MER_det_030(t *testing.T) {
 
 	// Insert in different orders
 	// Tree 1: order 1, 2, 3
+	mock1.addEntry(entry1)
+	mock1.addEntry(entry2)
+	mock1.addEntry(entry3)
 	m1.Append(entry1)
 	m1.Append(entry2)
 	m1.Append(entry3)
 
 	// Tree 2: order 3, 1, 2
+	mock2.addEntry(entry3)
+	mock2.addEntry(entry1)
+	mock2.addEntry(entry2)
 	m2.Append(entry3)
 	m2.Append(entry1)
 	m2.Append(entry2)
@@ -494,9 +552,11 @@ func Test_U_MER_det_030(t *testing.T) {
 
 // U-MER-det-031: summarize determinism
 func Test_U_MER_det_031(t *testing.T) {
-	// Create two trees
-	m1 := NewMerkle(16, 4)
-	m2 := NewMerkle(16, 4)
+	// Create two trees with separate mocks
+	mock1 := newMockGetOps()
+	mock2 := newMockGetOps()
+	m1 := NewMerkle(16, 4, mock1.getOps)
+	m2 := NewMerkle(16, 4, mock2.getOps)
 
 	// Create ops
 	op1 := generateOp("key1", "value1", OpPut)
@@ -514,10 +574,16 @@ func Test_U_MER_det_031(t *testing.T) {
 	entry3 := OpLogEntry{key: K3, hash: op3.Hash(), op: &op3}
 
 	// Insert in different orders
+	mock1.addEntry(entry1)
+	mock1.addEntry(entry2)
+	mock1.addEntry(entry3)
 	m1.Append(entry1)
 	m1.Append(entry2)
 	m1.Append(entry3)
 
+	mock2.addEntry(entry3)
+	mock2.addEntry(entry1)
+	mock2.addEntry(entry2)
 	m2.Append(entry3)
 	m2.Append(entry1)
 	m2.Append(entry2)
@@ -544,9 +610,11 @@ func Test_U_MER_det_031(t *testing.T) {
 
 // U-MER-path-040: single-leaf difference localizes
 func Test_U_MER_path_040(t *testing.T) {
-	// Create two identical trees
-	m1 := NewMerkle(16, 4)
-	m2 := NewMerkle(16, 4)
+	// Create two identical trees with separate mocks
+	mock1 := newMockGetOps()
+	mock2 := newMockGetOps()
+	m1 := NewMerkle(16, 4, mock1.getOps)
+	m2 := NewMerkle(16, 4, mock2.getOps)
 
 	// Create ops
 	op1 := generateOp("key1", "value1", OpPut)
@@ -559,10 +627,16 @@ func Test_U_MER_path_040(t *testing.T) {
 	entry3 := OpLogEntry{key: op3.CanonicalKey(), hash: op3.Hash(), op: &op3}
 
 	// Add same ops to both trees
+	mock1.addEntry(entry1)
+	mock1.addEntry(entry2)
+	mock1.addEntry(entry3)
 	m1.Append(entry1)
 	m1.Append(entry2)
 	m1.Append(entry3)
 
+	mock2.addEntry(entry1)
+	mock2.addEntry(entry2)
+	mock2.addEntry(entry3)
 	m2.Append(entry1)
 	m2.Append(entry2)
 	m2.Append(entry3)
@@ -589,7 +663,8 @@ func Test_U_MER_path_040(t *testing.T) {
 
 // U-MER-fuzz-060: random Ks (fixed seed)
 func Test_U_MER_fuzz_060(t *testing.T) {
-	m := NewMerkle(16, 4)
+	mock := newMockGetOps()
+	m := NewMerkle(16, 4, mock.getOps)
 
 	// Test with a small number of operations
 	for i := range 10 {
@@ -602,6 +677,7 @@ func Test_U_MER_fuzz_060(t *testing.T) {
 		op := generateOp("key", "value", OpPut)
 		entry := OpLogEntry{key: key, hash: op.Hash(), op: &op}
 
+		mock.addEntry(entry)
 		m.Append(entry)
 
 		// Verify Summarize(root) length == fanout
@@ -626,7 +702,8 @@ func Test_U_MER_fuzz_060(t *testing.T) {
 
 // U-MER-leaf-001: Leaves(p) on empty tree
 func Test_U_MER_leaf_001(t *testing.T) {
-	m := NewMerkle(16, 4)
+	mock := newMockGetOps()
+	m := NewMerkle(16, 4, mock.getOps)
 
 	p := MakePrefix([]byte{0x12, 0x34}, 0)
 	leaves := m.Leaves(p)
@@ -644,11 +721,14 @@ func Test_U_MER_leaf_001(t *testing.T) {
 
 // U-MER-leaf-002: Leaves(p) on populated tree
 func Test_U_MER_leaf_002(t *testing.T) {
-	m := NewMerkle(16, 4)
+	mock := newMockGetOps()
+	m := NewMerkle(16, 4, mock.getOps)
 
 	op := generateOp("key", "value", OpPut)
 	K := op.CanonicalKey()
-	m.Append(OpLogEntry{key: K, hash: op.Hash(), op: &op})
+	entry := OpLogEntry{key: K, hash: op.Hash(), op: &op}
+	mock.addEntry(entry)
+	m.Append(entry)
 
 	p := MakePrefix([]byte{0x12, 0x34}, 0)
 	leaves := m.Leaves(p)
