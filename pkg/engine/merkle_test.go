@@ -706,7 +706,7 @@ func Test_U_MER_leaf_001(t *testing.T) {
 	m := NewMerkle(16, 4, mock.getOps)
 
 	p := MakePrefix([]byte{0x12, 0x34}, 0)
-	leaves := m.Leaves(p)
+	leaves := m.LeavesIter(p)
 	if leaves == nil {
 		t.Fatal("expected leaves to be non-nil")
 	}
@@ -714,7 +714,7 @@ func Test_U_MER_leaf_001(t *testing.T) {
 	// Verify that the leaves are empty
 	for _, leaf := range leaves {
 		if leaf != nil {
-			t.Errorf("expected leaf to be nil, got %x", leaf.Hash)
+			t.Errorf("expected leaf to be nil, got %x", leaf.Digest)
 		}
 	}
 }
@@ -731,7 +731,7 @@ func Test_U_MER_leaf_002(t *testing.T) {
 	m.Append(entry)
 
 	p := MakePrefix([]byte{0x12, 0x34}, 0)
-	leaves := m.Leaves(p)
+	leaves := m.LeavesIter(p)
 	if leaves == nil {
 		t.Fatal("expected leaves to be non-nil")
 	}

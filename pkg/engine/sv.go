@@ -10,6 +10,12 @@ type Frontier struct {
 
 type SV map[PeerID][]Frontier
 
+type DeltaPlan struct {
+	Leaf  Prefix
+	FromK OpCannonicalKey
+	Ops   []*OpLogEntry
+}
+
 type SummaryReq struct {
 	Peer   PeerID
 	Prefix Prefix

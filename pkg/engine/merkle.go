@@ -53,6 +53,13 @@ type Merkle struct {
 	getOps func(low, high OpCannonicalKey) iter.Seq2[OpCannonicalKey, *OpLogEntry]
 }
 
+type LeafMeta struct {
+	Prefix Prefix
+	Count  uint32
+	LastK  OpCannonicalKey
+	Digest MerkleHash
+}
+
 func NewMerkle(fanout uint32, depth uint8, getOps func(low, high OpCannonicalKey) iter.Seq2[OpCannonicalKey, *OpLogEntry]) *Merkle {
 	m := &Merkle{Depth: depth, Fanout: fanout, getOps: getOps}
 	m.root = NewMerkleNode(false, nil, fanout)
@@ -238,13 +245,27 @@ func (m *Merkle) collectLeaves(prefix Prefix) []*MerkleNode {
 	return leaves
 }
 
-func (m *Merkle) Leaves(p Prefix) iter.Seq2[MerkleHash, *MerkleNode] {
-	return func(yield func(MerkleHash, *MerkleNode) bool) {
+func (m *Merkle) LeavesIter(p Prefix) iter.Seq2[MerkleHash, *LeafMeta] {
+	return func(yield func(MerkleHash, *LeafMeta) bool) {
 		leaves := m.collectLeaves(p)
 		for _, leaf := range leaves {
-			if !yield(leaf.Hash, leaf) {
+			leafMeta := LeafMeta{
+				Prefix: leaf.Prefix,
+				Count:  uint32(leaf.Count),
+				LastK:  leaf.LastK,
+				Digest: leaf.Hash,
+			}
+			if !yield(leaf.Hash, &leafMeta) {
 				return
 			}
 		}
 	}
+}
+
+func (m *Merkle) Leaves(p Prefix) []LeafMeta {
+	var leaves []LeafMeta
+	for _, leaf := range m.LeavesIter(p) {
+		leaves = append(leaves, *leaf)
+	}
+	return leaves
 }

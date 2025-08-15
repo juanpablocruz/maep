@@ -2,7 +2,9 @@
 package engine
 
 import (
+	"bytes"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/juanpablocruz/maep/pkg/eventbus"
@@ -39,8 +41,6 @@ type Node struct {
 	mu      sync.RWMutex // Protect started field and other state
 
 	frontier Frontier
-	drainCh  chan struct{}
-	drainWg  sync.WaitGroup
 
 	m   *Merkle
 	HLC HLCTimestamp
@@ -81,12 +81,11 @@ func NewNode(bus *eventbus.EventBus, opts *NodeOptions) *Node {
 
 	opsLog := NewOpLog()
 	node := &Node{
-		ops:     opsLog,
-		ch:      make(chan eventbus.Event),
-		m:       NewMerkle(*opts.MerkleFanout, *opts.MerkleDepth, opsLog.GetOpLogEntriesFrom),
-		HLC:     NewHLC(0, 0),
-		drainCh: make(chan struct{}, 100),
-		SV:      make(SV),
+		ops: opsLog,
+		ch:  make(chan eventbus.Event),
+		m:   NewMerkle(*opts.MerkleFanout, *opts.MerkleDepth, opsLog.GetOpLogEntriesFrom),
+		HLC: NewHLC(0, 0),
+		SV:  make(SV),
 	}
 	subscriber := NewOpsEventSubscriber(node)
 	node.bus = subscriber
@@ -252,4 +251,137 @@ func (n *Node) SummaryRound(remote SummaryPeer) ([]Prefix, error) {
 	}
 
 	return out, nil
+}
+
+// PlanDeltas takes the set of differing leaves from the summary/descent and the peer's SV,
+// scans the OpLog for each leaf's suffix after the peer's frontier, sorts the ops by key,
+// and chunks into sendable batches.
+func (n *Node) PlanDeltas(peer SummaryPeer, leaves []Prefix, maxOps int, maxBytes int) []DeltaPlan {
+	var out []DeltaPlan
+
+	// Get the peer's SV frontiers
+	peerID := peer.GetID()
+	peerFrontiers, exists := n.SV[peerID]
+	if !exists {
+		// If no SV exists for this peer, create an empty one
+		peerFrontiers = []Frontier{}
+	}
+
+	// Create a map of peer frontiers by key for efficient lookup
+	frontierMap := make(map[OpCannonicalKey]bool)
+	for _, frontier := range peerFrontiers {
+		if frontier.Set {
+			frontierMap[frontier.Key] = true
+		}
+	}
+
+	totalBytes := 0
+	for _, leaf := range leaves {
+		if len(out) >= maxOps {
+			break
+		}
+
+		// Get the key range for this leaf prefix
+		lowKey, highKey := n.getPrefixKeyBounds(leaf)
+
+		// Collect operations in this leaf's range that are after the peer's frontier
+		var leafOps []*OpLogEntry
+		leafBytes := 0
+
+		for key, entry := range n.ops.GetOpLogEntriesFrom(lowKey, highKey) {
+			// Skip operations that are exactly at the peer's frontier
+			if frontierMap[key] {
+				continue
+			}
+
+			// Check if this operation is after ALL peer frontiers
+			// An operation should be included if it's greater than ALL frontier keys
+			if !n.isOperationAfterAllFrontiers(key, peerFrontiers) {
+				continue
+			}
+
+			// Estimate the size of this operation
+			opSize := n.estimateOperationSize(entry)
+
+			// Check if adding this operation would exceed limits
+			if len(leafOps) >= maxOps || (leafBytes+opSize) > maxBytes {
+				break
+			}
+
+			leafOps = append(leafOps, entry)
+			leafBytes += opSize
+		}
+
+		// If we found operations for this leaf, create a DeltaPlan
+		if len(leafOps) > 0 {
+			// Sort operations by canonical key to ensure deterministic order
+			sort.Slice(leafOps, func(i, j int) bool {
+				return bytes.Compare(leafOps[i].key[:], leafOps[j].key[:]) < 0
+			})
+
+			// Find the starting key for this delta plan
+			fromK := lowKey
+			if len(leafOps) > 0 {
+				fromK = leafOps[0].key
+			}
+
+			plan := DeltaPlan{
+				Leaf:  leaf,
+				FromK: fromK,
+				Ops:   leafOps,
+			}
+
+			out = append(out, plan)
+			totalBytes += leafBytes
+		}
+	}
+
+	return out
+}
+
+// getPrefixKeyBounds returns the lower and upper bounds for a given prefix
+// The lower bound is the prefix itself, and the upper bound is the prefix with all remaining bits set to 1
+func (n *Node) getPrefixKeyBounds(prefix Prefix) (OpCannonicalKey, OpCannonicalKey) {
+	var lowKey, highKey OpCannonicalKey
+
+	// Copy the prefix path to create the lower bound
+	if len(prefix.Path) > 0 {
+		copy(lowKey[:], prefix.Path)
+	}
+
+	// Create the upper bound by setting all remaining bits to 1
+	copy(highKey[:], lowKey[:])
+
+	// Calculate how many bits are used by the prefix
+	bitsUsed := uint(prefix.Depth) * bitsPerLevel(n.m.Fanout)
+	bytesUsed := bitsUsed / 8
+	remainingBits := bitsUsed % 8
+
+	// Set all remaining bits in the used bytes to 1
+	for i := bytesUsed; i < uint(len(highKey)); i++ {
+		highKey[i] = 0xFF
+	}
+
+	// If there are remaining bits in the last used byte, set them to 1
+	if remainingBits > 0 && bytesUsed < uint(len(highKey)) {
+		mask := byte(0xFF) << (8 - remainingBits)
+		highKey[bytesUsed] |= mask
+	}
+
+	return lowKey, highKey
+}
+
+// isOperationAfterAllFrontiers checks if an operation is after all peer frontiers
+func (n *Node) isOperationAfterAllFrontiers(key OpCannonicalKey, peerFrontiers []Frontier) bool {
+	for _, frontier := range peerFrontiers {
+		if frontier.Set && bytes.Compare(key[:], frontier.Key[:]) <= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// estimateOperationSize estimates the size of an operation in bytes
+func (n *Node) estimateOperationSize(entry *OpLogEntry) int {
+	return len(entry.op.Key) + len(entry.op.Value) + 60 // 60 bytes for canonical key overhead
 }
