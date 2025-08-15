@@ -48,7 +48,31 @@ func (e *EventBus) Publish(msg Event) {
 
 	for _, s := range e.subscribers {
 		s.GetWaitGroup().Add(1)
-		s.GetChannel() <- msg
+		select {
+		case s.GetChannel() <- msg:
+			// Successfully sent to channel
+		default:
+			// Channel is full or closed, skip this subscriber
+			s.GetWaitGroup().Done()
+		}
+	}
+}
+
+// Stop stops the eventBus and waits for all goroutines to finish
+func (e *EventBus) Stop() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if !e.started {
+		return
+	}
+
+	// Mark as stopped to prevent new events
+	e.started = false
+
+	// Close all subscriber channels to stop goroutines
+	for _, s := range e.subscribers {
+		close(s.GetChannel())
 	}
 }
 

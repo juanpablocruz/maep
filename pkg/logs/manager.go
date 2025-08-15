@@ -9,16 +9,13 @@ import (
 
 type LogManager struct {
 	subscriber *LogSubscriber
-	ch         chan eventbus.Event
 	started    bool
 	mu         sync.RWMutex // Protect started field
-	wg         sync.WaitGroup
 }
 
 func NewLogManager(logger *log.Logger) *LogManager {
 	return &LogManager{
 		subscriber: NewLogSubscriber(logger),
-		ch:         make(chan eventbus.Event),
 	}
 }
 
@@ -30,19 +27,13 @@ func (lm *LogManager) Start(bus *eventbus.EventBus) {
 		return
 	}
 
-	go func() {
-		for event := range lm.ch {
-			lm.subscriber.OnEvent(event)
-			lm.wg.Done()
-		}
-	}()
 	bus.Subscribe(lm.subscriber)
 	bus.Start()
 	lm.started = true
 }
 
 func (lm *LogManager) WaitForProcessing() {
-	lm.wg.Wait()
+	lm.subscriber.GetWaitGroup().Wait()
 }
 
 // GlobalLogManager instance

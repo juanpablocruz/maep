@@ -18,7 +18,7 @@ func Test_Node_EventBus_Integration(t *testing.T) {
 		MerkleDepth:  &depth,
 		MerkleFanout: &fanout,
 	})
-	node.Start(bus)
+	node.Start()
 
 	op := generateOp("key", "value", OpPut)
 
@@ -93,7 +93,7 @@ func Test_Node_AppendOp(t *testing.T) {
 		MerkleDepth:  &depth,
 		MerkleFanout: &fanout,
 	})
-	node.Start(bus)
+	node.Start()
 
 	op := generateOp("key", "value", OpPut)
 
@@ -126,7 +126,7 @@ func Test_Node_AppendOp_Idempotent(t *testing.T) {
 		MerkleDepth:  &depth,
 		MerkleFanout: &fanout,
 	})
-	node.Start(bus)
+	node.Start()
 
 	op := generateOp("key", "value", OpPut)
 
@@ -160,8 +160,8 @@ func Test_Node_SummaryRound(t *testing.T) {
 	options := DefaultNodeOptions()
 	A, B := NewNode(bus, &options), NewNode(bus, &options)
 
-	A.Start(bus)
-	B.Start(bus)
+	A.Start()
+	B.Start()
 
 	require.Equal(t, A.m.root, B.m.root)
 
@@ -177,8 +177,8 @@ func Test_Node_SummaryRound_Integration(t *testing.T) {
 	options := DefaultNodeOptions()
 	A, B := NewNode(busA, &options), NewNode(busB, &options)
 
-	A.Start(busA)
-	B.Start(busB)
+	A.Start()
+	B.Start()
 
 	require.Equal(t, A.m.root, B.m.root)
 	op := generateOp("key", "value", OpPut)
@@ -213,8 +213,8 @@ func Test_Node_SummaryRound_DifferentOrder_SameRoot(t *testing.T) {
 	options := DefaultNodeOptions()
 	A, B := NewNode(busA, &options), NewNode(busB, &options)
 
-	A.Start(busA)
-	B.Start(busB)
+	A.Start()
+	B.Start()
 
 	// Verify initial state
 	require.Equal(t, A.m.root.Hash, B.m.root.Hash, "Roots should be equal despite different operation order")
@@ -278,7 +278,7 @@ func Test_Node_PlanDeltas(t *testing.T) {
 		MerkleDepth:  &depth,
 		MerkleFanout: &fanout,
 	})
-	node.Start(bus)
+	node.Start()
 
 	// Create a mock peer
 	mockPeer := &mockSummaryPeer{
@@ -443,7 +443,7 @@ func Test_Node_PlanDeltas_EmptyLeaves(t *testing.T) {
 		MerkleDepth:  &depth,
 		MerkleFanout: &fanout,
 	})
-	node.Start(bus)
+	node.Start()
 
 	mockPeer := &mockSummaryPeer{
 		id: PeerID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
@@ -478,7 +478,7 @@ func Test_Node_PlanDeltas_NoPeerSV(t *testing.T) {
 		MerkleDepth:  &depth,
 		MerkleFanout: &fanout,
 	})
-	node.Start(bus)
+	node.Start()
 
 	mockPeer := &mockSummaryPeer{
 		id: PeerID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
@@ -531,7 +531,7 @@ func Test_Node_PlanDeltas_RespectsLimits(t *testing.T) {
 		MerkleDepth:  &depth,
 		MerkleFanout: &fanout,
 	})
-	node.Start(bus)
+	node.Start()
 
 	mockPeer := &mockSummaryPeer{
 		id: PeerID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},

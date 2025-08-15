@@ -65,7 +65,6 @@ type FSM struct {
 }
 
 func (f *FSM) HandleInitiatorEvent(ev *InitiatorStateEvent) {
-
 }
 
 func (f *FSM) HandleResponderEvent(ev *ResponderStateEvent) {

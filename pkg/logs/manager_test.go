@@ -8,9 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/juanpablocruz/maep/pkg/engine"
 	"github.com/juanpablocruz/maep/pkg/eventbus"
-	"github.com/juanpablocruz/maep/pkg/testutils"
 )
 
 // ThreadSafeBuffer is a thread-safe wrapper around bytes.Buffer
@@ -44,9 +42,8 @@ func Test_LogManager_EventBus_Integration(t *testing.T) {
 	logManager.Start(bus)
 
 	// Create and publish different types of events
-	op := testutils.GenerateOp("test-key", "test-value", engine.OpPut)
 
-	opEvent := &engine.OpEvent{Op: &op}
+	opEvent := &SimpleEvent{Message: "Test Message"}
 	bus.Publish(opEvent)
 
 	// Create a custom event
@@ -67,8 +64,8 @@ func Test_LogManager_EventBus_Integration(t *testing.T) {
 	t.Logf("Log output: %s", logOutput)
 	t.Logf("Log output lines: %d", strings.Count(logOutput, "\n"))
 
-	if !strings.Contains(logOutput, "OpEvent") {
-		t.Errorf("Expected log to contain OpEvent")
+	if !strings.Contains(logOutput, "SimpleEvent") {
+		t.Errorf("Expected log to contain SimpleEvent")
 	}
 
 	if !strings.Contains(logOutput, "CustomEvent") {

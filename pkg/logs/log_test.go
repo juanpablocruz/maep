@@ -6,9 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/juanpablocruz/maep/pkg/engine"
 	"github.com/juanpablocruz/maep/pkg/eventbus"
-	"github.com/juanpablocruz/maep/pkg/testutils"
 )
 
 type CustomEvent struct {
@@ -37,24 +35,27 @@ func Test_LogSubscriber_EventBus_Integration(t *testing.T) {
 	bus.Start()
 
 	// Create and publish different types of events
-	op := testutils.GenerateOp("test-key", "test-value", engine.OpPut)
-
-	opEvent := &engine.OpEvent{Op: &op}
+	opEvent := &SimpleEvent{Message: "Test Message"}
+	t.Logf("Publishing SimpleEvent: %+v", opEvent)
 	bus.Publish(opEvent)
 
 	// Create a custom event
 	customEvent := &CustomEvent{Message: "Hello World"}
+	t.Logf("Publishing CustomEvent: %+v", customEvent)
 	bus.Publish(customEvent)
 
 	// Wait for all events to be processed before reading the buffer
+	t.Logf("Waiting for events to be processed...")
 	s.GetWaitGroup().Wait()
+	t.Logf("Events processed, checking buffer...")
 
 	// Check that both events were logged
 	logOutput := buf.String()
 	t.Logf("Log output: %s", logOutput)
+	t.Logf("Log output length: %d", len(logOutput))
 
-	if !strings.Contains(logOutput, "OpEvent") {
-		t.Errorf("Expected log to contain OpEvent")
+	if !strings.Contains(logOutput, "SimpleEvent") {
+		t.Errorf("Expected log to contain SimpleEvent")
 	}
 
 	if !strings.Contains(logOutput, "CustomEvent") {

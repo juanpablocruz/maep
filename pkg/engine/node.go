@@ -4,11 +4,14 @@ package engine
 import (
 	"bytes"
 	"fmt"
+	"log"
+	"os"
 	"sort"
 	"sync"
 
 	"github.com/juanpablocruz/maep/pkg/eventbus"
 	"github.com/juanpablocruz/maep/pkg/fsm"
+	"github.com/juanpablocruz/maep/pkg/logs"
 )
 
 // OpsEventSubscriber is a Subscriber to EventBus that handles ops events.
@@ -36,8 +39,10 @@ func (s *OpsEventSubscriber) GetWaitGroup() *sync.WaitGroup {
 
 func (s *OpsEventSubscriber) OnEvent(event eventbus.Event) {
 	if opEvent, ok := event.(*OpEvent); ok {
-		_, isNew := s.node.addOp(opEvent.Op)
+		o, isNew := s.node.addOp(opEvent.Op)
 		if isNew {
+			// Only emit instrumentation for actual new operations, not instrumentation events
+			s.node.EmitInstrumentation("OpAdded", fmt.Sprintf("%x", o.hash))
 			s.node.drainOnce()
 		}
 	}
@@ -89,6 +94,7 @@ type Node struct {
 	HLC HLCTimestamp
 
 	FSM *fsm.FSM
+	bus *eventbus.EventBus
 }
 
 type NodeOptions struct {
@@ -131,12 +137,13 @@ func NewNode(bus *eventbus.EventBus, opts *NodeOptions) *Node {
 		HLC: NewHLC(0, 0),
 		SV:  make(SV),
 		FSM: fsm.NewFSM(),
+		bus: bus,
 	}
 
 	return node
 }
 
-func (n *Node) Start(bus *eventbus.EventBus) {
+func (n *Node) Start() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -147,13 +154,17 @@ func (n *Node) Start(bus *eventbus.EventBus) {
 	opsEventSubscriber := NewOpsEventSubscriber(n)
 	fsmEventSubscriber := NewStateEventSubscriber(n)
 
-	bus.Subscribe(opsEventSubscriber)
-	bus.Subscribe(fsmEventSubscriber)
+	logger := log.New(os.Stdout, "[NODE]", 0)
+	logEventSubscriber := logs.NewLogSubscriber(logger)
 
-	n.subscribers = []eventbus.Subscriber{opsEventSubscriber, fsmEventSubscriber}
+	n.bus.Subscribe(opsEventSubscriber)
+	n.bus.Subscribe(fsmEventSubscriber)
+	n.bus.Subscribe(logEventSubscriber)
+
+	n.subscribers = []eventbus.Subscriber{opsEventSubscriber, fsmEventSubscriber, logEventSubscriber}
 
 	// Start the eventBus to begin processing events
-	bus.Start()
+	n.bus.Start()
 
 	n.started = true
 }
@@ -220,10 +231,14 @@ func (n *Node) Stop() {
 	if !n.started {
 		return
 	}
-	for _, s := range n.subscribers {
-		close(s.GetChannel())
-	}
+
+	// Mark as stopped first to prevent new emissions
 	n.started = false
+
+	// Stop the eventBus to properly close all channels
+	if n.bus != nil {
+		n.bus.Stop()
+	}
 }
 
 func (n *Node) SummaryRound(remote SummaryPeer) ([]Prefix, error) {

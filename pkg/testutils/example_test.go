@@ -28,14 +28,14 @@ func ExampleGenerateBulkOps() {
 func TestBasicOperations(t *testing.T) {
 	testNode := NewTestNode(t)
 	defer testNode.Stop()
-	
+
 	testNode.Start()
-	
+
 	// Test single operation
 	op := GenerateOp("key1", "value1", engine.OpPut)
 	testNode.ApplyOp(op)
 	testNode.AssertOpCount(1)
-	
+
 	// Test bulk operations with different HLC timestamps
 	ops := make([]engine.Op, 5)
 	for i := 0; i < 5; i++ {
@@ -43,7 +43,7 @@ func TestBasicOperations(t *testing.T) {
 	}
 	testNode.ApplyOps(ops)
 	testNode.AssertOpCount(6) // 1 + 5
-	
+
 	// Test mixed operations with different HLC timestamps
 	mixedOps := make([]engine.Op, 10)
 	for i := 0; i < 10; i++ {
@@ -63,32 +63,32 @@ func TestBasicOperations(t *testing.T) {
 func TestConcurrentOperations(t *testing.T) {
 	testNode := NewTestNode(t)
 	defer testNode.Stop()
-	
+
 	testNode.Start()
-	
+
 	// Generate operations with different actors and HLC timestamps
 	actors := []engine.ActorID{
 		GenerateRandomActorID(),
 		GenerateRandomActorID(),
 		GenerateRandomActorID(),
 	}
-	
+
 	ops := make([]engine.Op, 30)
 	for i := 0; i < 30; i++ {
 		actor := actors[i%len(actors)]
 		ops[i] = GenerateOpWithHLC(fmt.Sprintf("concurrent-%d", i), fmt.Sprintf("value-%d", i), engine.OpPut, 1234568000+uint64(i), 12345)
 		ops[i].Actor = actor
 	}
-	
+
 	// Apply operations sequentially (avoiding WaitGroup issues)
 	testNode.ApplyOps(ops)
-	
+
 	// Wait for all operations to be processed
 	err := testNode.WaitForOpCount(30, 5*time.Second)
 	if err != nil {
 		t.Fatalf("Timeout waiting for operations: %v", err)
 	}
-	
+
 	testNode.AssertOpCount(30)
 }
 
@@ -97,25 +97,25 @@ func TestMultiNodeCluster(t *testing.T) {
 	// Create a 3-node cluster
 	cluster := NewTestCluster(t, 3)
 	defer cluster.Stop()
-	
+
 	cluster.Start()
-	
+
 	// Apply different operations to different nodes
 	ops1 := GenerateBulkOps(5, "node1", engine.OpPut)
 	ops2 := GenerateBulkOps(5, "node2", engine.OpPut)
 	ops3 := GenerateBulkOps(5, "node3", engine.OpPut)
-	
+
 	cluster.ApplyOpsToNode(0, ops1)
 	cluster.ApplyOpsToNode(1, ops2)
 	cluster.ApplyOpsToNode(2, ops3)
-	
+
 	// Each node should have 5 operations
 	cluster.AssertAllNodesHaveOpCount(5)
-	
+
 	// Apply the same operation to all nodes
 	sharedOp := GenerateOp("shared", "value", engine.OpPut)
 	cluster.ApplyOpToAll(sharedOp)
-	
+
 	// Each node should now have 6 operations
 	cluster.AssertAllNodesHaveOpCount(6)
 }
@@ -129,17 +129,17 @@ func TestCustomNodeOptions(t *testing.T) {
 		MerkleDepth:  &depth,
 		MerkleFanout: &fanout,
 	}
-	
+
 	// Create test node with custom options
 	testNode := NewTestNodeWithOptions(t, options)
 	defer testNode.Stop()
-	
+
 	testNode.Start()
-	
+
 	// Test operations with custom configuration
 	ops := GenerateBulkOps(20, "custom", engine.OpPut)
 	testNode.ApplyOps(ops)
-	
+
 	testNode.AssertOpCount(20)
 }
 
@@ -152,23 +152,23 @@ func TestClusterWithCustomOptions(t *testing.T) {
 		MerkleDepth:  &depth,
 		MerkleFanout: &fanout,
 	}
-	
+
 	// Create cluster with custom options
 	cluster := NewTestClusterWithOptions(t, 2, options)
 	defer cluster.Stop()
-	
+
 	cluster.Start()
-	
+
 	// Apply operations and test synchronization
 	ops := GenerateBulkOps(10, "sync", engine.OpPut)
 	cluster.ApplyOpsToNode(0, ops)
-	
+
 	// Perform summary round to sync nodes
 	leaves, err := cluster.Nodes[0].Node.SummaryRound(cluster.Nodes[1].Node)
 	if err != nil {
 		t.Fatalf("SummaryRound failed: %v", err)
 	}
-	
+
 	// Should have leaves to sync
 	if len(leaves) == 0 {
 		t.Log("No leaves to sync - nodes may already be in sync")
@@ -179,10 +179,10 @@ func TestClusterWithCustomOptions(t *testing.T) {
 func TestPredefinedScenarios(t *testing.T) {
 	// Run the single node basic scenario
 	RunTestScenario(t, SingleNodeBasicScenario, 1)
-	
+
 	// Run the multi-node sync scenario
 	RunTestScenario(t, MultiNodeSyncScenario, 2)
-	
+
 	// Run the concurrent operations scenario
 	RunTestScenario(t, ConcurrentOpsScenario, 1)
 }
@@ -198,27 +198,27 @@ func TestCustomScenario(t *testing.T) {
 		Execute: func(cluster *TestCluster) {
 			// Execute phase - perform the actual test operations
 			t.Log("Executing custom scenario")
-			
+
 			// Apply operations with different patterns
 			putOps := GenerateBulkOps(10, "put", engine.OpPut)
 			delOps := GenerateBulkOps(5, "del", engine.OpDel)
-			
+
 			cluster.ApplyOpsToNode(0, putOps)
 			cluster.ApplyOpsToNode(1, delOps)
-			
+
 			// Perform some complex operation
 			cluster.Nodes[0].ApplyOpsConcurrently(GenerateBulkOps(20, "concurrent", engine.OpPut))
 		},
 		Verify: func(cluster *TestCluster) {
 			// Verify phase - check that the expected state was achieved
 			t.Log("Verifying custom scenario")
-			
+
 			// Node 0 should have 30 operations (10 put + 20 concurrent)
 			cluster.Nodes[0].AssertOpCount(30)
-			
+
 			// Node 1 should have 5 operations (5 delete)
 			cluster.Nodes[1].AssertOpCount(5)
-			
+
 			// Verify Merkle roots are different (different operations)
 			root0 := cluster.Nodes[0].Node.GetMerkleRoot()
 			root1 := cluster.Nodes[1].Node.GetMerkleRoot()
@@ -231,7 +231,7 @@ func TestCustomScenario(t *testing.T) {
 			t.Log("Cleaning up custom scenario")
 		},
 	}
-	
+
 	RunTestScenario(t, customScenario, 2)
 }
 
@@ -239,19 +239,19 @@ func TestCustomScenario(t *testing.T) {
 func TestErrorHandling(t *testing.T) {
 	testNode := NewTestNode(t)
 	defer testNode.Stop()
-	
+
 	testNode.Start()
-	
+
 	// Test timeout scenario
 	err := testNode.WaitForOpCount(100, 100*time.Millisecond)
 	if err == nil {
 		t.Fatal("Expected timeout error, got none")
 	}
-	
+
 	// Test with operations that should complete
 	ops := GenerateBulkOps(5, "timeout", engine.OpPut)
 	testNode.ApplyOps(ops)
-	
+
 	err = testNode.WaitForOpCount(5, 5*time.Second)
 	if err != nil {
 		t.Fatalf("Unexpected error waiting for operations: %v", err)
@@ -264,12 +264,12 @@ func BenchmarkBulkOperations(b *testing.B) {
 	bus := eventbus.NewEventBus()
 	options := engine.DefaultNodeOptions()
 	node := engine.NewNode(bus, &options)
-	
-	node.Start(bus)
-	
+
+	node.Start()
+
 	// Pre-generate operations
 	ops := GenerateBulkOps(1000, "benchmark", engine.OpPut)
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		// Apply operations
@@ -278,10 +278,10 @@ func BenchmarkBulkOperations(b *testing.B) {
 			bus.Publish(opEvent)
 		}
 		node.WaitForProcessing()
-		
+
 		// Reset for next iteration
 		node = engine.NewNode(bus, &options)
-		node.Start(bus)
+		node.Start()
 	}
 }
 
@@ -291,12 +291,12 @@ func BenchmarkConcurrentOperations(b *testing.B) {
 	bus := eventbus.NewEventBus()
 	options := engine.DefaultNodeOptions()
 	node := engine.NewNode(bus, &options)
-	
-	node.Start(bus)
-	
+
+	node.Start()
+
 	// Pre-generate operations
 	ops := GenerateBulkOps(1000, "concurrent-bench", engine.OpPut)
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		// Apply operations concurrently
@@ -311,9 +311,9 @@ func BenchmarkConcurrentOperations(b *testing.B) {
 		}
 		wg.Wait()
 		node.WaitForProcessing()
-		
+
 		// Reset for next iteration
 		node = engine.NewNode(bus, &options)
-		node.Start(bus)
+		node.Start()
 	}
 }

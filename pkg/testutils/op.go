@@ -81,7 +81,7 @@ func GenerateMixedOps(count int, prefix string, putRatio float64) []engine.Op {
 	for i := 0; i < count; i++ {
 		key := fmt.Sprintf("%s-%d", prefix, i)
 		value := fmt.Sprintf("value-%d", i)
-		
+
 		// Determine operation type based on ratio
 		var opType engine.OpType
 		if float64(i)/float64(count) < putRatio {
@@ -89,7 +89,7 @@ func GenerateMixedOps(count int, prefix string, putRatio float64) []engine.Op {
 		} else {
 			opType = engine.OpDel
 		}
-		
+
 		ops[i] = GenerateOp(key, value, opType)
 	}
 	return ops
@@ -107,7 +107,7 @@ func NewTestNode(t *testing.T) *TestNode {
 	bus := eventbus.NewEventBus()
 	options := engine.DefaultNodeOptions()
 	node := engine.NewNode(bus, &options)
-	
+
 	return &TestNode{
 		Node: node,
 		Bus:  bus,
@@ -119,7 +119,7 @@ func NewTestNode(t *testing.T) *TestNode {
 func NewTestNodeWithOptions(t *testing.T, options engine.NodeOptions) *TestNode {
 	bus := eventbus.NewEventBus()
 	node := engine.NewNode(bus, &options)
-	
+
 	return &TestNode{
 		Node: node,
 		Bus:  bus,
@@ -129,7 +129,7 @@ func NewTestNodeWithOptions(t *testing.T, options engine.NodeOptions) *TestNode 
 
 // Start starts the test node
 func (tn *TestNode) Start() {
-	tn.Node.Start(tn.Bus)
+	tn.Node.Start()
 }
 
 // Stop stops the test node
@@ -203,7 +203,7 @@ func NewTestCluster(t *testing.T, nodeCount int) *TestCluster {
 	for i := 0; i < nodeCount; i++ {
 		nodes[i] = NewTestNode(t)
 	}
-	
+
 	return &TestCluster{
 		Nodes: nodes,
 		t:     t,
@@ -216,7 +216,7 @@ func NewTestClusterWithOptions(t *testing.T, nodeCount int, options engine.NodeO
 	for i := 0; i < nodeCount; i++ {
 		nodes[i] = NewTestNodeWithOptions(t, options)
 	}
-	
+
 	return &TestCluster{
 		Nodes: nodes,
 		t:     t,
@@ -290,21 +290,21 @@ func (tc *TestCluster) AssertAllNodesHaveSameRoot() {
 	if len(tc.Nodes) < 2 {
 		return
 	}
-	
+
 	firstRoot := tc.Nodes[0].Node.GetMerkleRoot()
 	for i := 1; i < len(tc.Nodes); i++ {
-		require.Equal(tc.t, firstRoot, tc.Nodes[i].Node.GetMerkleRoot(), 
+		require.Equal(tc.t, firstRoot, tc.Nodes[i].Node.GetMerkleRoot(),
 			"Node %d has different root than node 0", i)
 	}
 }
 
 // TestScenario represents a complex test scenario
 type TestScenario struct {
-	Name        string
-	Setup       func(*TestCluster)
-	Execute     func(*TestCluster)
-	Verify      func(*TestCluster)
-	Cleanup     func(*TestCluster)
+	Name    string
+	Setup   func(*TestCluster)
+	Execute func(*TestCluster)
+	Verify  func(*TestCluster)
+	Cleanup func(*TestCluster)
 }
 
 // RunTestScenario runs a complete test scenario
@@ -312,21 +312,21 @@ func RunTestScenario(t *testing.T, scenario TestScenario, nodeCount int) {
 	t.Run(scenario.Name, func(t *testing.T) {
 		cluster := NewTestCluster(t, nodeCount)
 		defer cluster.Stop()
-		
+
 		cluster.Start()
-		
+
 		if scenario.Setup != nil {
 			scenario.Setup(cluster)
 		}
-		
+
 		if scenario.Execute != nil {
 			scenario.Execute(cluster)
 		}
-		
+
 		if scenario.Verify != nil {
 			scenario.Verify(cluster)
 		}
-		
+
 		if scenario.Cleanup != nil {
 			scenario.Cleanup(cluster)
 		}
@@ -346,7 +346,7 @@ var (
 			cluster.AssertAllNodesHaveOpCount(10)
 		},
 	}
-	
+
 	// MultiNodeSyncScenario tests synchronization between multiple nodes
 	MultiNodeSyncScenario = TestScenario{
 		Name: "MultiNodeSync",
@@ -354,10 +354,10 @@ var (
 			// Apply different operations to different nodes
 			ops1 := GenerateBulkOps(5, "node1", engine.OpPut)
 			ops2 := GenerateBulkOps(5, "node2", engine.OpPut)
-			
+
 			cluster.ApplyOpsToNode(0, ops1)
 			cluster.ApplyOpsToNode(1, ops2)
-			
+
 			// Perform summary rounds to sync
 			leaves, err := cluster.Nodes[0].Node.SummaryRound(cluster.Nodes[1].Node)
 			require.NoError(cluster.t, err)
@@ -370,7 +370,7 @@ var (
 			cluster.Nodes[1].AssertOpCount(5)
 		},
 	}
-	
+
 	// ConcurrentOpsScenario tests bulk operation handling
 	ConcurrentOpsScenario = TestScenario{
 		Name: "BulkOps",
