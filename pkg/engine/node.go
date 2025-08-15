@@ -23,7 +23,7 @@ func (s *OpsEventSubscriber) OnEvent(event eventbus.Event) {
 	if opEvent, ok := event.(*OpEvent); ok {
 		_, isNew := s.node.addOp(opEvent.Op)
 		if isNew {
-			s.node.notifyDrain()
+			s.node.drainOnce()
 		}
 	}
 }
@@ -36,6 +36,7 @@ type Node struct {
 	wg      sync.WaitGroup
 	ch      chan eventbus.Event
 	started bool
+	mu      sync.RWMutex // Protect started field and other state
 
 	frontier Frontier
 	drainCh  chan struct{}
@@ -92,22 +93,23 @@ func NewNode(bus *eventbus.EventBus, opts *NodeOptions) *Node {
 }
 
 func (n *Node) Start(bus *eventbus.EventBus) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
 	if n.started {
 		return
 	}
 
 	go func() {
 		for event := range n.ch {
-			n.wg.Add(1)
 			n.bus.OnEvent(event)
 			n.wg.Done()
 		}
 	}()
-	bus.Subscribe(n.ch)
-	go n.drainLoop()
+	s := eventbus.NewSubscriber(n.ch, &n.wg)
+	bus.Subscribe(*s)
 
 	n.started = true
-
 }
 
 func (n *Node) addOp(op *Op) (*OpLogEntry, bool) {
@@ -116,23 +118,6 @@ func (n *Node) addOp(op *Op) (*OpLogEntry, bool) {
 
 func (n *Node) WaitForProcessing() {
 	n.wg.Wait()
-	// Wait for any pending drain operations to complete
-	n.drainWg.Wait()
-}
-
-func (n *Node) notifyDrain() {
-	select {
-	case n.drainCh <- struct{}{}:
-	default:
-	}
-}
-
-func (n *Node) drainLoop() {
-	for range n.drainCh {
-		n.drainWg.Add(1)
-		n.drainOnce()
-		n.drainWg.Done()
-	}
 }
 
 func (n *Node) drainOnce() {
@@ -181,6 +166,9 @@ func (n *Node) GetMerkleRoot() MerkleHash {
 
 // Stop stops the node processing
 func (n *Node) Stop() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
 	if !n.started {
 		return
 	}

@@ -28,12 +28,12 @@ func (lm *LogManager) Start(bus *eventbus.EventBus) {
 
 	go func() {
 		for event := range lm.ch {
-			lm.wg.Add(1)
 			lm.subscriber.OnEvent(event)
 			lm.wg.Done()
 		}
 	}()
-	bus.Subscribe(lm.ch)
+	s := eventbus.NewSubscriber(lm.ch, &lm.wg)
+	bus.Subscribe(*s)
 	lm.started = true
 }
 

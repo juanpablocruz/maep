@@ -1,7 +1,22 @@
+// Package eventbus implements a simple event bus.
 package eventbus
+
+import "sync"
 
 type Event interface {
 	GetType() string
+}
+
+type Subscriber struct {
+	ch chan<- Event
+	wg *sync.WaitGroup
+}
+
+func NewSubscriber(ch chan<- Event, wg *sync.WaitGroup) *Subscriber {
+	return &Subscriber{
+		ch: ch,
+		wg: wg,
+	}
 }
 
 type EventBusIf interface {
@@ -10,24 +25,25 @@ type EventBusIf interface {
 }
 
 type EventBus struct {
-	subscribers []chan<- Event
+	subscribers []Subscriber
 }
 
 func NewEventBus() *EventBus {
 	return &EventBus{
-		subscribers: []chan<- Event{},
+		subscribers: []Subscriber{},
 	}
 }
 
-func (e *EventBus) Subscribe(ch chan<- Event) {
-	e.subscribers = append(e.subscribers, ch)
+func (e *EventBus) Subscribe(s Subscriber) {
+	e.subscribers = append(e.subscribers, s)
 }
 
 func (e *EventBus) Publish(msg Event) {
-	for _, ch := range e.subscribers {
-		ch <- msg
+	for _, s := range e.subscribers {
+		s.wg.Add(1)
+		s.ch <- msg
 	}
 }
 
-// Global EventBus instance
+// GlobalEventBus instance
 var GlobalEventBus = NewEventBus()

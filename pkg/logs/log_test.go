@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"log"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/juanpablocruz/maep/pkg/engine"
@@ -32,12 +33,15 @@ func Test_LogSubscriber_EventBus_Integration(t *testing.T) {
 
 	// Subscribe to the EventBus
 	ch := make(chan eventbus.Event)
+	wg := &sync.WaitGroup{}
+	s := eventbus.NewSubscriber(ch, wg)
 	go func() {
 		for event := range ch {
 			subscriber.OnEvent(event)
+			wg.Done()
 		}
 	}()
-	bus.Subscribe(ch)
+	bus.Subscribe(*s)
 
 	// Create and publish different types of events
 	op := testutils.GenerateOp("test-key", "test-value", engine.OpPut)
@@ -49,8 +53,8 @@ func Test_LogSubscriber_EventBus_Integration(t *testing.T) {
 	customEvent := &CustomEvent{Message: "Hello World"}
 	bus.Publish(customEvent)
 
-	// Give some time for processing
-	// In a real implementation, you might want to use a WaitGroup or similar
+	// Wait for all events to be processed before reading the buffer
+	wg.Wait()
 
 	// Check that both events were logged
 	logOutput := buf.String()

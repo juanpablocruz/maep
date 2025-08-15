@@ -1,0 +1,170 @@
+# MAEP Testing Conventions and Rules
+
+## Testing Convention Rules
+
+### 1. Test Naming Structure
+- Follow the pattern: `Test_[TARGET]-[CATEGORY]-[NUMBER]_[Description]`
+- Example: `Test_CORE_DET_01_DeterministicOrder` or `Test_SYNC_FC_01_SlidingWindow`
+- Use underscores to separate components for readability
+
+### 2. Test Structure (ID · Target · Setup · Stimulus · Checks)
+Every test must have these 5 components clearly documented:
+
+```go
+func Test_CORE_DET_01_DeterministicOrder(t *testing.T) {
+    // ID: CORE-DET-01
+    // Target: CORE (OpLog, Merkle, SV)
+    // Setup: [describe setup]
+    // Stimulus: [describe what we're testing]
+    // Checks: [describe expected outcomes]
+    
+    // Setup code here...
+    
+    // Stimulus code here...
+    
+    // Checks/assertions here...
+}
+```
+
+### 3. Target Categories to Follow
+- **CORE**: OpLog, Merkle tree, SV (State Vector) operations
+- **SYNC**: FSM + flow control mechanisms
+- **CSR**: Crash recovery and 2PC (Two-Phase Commit)
+- **TR**: Transport and framing layer
+- **SYS**: End-to-end system integration
+- **SEC**: Security and hardening
+- **PERF**: Performance and scalability
+
+### 4. Test Categories to Implement
+Based on the conventions, prioritize these test types:
+
+**Determinism & Idempotency Tests:**
+- CORE-DET-01: Deterministic ordering with random ops
+- CORE-DET-02: Idempotent re-apply of chunks
+
+**Merkle Tree Tests:**
+- CORE-MT-01: Incremental vs full rebuild equivalence
+- CORE-MT-02: Logarithmic descent for differing leaves
+
+**State Vector Tests:**
+- CORE-SV-01: Monotonic frontier validation
+- CORE-SV-02: Bounded deltas enforcement
+
+**Flow Control Tests:**
+- SYNC-FC-01: Sliding window with selective retransmit
+
+**Integration Tests:**
+- SYS-EC-01: Eventual convergence with multiple nodes
+- SYS-CHAOS-01: Loss/duplication/reordering scenarios
+
+### 5. Assertion and Validation Patterns
+- Use precise assertions with clear failure messages
+- Include instrumentation-style logging for debugging
+- Validate both positive and negative cases
+- Check invariants and bounded properties
+
+### 6. Test Data and Fixtures
+- Create reusable test utilities for generating operations
+- Use deterministic but varied test data
+- Include edge cases and boundary conditions
+- Support parameterized testing for scale scenarios
+
+### 7. Performance Test Guidelines
+- Include timing measurements for performance tests
+- Use bounded assertions (e.g., "completes within X time")
+- Test scalability with increasing load
+- Measure resource usage (memory, CPU)
+
+### 8. Integration Test Patterns
+- Test multi-node scenarios with realistic network conditions
+- Include failure injection and recovery testing
+- Validate eventual consistency properties
+- Test concurrent operations and race conditions
+
+### 9. Code Quality Standards
+- Write comprehensive tests that cover the full behavior
+- Avoid goto statements in test code
+- Use clear, descriptive variable names
+- Include proper cleanup and teardown
+
+### 10. Documentation Requirements
+- Each test must have clear comments explaining the scenario
+- Document the expected invariants being tested
+- Include references to the specific protocol or algorithm being validated
+
+## Original Conventions Reference
+
+### 9.1 Conventions
+Each test has **ID · Target · Setup · Stimulus · Checks**.  
+Targets: **CORE** (OpLog, Merkle, SV), **SYNC** (FSM+flow), **CSR** (repair/2PC), **TR** (transport/framing), **SYS** (end‑to‑end), **SEC** (security), **PERF** (performance/scale).
+
+### 9.2 Unit & Property Tests
+
+**Determinism & Idempotency**
+- **CORE‑DET‑01** · Deterministic order: random ops with identical wall times; different arrival permutations. **Checks**: order equals reference sort; materialized state & root identical.
+- **CORE‑DET‑02** · Idempotent re‑apply: replay same chunks in varying partitions. **Checks**: applied count stable; root unchanged.
+
+**Canonical hashing**
+- **CORE‑HASH‑01** · Cross‑platform encoding: verify `hash(op)` is byte‑identical across endianness/arch. **Checks**: equality, no collisions in test corpus.
+
+**Merkle correctness**
+- **CORE‑MT‑01** · Incremental==Full: k ops; incremental root equals full rebuild.
+- **CORE‑MT‑02** · Logarithmic descent: differing leaf localized with ≤ `O(log M)` probes.
+
+**SV semantics**
+- **CORE‑SV‑01** · Monotonic frontier: attempts to regress are rejected.
+- **CORE‑SV‑02** · Bounded deltas: no op earlier than `frontier` is sent.
+
+**Flow control & framing**
+- **SYNC‑FC‑01** · Sliding window c∈{1,…,cmax}: selective retransmit on gaps. **Checks**: bounded inflight; eventual advance.
+- **TR‑FRAME‑01** · Corrupt `chunk_hash` → NACK; sender retransmits. **Checks**: receiver state not mutated on bad frames.
+
+**Epoch fencing**
+- **SYNC‑EPOCH‑01** · Stale data epoch ignored. **Checks**: ACK/no‑mutate; metrics count stale frames.
+- **CSR‑EPOCH‑01** · PREP/COMMIT at stale epoch rejected; at `e′` accepted. **Checks**: epochs monotone.
+
+**CSR plan & 2PC**
+- **CSR‑PAIR‑01** · Deterministic `hashS`: identical across heads for the same SIDs.
+- **CSR‑2PC‑01** · PREP→COMMIT idempotency: duplicate messages cause no divergence.
+- **CSR‑UNIQ‑01** · Competing plans (`e1≠e2`): only maximal `e⋆` commits; degrees=1 in/out.
+
+**Crash recovery**
+- **CSR‑CRASH‑01** · Crash after PREP before COMMIT: restart yields no partial pointer; next run with higher `e′` succeeds.
+- **CORE‑HLC‑01** · HLC monotonicity across restart: no regression vs persisted last tick.
+
+**Validation & quarantine**
+- **CORE‑VAL‑01** · Mixed chunk with one bad op: quarantine bad, apply rest; sync continues.
+
+**Fairness across leaves**
+- **SYNC‑FAIR‑01** · Many differing leaves: round‑robin scheduling prevents starvation; progress per leaf.
+
+### 9.3 Integration & Chaos
+
+**Eventual convergence**
+- **SYS‑EC‑01** · 10 nodes, periodic writes, memory transport, no loss. **Checks**: equal roots; equal materialized snapshots.
+
+**Loss/dup/reorder**
+- **SYS‑CHAOS‑01** · Inject `(loss=0.1, dup=0.05, reorder=0.1, jitter)`. **Checks**: convergence; bounded retries; no panics.
+
+**Bi‑directional sync**
+- **SYS‑BDS‑01** · Both sides initiate rounds concurrently. **Checks**: safe serialization; ENDSYNC observed by both; no deadlock.
+
+**SV correctness over rounds**
+- **SYS‑SV‑01** · Resume after partial progress. **Checks**: next round starts from updated frontier; no resend < frontier.
+
+**CSR end‑to‑end**
+- **SYS‑CSR‑01** · Break ring into k segments; run CSR. **Checks**: single cycle at committed `e′`; degrees=1 in/out.
+- **SYS‑CSR‑02** · Competing CSR views. **Checks**: only max epoch commits; others NACK/ignored.
+
+**Mixed sync+repair**
+- **SYS‑MIX‑01** · Writes during CSR. **Checks**: sync ignores stale epochs; CSR completes; post‑CSR sync converges.
+
+### 9.4 Performance & Soak
+
+- **PERF‑MT‑01** · Scale leaves `M`: confirm summary cost ~`O(log M)`; measure Δ throughput vs window `c` and chunk size `W`.
+- **PERF‑WIND‑01** · Sweep `c` and `W`: chart goodput vs RTT/loss.
+- **SOAK‑24H‑01** · 24‑hour run with failures/restarts. **Checks**: stable memory/buffers; WAL bounded by compaction; latency distributions stable.
+
+### 9.5 Security & Hardening (optional in non‑Byzantine model)
+- **SEC‑TLS‑01** · mTLS handshake success; unknown certs rejected.
+- **SEC‑CSR‑SIG‑01** · (If enabled) signatures on SEGMENT_AD/plan validated; altered payloads rejected.

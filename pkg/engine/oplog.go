@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"iter"
 	"sort"
+	"sync"
 )
 
 type OpLogEntry struct {
@@ -13,6 +14,7 @@ type OpLogEntry struct {
 }
 
 type OpLog struct {
+	mu    sync.RWMutex // Protect concurrent access to Store and order
 	Store map[OpHash]*Op
 	order []OpLogEntry
 }
@@ -25,6 +27,9 @@ func NewOpLog() *OpLog {
 }
 
 func (o *OpLog) Append(op *Op) (*OpLogEntry, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
 	opHash := op.Hash()
 	// Append must be idempotent
 	if _, ok := o.Store[opHash]; ok {
@@ -55,18 +60,28 @@ func (o *OpLog) Append(op *Op) (*OpLogEntry, bool) {
 }
 
 func (o *OpLog) Get(opHash OpHash) *Op {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
 	return o.Store[opHash]
 }
 
 func (o *OpLog) Len() int {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
 	return len(o.order)
 }
 
 // GetOrdered returns a deterministic total order of ops
 func (o *OpLog) GetOrdered() iter.Seq2[OpCannonicalKey, *Op] {
 	return func(yield func(OpCannonicalKey, *Op) bool) {
-		for _, entry := range o.order {
-			op := o.Store[entry.op.Hash()]
+		o.mu.RLock()
+		// Create a copy of the order slice to avoid holding the lock during iteration
+		orderCopy := make([]OpLogEntry, len(o.order))
+		copy(orderCopy, o.order)
+		o.mu.RUnlock()
+
+		for _, entry := range orderCopy {
+			op := o.Get(entry.hash) // This will acquire its own read lock
 			if !yield(entry.key, op) {
 				return
 			}
@@ -76,10 +91,15 @@ func (o *OpLog) GetOrdered() iter.Seq2[OpCannonicalKey, *Op] {
 
 func (o *OpLog) GetFrom(frontier Frontier) iter.Seq2[OpCannonicalKey, *OpLogEntry] {
 	return func(yield func(OpCannonicalKey, *OpLogEntry) bool) {
+		o.mu.RLock()
+		// Create a copy of the order slice to avoid holding the lock during iteration
+		orderCopy := make([]OpLogEntry, len(o.order))
+		copy(orderCopy, o.order)
+		o.mu.RUnlock()
 
 		startAt := 0
 		if frontier.Set {
-			for i, entry := range o.order {
+			for i, entry := range orderCopy {
 				if bytes.Compare(entry.key[:], frontier.Key[:]) > 0 {
 					startAt = i
 					break
@@ -87,7 +107,7 @@ func (o *OpLog) GetFrom(frontier Frontier) iter.Seq2[OpCannonicalKey, *OpLogEntr
 			}
 		}
 
-		for _, entry := range o.order[startAt:] {
+		for _, entry := range orderCopy[startAt:] {
 			// Skip the entry that matches the frontier key exactly
 			// BUG: this should not be like this, but it's a quick fix
 			if frontier.Set && bytes.Equal(entry.key[:], frontier.Key[:]) {

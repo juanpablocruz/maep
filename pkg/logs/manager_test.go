@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"log"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,8 +17,9 @@ func Test_LogManager_EventBus_Integration(t *testing.T) {
 	// Create EventBus
 	bus := eventbus.NewEventBus()
 
-	// Create a buffer to capture log output
+	// Create a buffer to capture log output with mutex protection
 	var buf bytes.Buffer
+	var bufMutex sync.Mutex
 	logger := log.New(&buf, "", 0)
 
 	// Create LogManager and start it
@@ -42,8 +44,11 @@ func Test_LogManager_EventBus_Integration(t *testing.T) {
 	// and there might be a small timing issue
 	time.Sleep(10 * time.Millisecond)
 
-	// Check that both events were logged
+	// Check that both events were logged with proper synchronization
+	bufMutex.Lock()
 	logOutput := buf.String()
+	bufMutex.Unlock()
+
 	t.Logf("Log output: %s", logOutput)
 	t.Logf("Log output lines: %d", strings.Count(logOutput, "\n"))
 
