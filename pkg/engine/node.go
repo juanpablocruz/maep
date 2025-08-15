@@ -12,6 +12,7 @@ import (
 	"github.com/juanpablocruz/maep/pkg/eventbus"
 	"github.com/juanpablocruz/maep/pkg/fsm"
 	"github.com/juanpablocruz/maep/pkg/logs"
+	"github.com/juanpablocruz/maep/pkg/timer"
 )
 
 // OpsEventSubscriber is a Subscriber to EventBus that handles ops events.
@@ -71,11 +72,11 @@ func (s *StateEventSubscriber) GetWaitGroup() *sync.WaitGroup {
 }
 
 func (s *StateEventSubscriber) OnEvent(event eventbus.Event) {
-	if e, ok := event.(*fsm.InitiatorStateEvent); ok {
+	if e, ok := event.(*fsm.IStateEvent); ok {
 		s.node.FSM.HandleInitiatorEvent(e)
 	}
 
-	if e, ok := event.(*fsm.ResponderStateEvent); ok {
+	if e, ok := event.(*fsm.RStateEvent); ok {
 		s.node.FSM.HandleResponderEvent(e)
 	}
 }
@@ -136,7 +137,7 @@ func NewNode(bus *eventbus.EventBus, opts *NodeOptions) *Node {
 		m:   NewMerkle(*opts.MerkleFanout, *opts.MerkleDepth, opsLog.GetOpLogEntriesFrom),
 		HLC: NewHLC(0, 0),
 		SV:  make(SV),
-		FSM: fsm.NewFSM(),
+		FSM: fsm.NewFSM(bus),
 		bus: bus,
 	}
 
@@ -160,8 +161,11 @@ func (n *Node) Start() {
 	n.bus.Subscribe(opsEventSubscriber)
 	n.bus.Subscribe(fsmEventSubscriber)
 	n.bus.Subscribe(logEventSubscriber)
+	// TODO: Remove timer subscriber
+	timerEventSubscriber := timer.NewTimerEventSubscriber(n.bus)
+	n.bus.Subscribe(timerEventSubscriber)
 
-	n.subscribers = []eventbus.Subscriber{opsEventSubscriber, fsmEventSubscriber, logEventSubscriber}
+	n.subscribers = []eventbus.Subscriber{opsEventSubscriber, fsmEventSubscriber, logEventSubscriber, timerEventSubscriber}
 
 	// Start the eventBus to begin processing events
 	n.bus.Start()
