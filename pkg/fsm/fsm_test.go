@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/juanpablocruz/maep/pkg/eventbus"
+	"github.com/juanpablocruz/maep/pkg/timer"
 )
 
 // Test_FSM_INIT_01_InitialState validates the FSM starts in the correct initial states
@@ -479,6 +480,414 @@ func Test_FSM_ACTIONS_01_ActionEventEmission(t *testing.T) {
 
 	if !endsyncTxEmitted {
 		t.Error("Expected EndsyncTxEvent to be emitted")
+	}
+
+	// Clean up
+	bus.Stop()
+}
+
+// Test_FSM_TIMER_01_TimerIntegration validates FSM integration with timer subscriber
+func Test_FSM_TIMER_01_TimerIntegration(t *testing.T) {
+	// ID: FSM-TIMER-01
+	// Target: FSM (State Machine) + Timer Subscriber
+	// Setup: Create FSM with timer subscriber and event bus
+	// Stimulus: Trigger states that arm timers and handle timeouts
+	// Checks: Timers are armed/disarmed correctly and timeout events are handled
+
+	bus := eventbus.NewEventBus()
+	fsm := NewFSM(bus)
+	timerSub := timer.NewTimerSubscriber(bus)
+
+	// Track timer events
+	var timerEventsMutex sync.Mutex
+	timerEvents := make(map[string]bool)
+	timeoutReceived := false
+
+	// Create subscriber for timer events
+	timerSubscriber := &testSubscriber{
+		eventChan: make(chan eventbus.Event, 10),
+		waitGroup: &sync.WaitGroup{},
+		onEvent: func(event eventbus.Event) {
+			if timerEvent, ok := event.(*TimerEvent); ok {
+				timerEventsMutex.Lock()
+				timerEvents[timerEvent.TimerType] = true
+				timeoutReceived = true
+				timerEventsMutex.Unlock()
+			}
+		},
+	}
+
+	// Subscribe and start
+	bus.Subscribe(timerSubscriber)
+	bus.Start()
+	timerSub.Start()
+
+	// Test 1: Initiator arms summary timer
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: IStartSession})
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: IConnOK, Data: []byte("test summary")})
+
+	// Wait for timer to be armed
+	time.Sleep(100 * time.Millisecond)
+
+	// Check that summary timer is active
+	activeTimers := timerSub.GetActiveTimers()
+	found := false
+	for _, timerType := range activeTimers {
+		if timerType == "summary_timeout" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Expected summary_timeout timer to be active")
+	}
+
+	// Test 2: Disarm timer via summary response
+	fsm.HandleInitiatorEvent(&IStateEvent{
+		Type: ISummaryResp,
+		Data: &SummaryResponseEvent{RootEq: true},
+	})
+
+	// Wait for timer to be disarmed
+	time.Sleep(100 * time.Millisecond)
+
+	// Check that timer is no longer active
+	activeTimers = timerSub.GetActiveTimers()
+	found = false
+	for _, timerType := range activeTimers {
+		if timerType == "summary_timeout" {
+			found = true
+			break
+		}
+	}
+	if found {
+		t.Error("Expected summary_timeout timer to be disarmed")
+	}
+
+	// Test 3: Test timeout scenario
+	// Start a new session and arm timer
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: IStartSession})
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: IConnOK, Data: []byte("test summary 2")})
+
+	// Wait for timer to be armed
+	time.Sleep(100 * time.Millisecond)
+
+	// Manually trigger timeout by publishing TimerEvent
+	bus.Publish(&TimerEvent{TimerType: "summary_timeout"})
+
+	// Wait for timeout processing
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify timeout was received
+	timerEventsMutex.Lock()
+	received := timeoutReceived
+	timerEventsMutex.Unlock()
+
+	if !received {
+		t.Error("Expected timeout event to be received")
+	}
+
+	// Clean up
+	timerSub.Stop()
+	bus.Stop()
+}
+
+// Test_FSM_TIMER_02_TimeoutRetransmission validates timeout retransmission behavior
+func Test_FSM_TIMER_02_TimeoutRetransmission(t *testing.T) {
+	// ID: FSM-TIMER-02
+	// Target: FSM (State Machine) + Timer Subscriber
+	// Setup: Create FSM with timer subscriber
+	// Stimulus: Trigger timeout and verify retransmission
+	// Checks: FSM properly handles timeout and retransmits
+
+	bus := eventbus.NewEventBus()
+	fsm := NewFSM(bus)
+	timerSub := timer.NewTimerSubscriber(bus)
+
+	// Track retransmit events
+	var retransmitCount int
+	var retransmitMutex sync.Mutex
+
+	retransmitSubscriber := &testSubscriber{
+		eventChan: make(chan eventbus.Event, 10),
+		waitGroup: &sync.WaitGroup{},
+		onEvent: func(event eventbus.Event) {
+			if _, ok := event.(*RetransmitEvent); ok {
+				retransmitMutex.Lock()
+				retransmitCount++
+				retransmitMutex.Unlock()
+			}
+		},
+	}
+
+	// Subscribe and start
+	bus.Subscribe(retransmitSubscriber)
+	bus.Start()
+	timerSub.Start()
+
+	// Start session and arm timer
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: IStartSession})
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: IConnOK, Data: []byte("test summary")})
+
+	// Verify we're in WAIT_PROOFS state
+	if fsm.GetInitiatorState() != IWaitProofs {
+		t.Errorf("Expected IWaitProofs, got %v", fsm.GetInitiatorState())
+	}
+
+	// Trigger timeout
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: ITimeout})
+
+	// Wait for retransmission processing
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify retransmit event was emitted
+	retransmitMutex.Lock()
+	count := retransmitCount
+	retransmitMutex.Unlock()
+
+	if count == 0 {
+		t.Error("Expected RetransmitEvent to be emitted on timeout")
+	}
+
+	// Verify we're still in WAIT_PROOFS (ready for next response)
+	if fsm.GetInitiatorState() != IWaitProofs {
+		t.Errorf("Expected IWaitProofs after timeout, got %v", fsm.GetInitiatorState())
+	}
+
+	// Clean up
+	timerSub.Stop()
+	bus.Stop()
+}
+
+// Test_FSM_TIMER_03_DeltaChunkTimeout validates delta chunk timeout handling
+func Test_FSM_TIMER_03_DeltaChunkTimeout(t *testing.T) {
+	// ID: FSM-TIMER-03
+	// Target: FSM (State Machine) + Timer Subscriber
+	// Setup: Create FSM and get to WAIT_ACK state
+	// Stimulus: Trigger timeout in WAIT_ACK state
+	// Checks: Delta chunk timer is armed/disarmed correctly
+
+	bus := eventbus.NewEventBus()
+	fsm := NewFSM(bus)
+	timerSub := timer.NewTimerSubscriber(bus)
+
+	// Subscribe and start
+	bus.Start()
+	timerSub.Start()
+
+	// Get to WAIT_ACK state through the initiator path
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: IStartSession})
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: IConnOK})
+	fsm.HandleInitiatorEvent(&IStateEvent{
+		Type: ISummaryResp,
+		Data: &SummaryResponseEvent{RootEq: false},
+	})
+
+	// Verify we're in WAIT_ACK state
+	if fsm.GetInitiatorState() != IWaitAck {
+		t.Errorf("Expected IWaitAck, got %v", fsm.GetInitiatorState())
+	}
+
+	// Wait for delta chunk timer to be armed
+	time.Sleep(100 * time.Millisecond)
+
+	// Check that delta chunk timer is active
+	activeTimers := timerSub.GetActiveTimers()
+	found := false
+	for _, timerType := range activeTimers {
+		if timerType == "delta_timeout" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Expected delta_timeout timer to be active")
+	}
+
+	// Test timeout handling
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: ITimeout})
+
+	// Wait for retransmission processing
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify we're still in WAIT_ACK (ready for next ack)
+	if fsm.GetInitiatorState() != IWaitAck {
+		t.Errorf("Expected IWaitAck after timeout, got %v", fsm.GetInitiatorState())
+	}
+
+	// Test ack handling (disarms timer)
+	fsm.HandleInitiatorEvent(&IStateEvent{
+		Type: IAck,
+		Data: &AckEvent{MoreChunks: false},
+	})
+
+	// Wait for timer to be disarmed
+	time.Sleep(100 * time.Millisecond)
+
+	// Check that timer is no longer active
+	activeTimers = timerSub.GetActiveTimers()
+	found = false
+	for _, timerType := range activeTimers {
+		if timerType == "delta_timeout" {
+			found = true
+			break
+		}
+	}
+	if found {
+		t.Error("Expected delta_timeout timer to be disarmed")
+	}
+
+	// Clean up
+	timerSub.Stop()
+	bus.Stop()
+}
+
+// Test_FSM_TIMER_04_MultipleTimerScenarios validates multiple timer scenarios
+func Test_FSM_TIMER_04_MultipleTimerScenarios(t *testing.T) {
+	// ID: FSM-TIMER-04
+	// Target: FSM (State Machine) + Timer Subscriber
+	// Setup: Create FSM with timer subscriber
+	// Stimulus: Test various timer scenarios including multiple timers
+	// Checks: Multiple timers work correctly and don't interfere
+
+	bus := eventbus.NewEventBus()
+	fsm := NewFSM(bus)
+	timerSub := timer.NewTimerSubscriber(bus)
+
+	// Track timer events
+	var timerEventsMutex sync.Mutex
+	timerEvents := make(map[string]int)
+
+	timerSubscriber := &testSubscriber{
+		eventChan: make(chan eventbus.Event, 10),
+		waitGroup: &sync.WaitGroup{},
+		onEvent: func(event eventbus.Event) {
+			if armEvent, ok := event.(*ArmTimerEvent); ok {
+				timerEventsMutex.Lock()
+				timerEvents[armEvent.TimerType]++
+				timerEventsMutex.Unlock()
+			}
+		},
+	}
+
+	// Subscribe and start
+	bus.Subscribe(timerSubscriber)
+	bus.Start()
+	timerSub.Start()
+
+	// Test 1: Multiple summary timeouts (retransmissions)
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: IStartSession})
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: IConnOK, Data: []byte("test summary 1")})
+
+	// Trigger timeout and retransmit
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: ITimeout})
+	time.Sleep(100 * time.Millisecond)
+
+	// Trigger another timeout
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: ITimeout})
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify multiple summary timers were armed
+	timerEventsMutex.Lock()
+	summaryCount := timerEvents["summary_timeout"]
+	timerEventsMutex.Unlock()
+
+	if summaryCount < 2 {
+		t.Errorf("Expected at least 2 summary timers to be armed, got %d", summaryCount)
+	}
+
+	// Test 2: Delta chunk timeouts
+	fsm.HandleInitiatorEvent(&IStateEvent{
+		Type: ISummaryResp,
+		Data: &SummaryResponseEvent{RootEq: false},
+	})
+
+	// Trigger timeout in WAIT_ACK
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: ITimeout})
+	time.Sleep(100 * time.Millisecond)
+
+	// Trigger another timeout
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: ITimeout})
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify delta chunk timers were armed
+	timerEventsMutex.Lock()
+	deltaCount := timerEvents["delta_timeout"]
+	timerEventsMutex.Unlock()
+
+	if deltaCount < 2 {
+		t.Errorf("Expected at least 2 delta chunk timers to be armed, got %d", deltaCount)
+	}
+
+	// Test 3: Verify only one timer is active at a time
+	activeTimers := timerSub.GetActiveTimers()
+	if len(activeTimers) > 1 {
+		t.Errorf("Expected at most 1 active timer, got %d: %v", len(activeTimers), activeTimers)
+	}
+
+	// Clean up
+	timerSub.Stop()
+	bus.Stop()
+}
+
+// Test_FSM_TIMER_05_TimerCleanup validates proper timer cleanup
+func Test_FSM_TIMER_05_TimerCleanup(t *testing.T) {
+	// ID: FSM-TIMER-05
+	// Target: FSM (State Machine) + Timer Subscriber
+	// Setup: Create FSM with timer subscriber and arm timers
+	// Stimulus: Test various cleanup scenarios
+	// Checks: Timers are properly cleaned up in all scenarios
+
+	bus := eventbus.NewEventBus()
+	fsm := NewFSM(bus)
+	timerSub := timer.NewTimerSubscriber(bus)
+
+	// Subscribe and start
+	bus.Start()
+	timerSub.Start()
+
+	// Test 1: Arm timer and then disarm via normal flow
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: IStartSession})
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: IConnOK, Data: []byte("test summary")})
+
+	// Wait for timer to be armed
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify timer is active
+	activeTimers := timerSub.GetActiveTimers()
+	if len(activeTimers) == 0 {
+		t.Error("Expected timer to be active")
+	}
+
+	// Disarm via summary response
+	fsm.HandleInitiatorEvent(&IStateEvent{
+		Type: ISummaryResp,
+		Data: &SummaryResponseEvent{RootEq: true},
+	})
+
+	// Wait for disarm
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify timer is disarmed
+	activeTimers = timerSub.GetActiveTimers()
+	if len(activeTimers) > 0 {
+		t.Errorf("Expected no active timers, got %v", activeTimers)
+	}
+
+	// Test 2: Arm timer and stop timer subscriber
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: IStartSession})
+	fsm.HandleInitiatorEvent(&IStateEvent{Type: IConnOK, Data: []byte("test summary 2")})
+
+	// Wait for timer to be armed
+	time.Sleep(100 * time.Millisecond)
+
+	// Stop timer subscriber
+	timerSub.Stop()
+
+	// Verify all timers are cleaned up
+	activeTimers = timerSub.GetActiveTimers()
+	if len(activeTimers) > 0 {
+		t.Errorf("Expected no active timers after stop, got %v", activeTimers)
 	}
 
 	// Clean up
