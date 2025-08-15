@@ -13,14 +13,31 @@ import (
 	"github.com/juanpablocruz/maep/pkg/testutils"
 )
 
+// ThreadSafeBuffer is a thread-safe wrapper around bytes.Buffer
+type ThreadSafeBuffer struct {
+	buf bytes.Buffer
+	mu  sync.RWMutex
+}
+
+func (tsb *ThreadSafeBuffer) Write(p []byte) (n int, err error) {
+	tsb.mu.Lock()
+	defer tsb.mu.Unlock()
+	return tsb.buf.Write(p)
+}
+
+func (tsb *ThreadSafeBuffer) String() string {
+	tsb.mu.RLock()
+	defer tsb.mu.RUnlock()
+	return tsb.buf.String()
+}
+
 func Test_LogManager_EventBus_Integration(t *testing.T) {
 	// Create EventBus
 	bus := eventbus.NewEventBus()
 
-	// Create a buffer to capture log output with mutex protection
-	var buf bytes.Buffer
-	var bufMutex sync.Mutex
-	logger := log.New(&buf, "", 0)
+	// Create a thread-safe buffer to capture log output
+	tsBuffer := &ThreadSafeBuffer{}
+	logger := log.New(tsBuffer, "", 0)
 
 	// Create LogManager and start it
 	logManager := NewLogManager(logger)
@@ -40,14 +57,12 @@ func Test_LogManager_EventBus_Integration(t *testing.T) {
 	logManager.WaitForProcessing()
 
 	// Add a small delay to ensure all events are processed
-	// This is needed because the EventBus publishes synchronously
+	// This is needed because the EventBus publishes asynchronously
 	// and there might be a small timing issue
 	time.Sleep(10 * time.Millisecond)
 
-	// Check that both events were logged with proper synchronization
-	bufMutex.Lock()
-	logOutput := buf.String()
-	bufMutex.Unlock()
+	// Check that both events were logged
+	logOutput := tsBuffer.String()
 
 	t.Logf("Log output: %s", logOutput)
 	t.Logf("Log output lines: %d", strings.Count(logOutput, "\n"))

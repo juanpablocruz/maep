@@ -58,10 +58,6 @@ func Test_Node_DefaultOptions(t *testing.T) {
 	if node.m == nil {
 		t.Error("Expected Merkle tree to be initialized")
 	}
-
-	if node.ch == nil {
-		t.Error("Expected event channel to be initialized")
-	}
 }
 
 func Test_Node_PartialOptions(t *testing.T) {

@@ -8,17 +8,30 @@ import (
 	"sync"
 
 	"github.com/juanpablocruz/maep/pkg/eventbus"
+	"github.com/juanpablocruz/maep/pkg/fsm"
 )
 
 // OpsEventSubscriber is a Subscriber to EventBus that handles ops events.
 type OpsEventSubscriber struct {
+	ch   chan eventbus.Event
+	wg   *sync.WaitGroup
 	node *Node
 }
 
 func NewOpsEventSubscriber(node *Node) *OpsEventSubscriber {
 	return &OpsEventSubscriber{
 		node: node,
+		ch:   make(chan eventbus.Event, 100),
+		wg:   &sync.WaitGroup{},
 	}
+}
+
+func (s *OpsEventSubscriber) GetChannel() chan eventbus.Event {
+	return s.ch
+}
+
+func (s *OpsEventSubscriber) GetWaitGroup() *sync.WaitGroup {
+	return s.wg
 }
 
 func (s *OpsEventSubscriber) OnEvent(event eventbus.Event) {
@@ -30,20 +43,52 @@ func (s *OpsEventSubscriber) OnEvent(event eventbus.Event) {
 	}
 }
 
+type StateEventSubscriber struct {
+	node *Node
+	ch   chan eventbus.Event
+	wg   *sync.WaitGroup
+}
+
+func NewStateEventSubscriber(node *Node) *StateEventSubscriber {
+	return &StateEventSubscriber{
+		node: node,
+		ch:   make(chan eventbus.Event, 100),
+		wg:   &sync.WaitGroup{},
+	}
+}
+
+func (s *StateEventSubscriber) GetChannel() chan eventbus.Event {
+	return s.ch
+}
+
+func (s *StateEventSubscriber) GetWaitGroup() *sync.WaitGroup {
+	return s.wg
+}
+
+func (s *StateEventSubscriber) OnEvent(event eventbus.Event) {
+	if e, ok := event.(*fsm.InitiatorStateEvent); ok {
+		s.node.FSM.HandleInitiatorEvent(e)
+	}
+
+	if e, ok := event.(*fsm.ResponderStateEvent); ok {
+		s.node.FSM.HandleResponderEvent(e)
+	}
+}
+
 type Node struct {
 	ID      PeerID
 	SV      SV
-	bus     *OpsEventSubscriber
 	ops     *OpLog
-	wg      sync.WaitGroup
-	ch      chan eventbus.Event
 	started bool
 	mu      sync.RWMutex // Protect started field and other state
 
-	frontier Frontier
+	frontier    Frontier
+	subscribers []eventbus.Subscriber
 
 	m   *Merkle
 	HLC HLCTimestamp
+
+	FSM *fsm.FSM
 }
 
 type NodeOptions struct {
@@ -82,13 +127,12 @@ func NewNode(bus *eventbus.EventBus, opts *NodeOptions) *Node {
 	opsLog := NewOpLog()
 	node := &Node{
 		ops: opsLog,
-		ch:  make(chan eventbus.Event),
 		m:   NewMerkle(*opts.MerkleFanout, *opts.MerkleDepth, opsLog.GetOpLogEntriesFrom),
 		HLC: NewHLC(0, 0),
 		SV:  make(SV),
+		FSM: fsm.NewFSM(),
 	}
-	subscriber := NewOpsEventSubscriber(node)
-	node.bus = subscriber
+
 	return node
 }
 
@@ -100,14 +144,16 @@ func (n *Node) Start(bus *eventbus.EventBus) {
 		return
 	}
 
-	go func() {
-		for event := range n.ch {
-			n.bus.OnEvent(event)
-			n.wg.Done()
-		}
-	}()
-	s := eventbus.NewSubscriber(n.ch, &n.wg)
-	bus.Subscribe(*s)
+	opsEventSubscriber := NewOpsEventSubscriber(n)
+	fsmEventSubscriber := NewStateEventSubscriber(n)
+
+	bus.Subscribe(opsEventSubscriber)
+	bus.Subscribe(fsmEventSubscriber)
+
+	n.subscribers = []eventbus.Subscriber{opsEventSubscriber, fsmEventSubscriber}
+
+	// Start the eventBus to begin processing events
+	bus.Start()
 
 	n.started = true
 }
@@ -117,7 +163,9 @@ func (n *Node) addOp(op *Op) (*OpLogEntry, bool) {
 }
 
 func (n *Node) WaitForProcessing() {
-	n.wg.Wait()
+	for _, s := range n.subscribers {
+		s.GetWaitGroup().Wait()
+	}
 }
 
 func (n *Node) drainOnce() {
@@ -172,7 +220,9 @@ func (n *Node) Stop() {
 	if !n.started {
 		return
 	}
-	close(n.ch)
+	for _, s := range n.subscribers {
+		close(s.GetChannel())
+	}
 	n.started = false
 }
 

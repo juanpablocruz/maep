@@ -36,8 +36,8 @@ func (lm *LogManager) Start(bus *eventbus.EventBus) {
 			lm.wg.Done()
 		}
 	}()
-	s := eventbus.NewSubscriber(lm.ch, &lm.wg)
-	bus.Subscribe(*s)
+	bus.Subscribe(lm.subscriber)
+	bus.Start()
 	lm.started = true
 }
 
