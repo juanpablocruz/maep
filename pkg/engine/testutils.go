@@ -39,7 +39,7 @@ func WithValue(v []byte) func(o *Op) {
 	}
 }
 
-func generateOp(options ...OpOption) Op {
+func GenerateOp(options ...OpOption) Op {
 	actorID := actor.NewActor()
 	h := hlc.NewWithPT(hlc.PT{})
 	k := make([]byte, 16)
@@ -63,10 +63,10 @@ func generateOp(options ...OpOption) Op {
 	return op
 }
 
-func generateOps(n int) []Op {
+func GenerateOps(n int) []Op {
 	ops := make([]Op, 0)
 	for range n {
-		o := generateOp()
+		o := GenerateOp()
 		ops = append(ops, o)
 	}
 	return ops

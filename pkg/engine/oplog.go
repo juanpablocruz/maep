@@ -13,6 +13,10 @@ type OpLogEntry struct {
 	key  OpCannonicalKey
 }
 
+func (ole OpLogEntry) CanonicalKey() OpCannonicalKey {
+	return ole.op.CanonicalKey()
+}
+
 type OpLog struct {
 	mu    sync.RWMutex // Protect concurrent access to Store and order
 	Store map[OpHash]*Op
@@ -114,6 +118,7 @@ func (o *OpLog) GetOpLogEntriesFrom(low, high OpCannonicalKey) iter.Seq2[OpCanno
 		o.mu.RUnlock()
 
 		startAt := len(orderCopy)
+
 		endAt := len(orderCopy)
 		for i, entry := range orderCopy {
 			if bytes.Equal(entry.key[:], low[:]) {
@@ -123,6 +128,12 @@ func (o *OpLog) GetOpLogEntriesFrom(low, high OpCannonicalKey) iter.Seq2[OpCanno
 			if bytes.Equal(entry.key[:], high[:]) {
 				endAt = i
 			}
+		}
+
+		zero := OpCannonicalKey{}
+
+		if bytes.Equal(zero[:], low[:]) {
+			startAt = 0
 		}
 
 		if startAt > endAt {
@@ -136,4 +147,10 @@ func (o *OpLog) GetOpLogEntriesFrom(low, high OpCannonicalKey) iter.Seq2[OpCanno
 			}
 		}
 	}
+}
+
+func (o *OpLog) GetAll() iter.Seq2[OpCannonicalKey, *OpLogEntry] {
+	first := o.order[0].op.CanonicalKey()
+	last := o.order[len(o.order)-1].op.CanonicalKey()
+	return o.GetOpLogEntriesFrom(first, last)
 }

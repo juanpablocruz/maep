@@ -23,7 +23,7 @@ func Test_CORE_OPS_01_ConsistentHash(t *testing.T) {
 		Count: 1,
 	}
 
-	o := generateOp(
+	o := GenerateOp(
 		WithActorID(actorId),
 		WithHLC(ts),
 		WithKey([]byte("key1")),
@@ -33,7 +33,7 @@ func Test_CORE_OPS_01_ConsistentHash(t *testing.T) {
 	hash := o.Hash()
 	t.Logf("hash: %x", hash)
 
-	o2 := generateOp(
+	o2 := GenerateOp(
 		WithActorID(actorId),
 		WithHLC(ts),
 		WithKey([]byte("key1")),
@@ -59,7 +59,7 @@ func Test_CORE_OPS_02_UniqueHash(t *testing.T) {
 		TS:    1,
 		Count: 1,
 	}
-	o := generateOp(
+	o := GenerateOp(
 		WithKey([]byte("key1")),
 		WithValue([]byte("value1")),
 		WithHLC(ts),
@@ -68,7 +68,7 @@ func Test_CORE_OPS_02_UniqueHash(t *testing.T) {
 	hash := o.Hash()
 	t.Logf("hash: %x", hash)
 
-	o2 := generateOp(
+	o2 := GenerateOp(
 		WithKey([]byte("key2")),
 		WithValue([]byte("value2")),
 		WithHLC(ts),
@@ -89,7 +89,7 @@ func Test_CORE_OPS_03_Decode(t *testing.T) {
 	// Setup: Create operation and encode it
 	// Stimulus: Decode the encoded operation
 	// Checks: Decoded operation matches original
-	o := generateOp(
+	o := GenerateOp(
 		WithKey([]byte("key1")),
 		WithValue([]byte("value1")),
 	)

@@ -8,7 +8,7 @@ import (
 func Test_OPLOG_Append_00(t *testing.T) {
 
 	opLog := NewOpLog()
-	ops := generateOps(10)
+	ops := GenerateOps(10)
 	for _, o := range ops {
 		opLog.Append(&o)
 	}
@@ -21,7 +21,7 @@ func Test_OPLOG_Append_00(t *testing.T) {
 
 func Test_OPLOG_AppendIdempotence_01(t *testing.T) {
 	opLog := NewOpLog()
-	ops := generateOps(10)
+	ops := GenerateOps(10)
 	for _, o := range ops {
 		opLog.Append(&o)
 	}
@@ -41,23 +41,23 @@ func Test_OPLOG_GetOrdered_02(t *testing.T) {
 
 	// Create 5 operations with known values
 	ops := []Op{
-		generateOp(
+		GenerateOp(
 			WithKey([]byte("key1")),
 			WithValue([]byte("value1")),
 		),
-		generateOp(
+		GenerateOp(
 			WithKey([]byte("key2")),
 			WithValue([]byte("value2")),
 		),
-		generateOp(
+		GenerateOp(
 			WithKey([]byte("key3")),
 			WithValue([]byte("value3")),
 		),
-		generateOp(
+		GenerateOp(
 			WithKey([]byte("key4")),
 			WithValue([]byte("value4")),
 		),
-		generateOp(
+		GenerateOp(
 			WithKey([]byte("key5")),
 			WithValue([]byte("value5")),
 		),
@@ -127,7 +127,7 @@ func Test_OPLOG_GetOrdered_02(t *testing.T) {
 
 func Test_OPLOG_Get_03(t *testing.T) {
 	opLog := NewOpLog()
-	ops := generateOps(5)
+	ops := GenerateOps(5)
 
 	for _, o := range ops {
 		opLog.Append(&o)
@@ -143,7 +143,7 @@ func Test_OPLOG_Get_03(t *testing.T) {
 func Test_OPLOG_GetFrom_04(t *testing.T) {
 
 	opLog := NewOpLog()
-	ops := generateOps(5)
+	ops := GenerateOps(5)
 
 	for _, o := range ops {
 		opLog.Append(&o)
@@ -164,7 +164,7 @@ func Test_OPLOG_GetFrom_04(t *testing.T) {
 
 func Test_OPLOG_GetFromEmpty_04(t *testing.T) {
 	opLog := NewOpLog()
-	ops := generateOps(5)
+	ops := GenerateOps(5)
 
 	for _, o := range ops {
 		opLog.Append(&o)
