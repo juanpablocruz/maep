@@ -125,7 +125,7 @@ func Test_OPLOG_GetOrdered_02(t *testing.T) {
 	}
 }
 
-func Test_OPLOG_GET_03(t *testing.T) {
+func Test_OPLOG_Get_03(t *testing.T) {
 	opLog := NewOpLog()
 	ops := generateOps(5)
 
@@ -137,5 +137,49 @@ func Test_OPLOG_GET_03(t *testing.T) {
 
 	if !bytes.Equal(so.Encode(), ops[1].Encode()) {
 		t.Errorf("expected get to return op")
+	}
+}
+
+func Test_OPLOG_GetFrom_04(t *testing.T) {
+
+	opLog := NewOpLog()
+	ops := generateOps(5)
+
+	for _, o := range ops {
+		opLog.Append(&o)
+	}
+
+	sOpLogs := make([]*OpLogEntry, 0)
+	frontier := Frontier{
+		Key: ops[2].CanonicalKey(),
+	}
+	for _, o := range opLog.GetFrom(frontier) {
+		sOpLogs = append(sOpLogs, o)
+	}
+
+	if len(sOpLogs) != 2 {
+		t.Errorf("expected len %d, received %d", 2, len(sOpLogs))
+	}
+}
+
+func Test_OPLOG_GetFromEmpty_04(t *testing.T) {
+	opLog := NewOpLog()
+	ops := generateOps(5)
+
+	for _, o := range ops {
+		opLog.Append(&o)
+	}
+
+	sOpLogs := make([]*OpLogEntry, 0)
+	frontier := Frontier{
+		Key: OpCannonicalKey{},
+	}
+	copy(frontier.Key[:], []byte("aa"))
+	for _, o := range opLog.GetFrom(frontier) {
+		sOpLogs = append(sOpLogs, o)
+	}
+
+	if len(sOpLogs) != 0 {
+		t.Errorf("expected len %d, received %d", 0, len(sOpLogs))
 	}
 }
