@@ -459,10 +459,6 @@ func Test_MERKLE_Descent_08(t *testing.T) {
 	if len(summaries) != 16 {
 		t.Errorf("expected 16 children, got %d", len(summaries))
 	}
-
-	for i := range summaries {
-		t.Logf("Hash: %x, Count: %d, LastK: %x\n", summaries[i].Hash, summaries[i].Count, summaries[i].LastK)
-	}
 }
 
 func Test_MERKLE_DiffDescent_09(t *testing.T) {
@@ -505,4 +501,5 @@ func Test_MERKLE_DiffDescent_09(t *testing.T) {
 	}
 	// Optional: check the exact path if you expect it
 	t.Log(met.String())
+	t.Logf("diffs: %v", diffs)
 }
