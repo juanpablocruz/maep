@@ -1,6 +1,7 @@
 package merkle_test
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/juanpablocruz/maep/pkg/engine"
@@ -12,10 +13,10 @@ type TestHasher struct {
 	opLog *engine.OpLog
 }
 
-func (th TestHasher) Sort(hs []merkle.Hash) {
-	newOrder := make([]merkle.Hash, 0)
+func (th TestHasher) Sort(hs []merkle.OpHash) {
+	newOrder := make([]merkle.OpHash, 0)
 	for _, o := range th.opLog.GetOrdered() {
-		h := merkle.Hash{}
+		h := merkle.OpHash{}
 		oH := o.CanonicalKey()
 		copy(h[:], oH[:])
 		newOrder = append(newOrder, h)
@@ -46,8 +47,8 @@ type OpLogMerkleEntry struct {
 	hash  engine.OpCannonicalKey
 }
 
-func (ome OpLogMerkleEntry) ComputeHash() merkle.Hash {
-	var hash merkle.Hash
+func (ome OpLogMerkleEntry) ComputeHash() merkle.OpHash {
+	var hash merkle.OpHash
 	copy(hash[:], ome.hash[:])
 	return hash
 }
@@ -360,7 +361,7 @@ func Test_MERKLE_TreeStructure_06(t *testing.T) {
 	}
 }
 
-func Test_MERKLE_Proof_Verify(t *testing.T) {
+func Test_MERKLE_Proof_Verify_07(t *testing.T) {
 
 	cfg := merkle.Config{
 		Fanout:   16,
@@ -397,12 +398,111 @@ func Test_MERKLE_Proof_Verify(t *testing.T) {
 	// Test that tree maintains consistency after multiple operations
 	snapshot1 := m.Snapshot()
 
-	proof, err := snapshot1.ProofForKey(merkle.Hash(operations[0].opLog.CanonicalKey()))
+	fmt.Printf("Snapshot1: %x\n", snapshot1.Root())
+
+	proof, err := snapshot1.ProofForKey(merkle.OpHash(operations[0].opLog.CanonicalKey()))
 	if err != nil {
 		t.Fatalf("error computing proof for key: %v", err)
 	}
 
-	if !merkle.VerifyOpProof(snapshot1.Root(), merkle.Hash(operations[0].opLog.CanonicalKey()), 2, proof, th) {
+	if !merkle.VerifyOpProof(snapshot1.Root(), merkle.OpHash(operations[0].opLog.CanonicalKey()), 2, proof, th) {
 		t.Errorf("proof verification failed")
 	}
+}
+
+func Test_MERKLE_Descent_08(t *testing.T) {
+	cfg := merkle.Config{
+		Fanout:   16,
+		MaxDepth: 2, // Small depth for easier testing
+	}
+	th := NewTestHasher()
+	cfg.Hasher = th
+	m, err := merkle.New(cfg)
+	if err != nil {
+		t.Fatalf("error creating merkle tree: %v", err)
+	}
+
+	// Append operations with different hashes to test tree structure
+	operations := []OpLogMerkleEntry{}
+	for i := range 3 {
+		ome := OpLogMerkleEntry{}
+		ome.opLog = th.ops[i]
+		ome.hash = ome.opLog.CanonicalKey()
+		operations = append(operations, ome)
+
+		err = m.AppendOp(ome)
+		if err != nil {
+			t.Fatalf("error appending operation %d: %v", i, err)
+		}
+	}
+
+	// Verify all operations are in tree
+	for i, ome := range operations {
+		if !m.ContainsOp(ome) {
+			t.Fatalf("operation %d should be in tree", i)
+		}
+	}
+
+	snapshot1 := m.Snapshot()
+	p := merkle.Prefix{
+		Depth: 2,
+		Path:  []uint8{1, 8},
+	}
+	summaries, err := snapshot1.Children(p)
+	visualize := merkle.NewVisualizer(m)
+	t.Logf("Tree: %s\n", visualize.VisualizeTree())
+
+	if err != nil {
+		t.Fatalf("error computing children: %v", err)
+	}
+
+	if len(summaries) != 16 {
+		t.Errorf("expected 16 children, got %d", len(summaries))
+	}
+
+	for i := range summaries {
+		t.Logf("Hash: %x, Count: %d, LastK: %x\n", summaries[i].Hash, summaries[i].Count, summaries[i].LastK)
+	}
+}
+
+func Test_MERKLE_DiffDescent_09(t *testing.T) {
+	cfg := merkle.Config{Fanout: 16, MaxDepth: 2, Hasher: NewTestHasher()}
+
+	mA, _ := merkle.New(cfg)
+	mB, _ := merkle.New(cfg)
+
+	th := NewTestHasher()
+
+	// Append the same 3 ops to both nodes
+	for i := range 3 {
+		ome := OpLogMerkleEntry{opLog: th.ops[i], hash: th.ops[i].CanonicalKey()}
+		_ = mA.AppendOp(ome)
+		_ = mB.AppendOp(ome)
+	}
+
+	// Take snapshots (both at the same root now)
+	sA := mA.Snapshot()
+
+	// Diverge B with one extra op, then snapshot
+	extra := engine.GenerateOp()
+	extraLog, _ := th.opLog.Append(&extra)
+	e := OpLogMerkleEntry{opLog: *extraLog, hash: extraLog.CanonicalKey()}
+	_ = mB.AppendOp(e)
+	sB := mB.Snapshot()
+
+	diffs, met, err := merkle.DiffDescent(
+		sA,
+		sB.Root(),
+		sB.MaxDepth(),
+		func(p merkle.Prefix) ([]merkle.Summary, error) { return sB.Children(p) }, // mock transport
+	)
+	if err != nil {
+		t.Fatalf("diff failed: %v", err)
+	}
+
+	if len(diffs) != 1 {
+		t.Fatalf("want 1 diff leaf-parent, got %d", len(diffs))
+	}
+	// Optional: check the exact path if you expect it
+	t.Log(met.String())
 }

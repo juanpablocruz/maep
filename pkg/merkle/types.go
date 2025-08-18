@@ -1,6 +1,7 @@
 package merkle
 
-type Hash [60]byte
+type Hash [32]byte
+type OpHash [64]byte
 
 // Prefix identifies a subtree by base-k digits of a canonical key hash.
 // Path[i] ∈ [0..k-1], len(Path) == Depth.
@@ -12,20 +13,21 @@ type Prefix struct {
 type Summary struct {
 	Hash  Hash   // Subtree digest
 	Count uint64 // total ops under this child subtree
-	LastK Hash   // MAEP ordered max key hash present in this chils, zero if empty
+	LastK OpHash // MAEP ordered max key hash present in this chils, zero if empty
 }
 
 type Proof struct {
 	Fanout int
+	Leaf   []OpHash
 	Nodes  [][]Hash
 }
 
 type MerkleEntry interface {
-	ComputeHash() Hash
+	ComputeHash() OpHash
 }
 
 type Hasher interface {
-	Sort([]Hash)
+	Sort([]OpHash)
 }
 
 // Snapshot is an immutable point-in-time view for the summary path.
@@ -33,7 +35,7 @@ type Snapshot interface {
 	// Shape
 	Fanout() int
 	MaxDepth() int
-
+	Count() int
 	// Root digets for the whole tree.
 	Root() Hash
 
@@ -41,7 +43,7 @@ type Snapshot interface {
 	// for out-of-range prefixes, returns an error
 	Children(p Prefix) ([]Summary, error)
 
-	ProofForKey(key Hash) (Proof, error)
+	ProofForKey(key OpHash) (Proof, error)
 	Epoch() uint64 // passive epoch tag for observability
 
 	// Release resources associated with the snapshot
@@ -80,3 +82,5 @@ type Update struct {
 	Key   Hash
 	Delta int64
 }
+
+type ChildrenFetcher func(p Prefix) ([]Summary, error)

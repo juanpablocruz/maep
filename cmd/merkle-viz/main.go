@@ -16,10 +16,10 @@ type TestHasher struct {
 	opLog *engine.OpLog
 }
 
-func (th TestHasher) Sort(hs []merkle.Hash) {
-	newOrder := make([]merkle.Hash, 0)
+func (th TestHasher) Sort(hs []merkle.OpHash) {
+	newOrder := make([]merkle.OpHash, 0)
 	for _, o := range th.opLog.GetOrdered() {
-		h := merkle.Hash{}
+		h := merkle.OpHash{}
 		oH := o.CanonicalKey()
 		copy(h[:], oH[:])
 		newOrder = append(newOrder, h)
@@ -50,8 +50,8 @@ type OpLogMerkleEntry struct {
 	hash  engine.OpCannonicalKey
 }
 
-func (ome OpLogMerkleEntry) ComputeHash() merkle.Hash {
-	return merkle.Hash(ome.hash[:])
+func (ome OpLogMerkleEntry) ComputeHash() merkle.OpHash {
+	return merkle.OpHash(ome.hash[:])
 }
 
 func main() {
@@ -77,7 +77,7 @@ func main() {
 
 	// Add some initial operations
 	fmt.Println("Adding initial operations...")
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		ome := OpLogMerkleEntry{}
 		ome.opLog = th.ops[i]
 		ome.hash = ome.opLog.CanonicalKey()

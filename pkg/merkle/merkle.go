@@ -26,13 +26,14 @@ type Merkle struct {
 type MerkleNode struct {
 	Hash  Hash
 	Count uint64
-	LastK Hash
+	LastK OpHash
 	Child [16]*MerkleNode
 
-	Ops map[Hash]struct{}
+	Ops map[OpHash]struct{}
 }
 
-func zeroHash() Hash { return Hash{} }
+func zeroHash() Hash     { return Hash{} }
+func zeroOpHash() OpHash { return OpHash{} }
 
 func New(cfg Config) (*Merkle, error) {
 	// Validate configuration
@@ -149,7 +150,7 @@ func (m *Merkle) AppendOp(e MerkleEntry) error {
 
 	leaf := node
 	if leaf.Ops == nil {
-		leaf.Ops = make(map[Hash]struct{})
+		leaf.Ops = make(map[OpHash]struct{})
 	}
 	if _, exists := leaf.Ops[opHash]; exists {
 		// idempotent
@@ -158,8 +159,8 @@ func (m *Merkle) AppendOp(e MerkleEntry) error {
 
 	leaf.Ops[opHash] = struct{}{}
 
-	ops := make([]Hash, 0, len(leaf.Ops))
-	var maxK Hash
+	ops := make([]OpHash, 0, len(leaf.Ops))
+	var maxK OpHash
 	for h := range leaf.Ops {
 		ops = append(ops, h)
 	}
@@ -175,13 +176,13 @@ func (m *Merkle) AppendOp(e MerkleEntry) error {
 
 		var children [16]Hash
 		var sum uint64
-		var maxH Hash
+		var maxH OpHash
 
 		for i := range 16 {
 			if c := parent.Child[i]; c != nil {
 				children[i] = c.Hash
 				sum += c.Count
-				ops := []Hash{c.LastK, maxH}
+				ops := []OpHash{c.LastK, maxH}
 				m.hasher.Sort(ops)
 				maxH = ops[1]
 			} else {
@@ -206,7 +207,7 @@ func hashNode16(children [16]Hash) Hash {
 	return out
 }
 
-func hashLeafSet(ops []Hash) Hash {
+func hashLeafSet(ops []OpHash) Hash {
 	if len(ops) == 0 {
 		return zeroHash()
 	}

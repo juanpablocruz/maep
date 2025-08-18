@@ -60,7 +60,7 @@ func (v *Visualizer) visualizeNode(node *MerkleNode, prefix string, isLast bool,
 	fmt.Fprintf(sb, "Hash: %s, Count: %d", hashStr, node.Count)
 
 	// Show LastK if not zero
-	if node.LastK != zeroHash() {
+	if node.LastK != zeroOpHash() {
 		lastKStr := fmt.Sprintf("%x", node.LastK[:8])
 		fmt.Fprintf(sb, ", LastK: %s", lastKStr)
 	}
@@ -104,7 +104,7 @@ func (v *Visualizer) visualizeNode(node *MerkleNode, prefix string, isLast bool,
 }
 
 // VisualizePath visualizes the path from root to a specific hash
-func (v *Visualizer) VisualizePath(targetHash Hash) string {
+func (v *Visualizer) VisualizePath(targetHash OpHash) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Path to Hash: %x\n", targetHash[:8]))
 	sb.WriteString("=====================\n\n")

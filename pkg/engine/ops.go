@@ -46,13 +46,13 @@ func (o *Op) Hash() OpHash {
 	return hash
 }
 
-type OpCannonicalKey [60]byte
+type OpCannonicalKey [64]byte
 
 // CanonicalKey returns a key formed by (HLC || actorId || opHash)
 func (o *Op) CanonicalKey() OpCannonicalKey {
 	var buf bytes.Buffer
 
-	// Encode HLC timestamp (8 bytes wall_ns + 4 bytes logical, big endian)
+	// Encode HLC timestamp (8 bytes wall_ns + 8 bytes logical, big endian)
 	binary.Write(&buf, binary.BigEndian, o.HLC.TS)
 	binary.Write(&buf, binary.BigEndian, o.HLC.Count)
 

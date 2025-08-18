@@ -15,8 +15,8 @@ func Test_CORE_OPS_01_ConsistentHash(t *testing.T) {
 	// Setup: Create operations with identical content
 	// Stimulus: Generate hashes for identical operations
 	// Checks: Hashes are consistent and identical
-	actorId := actor.ActorID{}
-	copy(actorId[:], []byte("actor")[:])
+	actorID := actor.ActorID{}
+	copy(actorID[:], []byte("actor")[:])
 
 	ts := hlc.HLCTimestamp{
 		TS:    1,
@@ -24,7 +24,7 @@ func Test_CORE_OPS_01_ConsistentHash(t *testing.T) {
 	}
 
 	o := GenerateOp(
-		WithActorID(actorId),
+		WithActorID(actorID),
 		WithHLC(ts),
 		WithKey([]byte("key1")),
 		WithValue([]byte("value1")),
@@ -34,7 +34,7 @@ func Test_CORE_OPS_01_ConsistentHash(t *testing.T) {
 	t.Logf("hash: %x", hash)
 
 	o2 := GenerateOp(
-		WithActorID(actorId),
+		WithActorID(actorID),
 		WithHLC(ts),
 		WithKey([]byte("key1")),
 		WithValue([]byte("value1")),

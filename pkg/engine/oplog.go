@@ -1,3 +1,4 @@
+// Package engine implements a concurrent oplog, ops and sv
 package engine
 
 import (
