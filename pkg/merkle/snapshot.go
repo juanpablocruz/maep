@@ -142,6 +142,14 @@ func (s *MerkleSnapshot) ProofForKey(key OpHash) (Proof, error) {
 func (s *MerkleSnapshot) Epoch() uint64 { return s.epoch }
 func (s *MerkleSnapshot) Close()        {}
 
+func sumCounts(children []Summary) uint64 {
+	var s uint64
+	for i := 0; i < 16; i++ {
+		s += children[i].Count
+	}
+	return s
+}
+
 func DiffDescent(
 	local Snapshot,
 	remoteRoot Hash,
@@ -153,6 +161,17 @@ func DiffDescent(
 
 	met.Fanout = local.Fanout()
 	met.MaxDepth = local.MaxDepth()
+
+	root := Prefix{Depth: 0, Path: nil}
+	caRoot, err := local.Children(root)
+	if err == ErrStaleSnapshot {
+		met.Restarts++
+		return nil, met, fmt.Errorf("snapshot restarted")
+	}
+	if err != nil {
+		return nil, met, err
+	}
+	met.M = int(sumCounts(caRoot))
 
 	if remoteMaxDepth != met.MaxDepth {
 		return nil, met, fmt.Errorf("remote max depth %d != local max depth %d", remoteMaxDepth, met.MaxDepth)
