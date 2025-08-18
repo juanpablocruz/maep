@@ -3,7 +3,6 @@ package merkle
 import (
 	"bytes"
 	"fmt"
-	"slices"
 )
 
 type MerkleSnapshot struct {
@@ -15,16 +14,18 @@ type MerkleSnapshot struct {
 	hasher   Hasher
 }
 
-func (m *MerkleSnapshot) Fanout() int   { return m.fanout }
-func (m *MerkleSnapshot) MaxDepth() int { return m.maxDepth }
-func (m *MerkleSnapshot) Root() Hash    { return m.root }
-func (m *MerkleSnapshot) Children(p Prefix) ([]Summary, error) {
+func (s *MerkleSnapshot) Fanout() int   { return s.fanout }
+func (s *MerkleSnapshot) MaxDepth() int { return s.maxDepth }
+func (s *MerkleSnapshot) Root() Hash    { return s.root }
+func (s *MerkleSnapshot) Children(p Prefix) ([]Summary, error) {
 	return nil, nil
 }
+
 func (s *MerkleSnapshot) ProofForKey(key Hash) (Proof, error) {
 	m := s.source
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+
 	digits, err := KeyDigits16(key, s.maxDepth)
 	if err != nil {
 		return Proof{}, err
@@ -84,26 +85,37 @@ func (s *MerkleSnapshot) ProofForKey(key Hash) (Proof, error) {
 
 	return Proof{Fanout: 16, Nodes: nodes}, nil
 }
-func (m *MerkleSnapshot) Epoch() uint64 { return m.epoch }
-func (m *MerkleSnapshot) Close()        {}
+func (s *MerkleSnapshot) Epoch() uint64 { return s.epoch }
+func (s *MerkleSnapshot) Close()        {}
 
 // VerifyOpProof checks membership of op under root using the given proof.
 // Assumes proof.Nodes[0] is the full leaf set (sorted),
 // and proof.Nodes[1..] are sibling lists from leaf->root (15 per level).
-func VerifyOpProof(root Hash, op Hash, maxDepth int, proof Proof) bool {
+func VerifyOpProof(root Hash, op Hash, maxDepth int, proof Proof, hasher Hasher) bool {
 	if proof.Fanout != 16 {
 		return false
 	}
-	if len(proof.Nodes) == 0 {
+	if len(proof.Nodes) != 1+maxDepth {
 		return false
 	}
 
-	// 1) recompute leaf hash from full set; check op is present
-	leafSet := slices.Clone(proof.Nodes[0]) // copy - already sorted by hasher
-	// op must be in the set
+	for i, n := range proof.Nodes {
+		if i == 0 {
+			continue
+		}
+		if len(n) != 15 {
+			return false
+		}
+	}
+
+	L := make([]Hash, len(proof.Nodes[0]))
+	copy(L, proof.Nodes[0])
+
+	hasher.Sort(L)
+
 	found := false
-	for _, h := range leafSet {
-		if bytes.Equal(h[:], op[:]) {
+	for _, l := range L {
+		if bytes.Equal(l[:], op[:]) {
 			found = true
 			break
 		}
@@ -111,23 +123,19 @@ func VerifyOpProof(root Hash, op Hash, maxDepth int, proof Proof) bool {
 	if !found {
 		return false
 	}
-	h := hashLeafSet(leafSet)
 
-	// 2) climb to root using siblings
+	// Hash leaf without re-sorting
+	h := hashLeafSet(proof.Nodes[0])
+
 	digits, err := KeyDigits16(op, maxDepth)
 	if err != nil {
 		return false
 	}
-	if len(proof.Nodes) != 1+len(digits) {
-		return false
-	} // leaf + one row per level
 
-	// From leaf upward: at each level, insert h at index 'idx' among 16 children and hash
-	for levelFromLeaf := range digits {
-		idx := int(digits[len(digits)-1-levelFromLeaf]) // bottom-up
-		sibs := proof.Nodes[1+levelFromLeaf]            // 15 hashes
+	for t := range maxDepth {
+		idx := int(digits[maxDepth-1-t]) // bottom-most digit first
+		sibs := proof.Nodes[1+t]         // 15 siblings for this level
 
-		// Rebuild the 16 child array in order 0..15, putting h at idx
 		var children [16]Hash
 		si := 0
 		for i := range 16 {
@@ -138,7 +146,20 @@ func VerifyOpProof(root Hash, op Hash, maxDepth int, proof Proof) bool {
 				si++
 			}
 		}
-		h = hashNode16(children)
+		if si != 15 {
+			return false
+		} // sanity
+		h = hashNode16(children) // H(0x01 || h0 || ... || h15)
 	}
 	return h == root
+}
+
+func (p Proof) String() string {
+	s := fmt.Sprintf("Fanout: %d\n", p.Fanout)
+	for i, n := range p.Nodes {
+		for j, h := range n {
+			s += fmt.Sprintf("Node %d-%d: %x\n", i, j, h)
+		}
+	}
+	return s
 }

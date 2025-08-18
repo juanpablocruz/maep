@@ -1,3 +1,4 @@
+// Package merkle implements a k-ary Merkle tree.
 package merkle
 
 import (

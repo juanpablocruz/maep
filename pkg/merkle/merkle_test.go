@@ -361,4 +361,48 @@ func Test_MERKLE_TreeStructure_06(t *testing.T) {
 }
 
 func Test_MERKLE_Proof_Verify(t *testing.T) {
+
+	cfg := merkle.Config{
+		Fanout:   16,
+		MaxDepth: 2, // Small depth for easier testing
+	}
+	th := NewTestHasher()
+	cfg.Hasher = th
+	m, err := merkle.New(cfg)
+	if err != nil {
+		t.Fatalf("error creating merkle tree: %v", err)
+	}
+
+	// Append operations with different hashes to test tree structure
+	operations := []OpLogMerkleEntry{}
+	for i := range 3 {
+		ome := OpLogMerkleEntry{}
+		ome.opLog = th.ops[i]
+		ome.hash = ome.opLog.CanonicalKey()
+		operations = append(operations, ome)
+
+		err = m.AppendOp(ome)
+		if err != nil {
+			t.Fatalf("error appending operation %d: %v", i, err)
+		}
+	}
+
+	// Verify all operations are in tree
+	for i, ome := range operations {
+		if !m.ContainsOp(ome) {
+			t.Fatalf("operation %d should be in tree", i)
+		}
+	}
+
+	// Test that tree maintains consistency after multiple operations
+	snapshot1 := m.Snapshot()
+
+	proof, err := snapshot1.ProofForKey(merkle.Hash(operations[0].opLog.CanonicalKey()))
+	if err != nil {
+		t.Fatalf("error computing proof for key: %v", err)
+	}
+
+	if !merkle.VerifyOpProof(snapshot1.Root(), merkle.Hash(operations[0].opLog.CanonicalKey()), 2, proof, th) {
+		t.Errorf("proof verification failed")
+	}
 }

@@ -65,7 +65,7 @@ type Tree interface {
 	Close() error
 }
 
-// stats for metric/observability
+// Stats for metric/observability
 type Stats struct {
 	Keys        uint64 // distinct non-zero-weight keys
 	TotalOps    uint64 // sum of weights
