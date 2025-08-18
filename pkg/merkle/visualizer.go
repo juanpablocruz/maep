@@ -57,17 +57,17 @@ func (v *Visualizer) visualizeNode(node *MerkleNode, prefix string, isLast bool,
 		hashStr = "00000000"
 	}
 
-	sb.WriteString(fmt.Sprintf("Hash: %s, Count: %d", hashStr, node.Count))
+	fmt.Fprintf(sb, "Hash: %s, Count: %d", hashStr, node.Count)
 
 	// Show LastK if not zero
 	if node.LastK != zeroHash() {
 		lastKStr := fmt.Sprintf("%x", node.LastK[:8])
-		sb.WriteString(fmt.Sprintf(", LastK: %s", lastKStr))
+		fmt.Fprintf(sb, ", LastK: %s", lastKStr)
 	}
 
 	// Show number of operations if this is a leaf
-	if node.Ops != nil && len(node.Ops) > 0 {
-		sb.WriteString(fmt.Sprintf(", Ops: %d", len(node.Ops)))
+	if len(node.Ops) > 0 {
+		fmt.Fprintf(sb, ", Ops: %d", len(node.Ops))
 	}
 
 	sb.WriteString("\n")
@@ -82,7 +82,7 @@ func (v *Visualizer) visualizeNode(node *MerkleNode, prefix string, isLast bool,
 
 	// Find non-nil children
 	nonNilChildren := 0
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		if node.Child[i] != nil {
 			nonNilChildren++
 		}
@@ -93,11 +93,11 @@ func (v *Visualizer) visualizeNode(node *MerkleNode, prefix string, isLast bool,
 	}
 
 	childCount := 0
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		if node.Child[i] != nil {
 			childCount++
 			isLastChild := childCount == nonNilChildren
-			sb.WriteString(fmt.Sprintf("%s[%d] ", childPrefix, i))
+			fmt.Fprintf(sb, "%s[%d] ", childPrefix, i)
 			v.visualizeNode(node.Child[i], childPrefix, isLastChild, sb)
 		}
 	}
@@ -143,7 +143,7 @@ func (v *Visualizer) VisualizePath(targetHash Hash) string {
 
 		// Show children at this level
 		sb.WriteString("  Children: ")
-		for j := 0; j < 16; j++ {
+		for j := range 16 {
 			if node.Child[j] != nil {
 				childHash := fmt.Sprintf("%x", node.Child[j].Hash[:8])
 				if node.Child[j].Hash == zeroHash() {
@@ -239,7 +239,7 @@ func (v *Visualizer) computeStats(node *MerkleNode, depth int) treeStats {
 
 	// Recursively compute stats for children
 	hasChildren := false
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		if node.Child[i] != nil {
 			hasChildren = true
 			childStats := v.computeStats(node.Child[i], depth+1)

@@ -10,7 +10,7 @@ func NibbleAt16(h Hash, i int) (uint8, error) {
 	}
 
 	b := h[i/2]
-	if i&1 == 1 {
+	if i%2 == 0 {
 		return b >> 4, nil // high nibble
 	}
 	return b & 0x0F, nil // low nibble

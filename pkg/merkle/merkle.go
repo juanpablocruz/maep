@@ -1,10 +1,8 @@
 package merkle
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"fmt"
-	"sort"
 	"sync"
 	"time"
 )
@@ -77,6 +75,8 @@ func (m *Merkle) Snapshot() Snapshot {
 		maxDepth: m.maxDepth,
 		root:     m.root.Hash,
 		epoch:    uint64(time.Now().UnixNano()),
+		source:   m,
+		hasher:   m.hasher,
 	}
 }
 
@@ -209,10 +209,6 @@ func hashLeafSet(ops []Hash) Hash {
 	if len(ops) == 0 {
 		return zeroHash()
 	}
-
-	sort.Slice(ops, func(i, j int) bool {
-		return bytes.Compare(ops[i][:], ops[j][:]) < 0
-	})
 
 	h := sha256.New()
 	h.Write([]byte{0x04})

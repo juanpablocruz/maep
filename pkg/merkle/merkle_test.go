@@ -47,7 +47,9 @@ type OpLogMerkleEntry struct {
 }
 
 func (ome OpLogMerkleEntry) ComputeHash() merkle.Hash {
-	return merkle.Hash(ome.hash[:])
+	var hash merkle.Hash
+	copy(hash[:], ome.hash[:])
+	return hash
 }
 
 func Test_MERKLE_Append_00(t *testing.T) {
@@ -180,7 +182,7 @@ func Test_MERKLE_Append_Multiple_03(t *testing.T) {
 	}
 
 	// Append multiple operations
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		ome := OpLogMerkleEntry{}
 		ome.opLog = th.ops[i]
 		ome.hash = ome.opLog.CanonicalKey()
@@ -197,7 +199,7 @@ func Test_MERKLE_Append_Multiple_03(t *testing.T) {
 	}
 
 	// Verify all operations are still in tree
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		ome := OpLogMerkleEntry{}
 		ome.opLog = th.ops[i]
 		ome.hash = ome.opLog.CanonicalKey()
@@ -313,7 +315,7 @@ func Test_MERKLE_TreeStructure_06(t *testing.T) {
 
 	// Append operations with different hashes to test tree structure
 	operations := []OpLogMerkleEntry{}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		ome := OpLogMerkleEntry{}
 		ome.opLog = th.ops[i]
 		ome.hash = ome.opLog.CanonicalKey()
@@ -356,4 +358,7 @@ func Test_MERKLE_TreeStructure_06(t *testing.T) {
 	if err != nil {
 		t.Errorf("error closing tree: %v", err)
 	}
+}
+
+func Test_MERKLE_Proof_Verify(t *testing.T) {
 }

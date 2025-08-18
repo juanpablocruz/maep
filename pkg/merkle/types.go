@@ -1,6 +1,6 @@
 package merkle
 
-type Hash [32]byte
+type Hash [60]byte
 
 // Prefix identifies a subtree by base-k digits of a canonical key hash.
 // Path[i] ∈ [0..k-1], len(Path) == Depth.
