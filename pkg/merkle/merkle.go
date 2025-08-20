@@ -86,12 +86,6 @@ func (m *Merkle) Stats() *Stats {
 	return &Stats{}
 }
 
-func (m *Merkle) Close() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return nil
-}
-
 // ContainsOp checks if an operation exists in the tree
 func (m *Merkle) ContainsOp(e MerkleEntry) bool {
 	m.mu.RLock()

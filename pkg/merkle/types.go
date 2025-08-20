@@ -4,7 +4,7 @@ type Hash [32]byte
 type OpHash [64]byte
 
 // Prefix identifies a subtree by base-k digits of a canonical key hash.
-// Path[i] ∈ [0..k-1], len(Path) == Depth.
+// Path[i] in [0..k-1], len(Path) == Depth.
 type Prefix struct {
 	Depth uint8
 	Path  []uint8
@@ -45,9 +45,6 @@ type Snapshot interface {
 
 	ProofForKey(key OpHash) (Proof, error)
 	Epoch() uint64 // passive epoch tag for observability
-
-	// Release resources associated with the snapshot
-	Close()
 }
 
 // Tree is the concurrency-safe, mutable structure
@@ -63,8 +60,6 @@ type Tree interface {
 	ContainsOp(e MerkleEntry) bool
 
 	Stats() Stats
-
-	Close() error
 }
 
 // Stats for metric/observability
@@ -84,3 +79,4 @@ type Update struct {
 }
 
 type ChildrenFetcher func(p Prefix) ([]Summary, error)
+type LeafKeysFetcher func(parent Prefix, child uint8) ([]OpHash, error)

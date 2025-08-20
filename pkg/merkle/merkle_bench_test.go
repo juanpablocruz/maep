@@ -26,9 +26,9 @@ var rnd = mrand.New(mrand.NewSource(1))
 
 func makeRandomKeysFast(n int) []merkle.OpHash {
 	out := make([]merkle.OpHash, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		// fill 64 bytes quickly
-		for j := 0; j < len(out[i]); j++ {
+		for j := range len(out[i]) {
 			out[i][j] = byte(rnd.Uint32())
 		}
 	}
@@ -38,7 +38,7 @@ func makeRandomKeysFast(n int) []merkle.OpHash {
 // Make a key whose first len(prefixNibbles) nibbles match exactly
 func makeKeyWithPrefix(prefix []uint8) merkle.OpHash {
 	var k merkle.OpHash
-	for j := 0; j < len(k); j++ {
+	for j := range len(k) {
 		k[j] = byte(rnd.Uint32())
 	}
 	for i, nib := range prefix {
@@ -122,8 +122,8 @@ func Benchmark_SummaryDescent(b *testing.B) {
 			}
 
 			// Snapshots for the session (stable roots)
-			sA := mA.Snapshot().(*merkle.MerkleSnapshot)
-			sB := mB.Snapshot().(*merkle.MerkleSnapshot)
+			sA := mA.Snapshot()
+			sB := mB.Snapshot()
 
 			// Sanity: compute M from the root summaries (use local)
 			caRoot, err := sA.Children(merkle.Prefix{Depth: 0, Path: nil})
@@ -145,8 +145,8 @@ func Benchmark_SummaryDescent(b *testing.B) {
 				_, met, err := merkle.DiffDescent(sA, sB.Root(), sB.MaxDepth(), fetchRemote)
 				if err == merkle.ErrStaleSnapshot {
 					// Extremely rare here (no mutation during session). Resnap and retry the same i.
-					sA = mA.Snapshot().(*merkle.MerkleSnapshot)
-					sB = mB.Snapshot().(*merkle.MerkleSnapshot)
+					sA = mA.Snapshot()
+					sB = mB.Snapshot()
 					i--
 					continue
 				}
@@ -184,6 +184,81 @@ func Benchmark_SummaryDescent(b *testing.B) {
 			// Log the normalized metrics for O(log M) analysis
 			b.Logf("CSV2,%s,log16M=%.3f,nodes/leaf=%.2f,Nodes=%d,Leaves=%d",
 				sc.name, x, nodesPerLeaf, last.NodesVisited, last.LeavesTouched)
+		})
+	}
+}
+
+func Benchmark_DeltaBytes(b *testing.B) {
+	// scenarios: fix M, vary Δ
+	cases := []struct {
+		name       string
+		M          int
+		DeltaExact int
+		Depth      int
+		AvgOpB     int
+	}{
+		{"M1e5_D1e1", 100_000, 10, 6, 64},
+		{"M1e5_D1e2", 100_000, 100, 6, 64},
+		{"M1e5_D1e3", 100_000, 1000, 6, 64},
+		{"M1e5_D1e4", 100_000, 10_000, 6, 64},
+	}
+
+	for _, sc := range cases {
+		b.Run(sc.name, func(b *testing.B) {
+			cfg := merkle.Config{Fanout: 16, MaxDepth: sc.Depth, Hasher: NewTestHasher()}
+			mA, _ := merkle.New(cfg)
+			mB, _ := merkle.New(cfg)
+
+			// Base state: M random keys (fast)
+			base := makeRandomKeysFast(sc.M)
+			_ = appendKeys(mA, base)
+			_ = appendKeys(mB, base)
+
+			// Δ pinned to ONE leaf (prefix = all 7s of length Depth)
+			pref := make([]uint8, sc.Depth)
+			for i := range pref {
+				pref[i] = 7
+			}
+			deltaKeys := make([]merkle.OpHash, sc.DeltaExact)
+			for i := 0; i < sc.DeltaExact; i++ {
+				deltaKeys[i] = makeKeyWithPrefix(pref)
+			}
+			_ = appendKeys(mB, deltaKeys)
+
+			sA := mA.Snapshot().(*merkle.MerkleSnapshot)
+			sB := mB.Snapshot().(*merkle.MerkleSnapshot)
+
+			fetchSummary := func(p merkle.Prefix) ([]merkle.Summary, error) { return sB.Children(p) }
+			fetchLeaf := func(p merkle.Prefix, c uint8) ([]merkle.OpHash, error) { return sB.LeafOps(p, c) }
+
+			var last metrics.TransferMetrics
+			b.ResetTimer()
+			for i := 0; b.Loop(); i++ {
+				tm, err := merkle.DeltaBytes(sA, sB.Root(), sB.MaxDepth(), fetchSummary, fetchLeaf, sc.AvgOpB)
+				if err == merkle.ErrStaleSnapshot {
+					sA = mA.Snapshot().(*merkle.MerkleSnapshot)
+					sB = mB.Snapshot().(*merkle.MerkleSnapshot)
+					i--
+					continue
+				}
+				if err != nil {
+					b.Fatalf("DeltaBytes: %v", err)
+				}
+				last = tm
+			}
+			b.StopTimer()
+
+			// Report useful per-run metrics and log a CSV row:
+			b.ReportMetric(float64(last.DeltaExact), "delta/op")
+			b.ReportMetric(float64(last.TotalBytes), "bytes/op")
+			b.ReportMetric(float64(last.SummaryBytes), "sumbytes/op")
+			b.ReportMetric(float64(last.LeafKeysBytes), "leafkeys/op")
+			b.ReportMetric(float64(last.OpsBytes), "opsbytes/op")
+
+			kb := func(x int64) float64 { return float64(x) / 1024.0 }
+			b.Logf("CSV, %s, M=%d, Δ=%d, Δexact=%d, SummaryKB=%.1f, LeafKeysKB=%.1f, OpsKB=%.1f, TotalKB=%.1f",
+				sc.name, last.M, sc.DeltaExact, last.DeltaExact,
+				kb(last.SummaryBytes), kb(last.LeafKeysBytes), kb(last.OpsBytes), kb(last.TotalBytes))
 		})
 	}
 }

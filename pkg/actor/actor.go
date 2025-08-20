@@ -1,3 +1,4 @@
+// Package actor implements a unique identifier for a node
 package actor
 
 import (
@@ -14,7 +15,7 @@ type PeerID = ActorID
 func NewActor() ActorID {
 	uid := uuid.New()
 
-	actorId := ActorID{}
-	copy(actorId[:], uid[:])
-	return actorId
+	actorID := ActorID{}
+	copy(actorID[:], uid[:])
+	return actorID
 }

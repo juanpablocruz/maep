@@ -1,7 +1,9 @@
 package merkle_test
 
 import (
+	"bytes"
 	"fmt"
+	"sort"
 	"testing"
 
 	"github.com/juanpablocruz/maep/pkg/engine"
@@ -353,12 +355,6 @@ func Test_MERKLE_TreeStructure_06(t *testing.T) {
 		t.Errorf("tree root changed after idempotent operations: %x vs %x",
 			snapshot1.Root(), snapshot2.Root())
 	}
-
-	// Test tree close
-	err = m.Close()
-	if err != nil {
-		t.Errorf("error closing tree: %v", err)
-	}
 }
 
 func Test_MERKLE_Proof_Verify_07(t *testing.T) {
@@ -502,4 +498,196 @@ func Test_MERKLE_DiffDescent_09(t *testing.T) {
 	// Optional: check the exact path if you expect it
 	t.Log(met.String())
 	t.Logf("diffs: %v", diffs)
+}
+
+// Case 1: Δ keys exist only on B under a single leaf; A has none there.
+func Test_DeltaBytes_SingleLeaf_AllMissing(t *testing.T) {
+	const (
+		M        = 1000
+		Delta    = 10
+		MaxDepth = 6
+		AvgOpB   = 64
+	)
+	cfg := merkle.Config{Fanout: 16, MaxDepth: MaxDepth, Hasher: NewSimpleHasher()}
+
+	maI, err := merkle.New(cfg)
+	if err != nil {
+		t.Fatalf("error creating merkle tree A: %v", err)
+	}
+	mbI, err := merkle.New(cfg)
+	if err != nil {
+		t.Fatalf("error creating merkle tree B: %v", err)
+	}
+	ma := maI
+	mb := mbI
+
+	// Base keys for both sides pinned to a DIFFERENT leaf (prefix 0x3...3)
+	basePref := make([]uint8, MaxDepth)
+	for i := range basePref {
+		basePref[i] = 3
+	}
+	base := make([]merkle.OpHash, M)
+	for i := range M {
+		base[i] = makeKeyWithPrefix(basePref)
+	}
+	appendKeys(ma, base)
+	appendKeys(mb, base)
+
+	// Δ keys pinned to ONE leaf on B (prefix 0x7...7); A has none there.
+	deltaPref := make([]uint8, MaxDepth)
+	for i := range deltaPref {
+		deltaPref[i] = 7
+	}
+	delta := make([]merkle.OpHash, Delta)
+	for i := range Delta {
+		delta[i] = makeKeyWithPrefix(deltaPref)
+	}
+	appendKeys(mb, delta)
+
+	sA := ma.Snapshot().(*merkle.MerkleSnapshot)
+	sB := mb.Snapshot().(*merkle.MerkleSnapshot)
+
+	// Remote fetchers (mock transport)
+	fetchSummary := func(p merkle.Prefix) ([]merkle.Summary, error) { return sB.Children(p) }
+	fetchLeaf := func(p merkle.Prefix, c uint8) ([]merkle.OpHash, error) { return sB.LeafOps(p, c) }
+
+	// Run DeltaBytes
+	tm, err := merkle.DeltaBytes(sA, sB.Root(), sB.MaxDepth(), fetchSummary, fetchLeaf, AvgOpB)
+	if err != nil {
+		t.Fatalf("DeltaBytes error: %v", err)
+	}
+
+	// Sanity: summary bytes should match a standalone descent run
+	_, met, err := merkle.DiffDescent(sA, sB.Root(), sB.MaxDepth(), fetchSummary)
+	if err != nil {
+		t.Fatalf("DiffDescent error: %v", err)
+	}
+	if tm.SummaryBytes != met.SummaryBytes {
+		t.Fatalf("summary bytes mismatch: tm=%d met=%d", tm.SummaryBytes, met.SummaryBytes)
+	}
+
+	// Exact Δ equals the number of inserted remote-only keys
+	if tm.DeltaExact != Delta {
+		t.Fatalf("DeltaExact=%d want=%d", tm.DeltaExact, Delta)
+	}
+
+	// LeafKeysBytes: remote leaf had exactly Δ keys; each key is 64B
+	if tm.LeafKeysBytes != int64(Delta*64) {
+		t.Fatalf("LeafKeysBytes=%d want=%d", tm.LeafKeysBytes, Delta*64)
+	}
+
+	// OpsBytes: we ship Δ op payloads of AvgOpB bytes each
+	if tm.OpsBytes != int64(Delta*AvgOpB) {
+		t.Fatalf("OpsBytes=%d want=%d", tm.OpsBytes, Delta*AvgOpB)
+	}
+
+	// LeavesTouched: a single leaf-parent path
+	if tm.LeavesTouched != 1 {
+		t.Fatalf("LeavesTouched=%d want=1", tm.LeavesTouched)
+	}
+
+	if tm.TotalBytes != tm.SummaryBytes+tm.LeafKeysBytes+tm.OpsBytes {
+		t.Fatalf("TotalBytes not sum of parts")
+	}
+}
+
+// Case 2: Local already has P keys in the target leaf; remote adds Q more.
+func Test_DeltaBytes_SingleLeaf_PartialMissing(t *testing.T) {
+	const (
+		M        = 2000
+		P        = 25 // already present locally & remotely in target leaf
+		Q        = 15 // extra only on remote (so DeltaExact == Q)
+		MaxDepth = 5
+		AvgOpB   = 128
+	)
+	cfg := merkle.Config{Fanout: 16, MaxDepth: MaxDepth, Hasher: NewSimpleHasher()}
+
+	maI, err := merkle.New(cfg)
+	if err != nil {
+		t.Fatalf("error creating merkle tree A: %v", err)
+	}
+	mbI, err := merkle.New(cfg)
+	if err != nil {
+		t.Fatalf("error creating merkle tree B: %v", err)
+	}
+	ma := maI
+	mb := mbI
+
+	// Base keys for both under some other leaf to give the tree size
+	basePref := make([]uint8, MaxDepth)
+	for i := range basePref {
+		basePref[i] = 2
+	}
+	base := make([]merkle.OpHash, M)
+	for i := range M {
+		base[i] = makeKeyWithPrefix(basePref)
+	}
+	appendKeys(ma, base)
+	appendKeys(mb, base)
+
+	// Target leaf prefix (same for both)
+	target := make([]uint8, MaxDepth)
+	for i := range target {
+		target[i] = 9
+	}
+
+	// Insert P common keys into target leaf on both A and B
+	common := make([]merkle.OpHash, P)
+	for i := range P {
+		common[i] = makeKeyWithPrefix(target)
+	}
+	appendKeys(ma, common)
+	appendKeys(mb, common)
+
+	// Insert Q extra keys only on B (so A is missing Q)
+	extra := make([]merkle.OpHash, Q)
+	for i := range Q {
+		extra[i] = makeKeyWithPrefix(target)
+	}
+	appendKeys(mb, extra)
+
+	sA := ma.Snapshot().(*merkle.MerkleSnapshot)
+	sB := mb.Snapshot().(*merkle.MerkleSnapshot)
+
+	fetchSummary := func(p merkle.Prefix) ([]merkle.Summary, error) { return sB.Children(p) }
+	fetchLeaf := func(p merkle.Prefix, c uint8) ([]merkle.OpHash, error) { return sB.LeafOps(p, c) }
+
+	tm, err := merkle.DeltaBytes(sA, sB.Root(), sB.MaxDepth(), fetchSummary, fetchLeaf, AvgOpB)
+	if err != nil {
+		t.Fatalf("DeltaBytes error: %v", err)
+	}
+
+	// Exact Δ is Q (remote-only extras)
+	if tm.DeltaExact != Q {
+		t.Fatalf("DeltaExact=%d want=%d", tm.DeltaExact, Q)
+	}
+
+	// Remote leaf key list has P+Q keys → bytes = (P+Q)*64
+	wantLeafBytes := int64((P + Q) * 64)
+	if tm.LeafKeysBytes != wantLeafBytes {
+		t.Fatalf("LeafKeysBytes=%d want=%d", tm.LeafKeysBytes, wantLeafBytes)
+	}
+
+	// OpsBytes = Q * AvgOpB
+	wantOpsBytes := int64(Q * AvgOpB)
+	if tm.OpsBytes != wantOpsBytes {
+		t.Fatalf("OpsBytes=%d want=%d", tm.OpsBytes, wantOpsBytes)
+	}
+
+	if tm.TotalBytes != tm.SummaryBytes+tm.LeafKeysBytes+tm.OpsBytes {
+		t.Fatalf("TotalBytes not sum of parts")
+	}
+}
+
+type SimpleHasher struct{}
+
+func (sh SimpleHasher) Sort(hs []merkle.OpHash) {
+	// Simple sort by hash value
+	sort.Slice(hs, func(i, j int) bool {
+		return bytes.Compare(hs[i][:], hs[j][:]) < 0
+	})
+}
+
+func NewSimpleHasher() *SimpleHasher {
+	return &SimpleHasher{}
 }

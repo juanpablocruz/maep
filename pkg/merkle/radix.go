@@ -3,7 +3,7 @@ package merkle
 import "fmt"
 
 // NibbleAt16 returns the i-th base-16 digit (MSB-first) of h.
-// i ∈ [0, 63]. 0 = top-most (high) nibble of h[0].
+// i in [0, 63]. 0 = top-most (high) nibble of h[0].
 func NibbleAt16(h OpHash, i int) (uint8, error) {
 	if i < 0 || i >= 64 {
 		return 0, fmt.Errorf("nibble index out of range: %d", i)
@@ -17,7 +17,7 @@ func NibbleAt16(h OpHash, i int) (uint8, error) {
 }
 
 // KeyDigits16 returns the first 'depth' base-16 digits (MSB-first) of h.
-// depth ∈ [0, 64]. For fanout=16, each digit is an index in [0..15].
+// depth in [0, 64]. For fanout=16, each digit is an index in [0..15].
 func KeyDigits16(h OpHash, depth int) ([]uint8, error) {
 	if depth < 0 || depth >= 64 {
 		return nil, fmt.Errorf("depth out of range: %d", depth)
@@ -32,7 +32,7 @@ func KeyDigits16(h OpHash, depth int) ([]uint8, error) {
 }
 
 // PrefixID16 packs the first 'depth' digits into a uint64 (4 bits per digit).
-// Useful as a compact map key for nodes. Requires depth ≤ 16.
+// Useful as a compact map key for nodes. Requires depth <= 16.
 func PrefixID16(h OpHash, depth int) (uint64, error) {
 	if depth < 0 || depth > 16 {
 		return 0, fmt.Errorf("depth must be ≤ 16 for uint64 packing (got %d)", depth)
@@ -46,7 +46,7 @@ func PrefixID16(h OpHash, depth int) (uint64, error) {
 }
 
 // ChildPrefixID16 returns the child prefix id one level deeper.
-// parentDepth ≤ 16, childDepth = parentDepth+1 ≤ 16.
+// parentDepth <= 16, childDepth = parentDepth+1 <= 16.
 func ChildPrefixID16(parentID uint64, parentDepth int, childIdx uint8) (uint64, int, error) {
 	if parentDepth < 0 || parentDepth >= 16 {
 		return 0, 0, fmt.Errorf("parentDepth out of range: %d", parentDepth)

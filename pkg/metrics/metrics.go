@@ -30,3 +30,13 @@ func (m *DescMetrics) String() string {
 // ChildSummaryBytes sizes: Hash (32) + Count (8) + LastK (64) = 104 bytes
 const ChildSummaryBytes = 32 + 8 + 64
 const RespBytesPerNode = 16 * ChildSummaryBytes
+
+type TransferMetrics struct {
+	M             int   // local total ops (from root)
+	DeltaExact    int   // |B \ A| shipped this session (one-way)
+	LeavesTouched int   // number of leaf parents touched (same as summary)
+	SummaryBytes  int64 // from summary descent (remote replies only)
+	LeafKeysBytes int64 // bytes to fetch remote leaf key lists
+	OpsBytes      int64 // bytes to ship missing ops (payload)
+	TotalBytes    int64 // sum of the above
+}

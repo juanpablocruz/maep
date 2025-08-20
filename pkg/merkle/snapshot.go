@@ -140,11 +140,10 @@ func (s *MerkleSnapshot) ProofForKey(key OpHash) (Proof, error) {
 	return Proof{Fanout: 16, Leaf: leafOps, Nodes: nodes}, nil
 }
 func (s *MerkleSnapshot) Epoch() uint64 { return s.epoch }
-func (s *MerkleSnapshot) Close()        {}
 
 func sumCounts(children []Summary) uint64 {
 	var s uint64
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		s += children[i].Count
 	}
 	return s
@@ -238,19 +237,19 @@ func DiffDescent(
 			met.LeavesTouched++
 			diffs = append(diffs, append([]uint8(nil), f.pref...))
 
-			// Δ := sum over differing children of |CountA - CountB|
-			var deltaHere uint64
+			// delta := sum over differing children of |CountA - CountB|
+			var delta uint64
 			for i := range 16 {
 				if ca[i].Hash != cb[i].Hash {
 					a, b := ca[i].Count, cb[i].Count
 					if a >= b {
-						deltaHere += a - b
+						delta += a - b
 					} else {
-						deltaHere += b - a
+						delta += b - a
 					}
 				}
 			}
-			met.Delta += int(deltaHere) // adjust type if your field is uint64
+			met.Delta += int(delta) // adjust type if your field is uint64
 			continue
 		}
 		for i := range 16 {
@@ -340,4 +339,122 @@ func (p Proof) String() string {
 		}
 	}
 	return s
+}
+
+func (s *MerkleSnapshot) LeafOps(parent Prefix, child uint8) ([]OpHash, error) {
+	m := s.source
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.root.Hash != s.root {
+		return nil, ErrStaleSnapshot
+	}
+
+	node := m.root
+	for _, d := range parent.Path {
+		if node.Child[int(d)] == nil {
+			return nil, fmt.Errorf("child not found")
+		}
+		node = node.Child[int(d)]
+	}
+
+	leaf := node.Child[int(child)]
+	if leaf == nil || leaf.Ops == nil {
+		return nil, fmt.Errorf("leaf not found")
+	}
+
+	out := make([]OpHash, 0, len(leaf.Ops))
+	for h := range leaf.Ops {
+		out = append(out, h)
+	}
+	s.hasher.Sort(out)
+	return out, nil
+}
+
+// DeltaBytes runs summary descent, then fetches leaf keys for differing children,
+// computes exact delta (remote -> local), and totals wire bytes.
+func DeltaBytes(
+	local *MerkleSnapshot,
+	remoteRoot Hash,
+	remoteMaxDepth int,
+	fetchSummary ChildrenFetcher, // remote Children()
+	fetchLeaf LeafKeysFetcher, // remote LeafOps()
+	avgOpBytes int,
+) (metrics.TransferMetrics, error) {
+
+	// summary descent
+	diffs, sumMet, err := DiffDescent(local, remoteRoot, remoteMaxDepth, fetchSummary)
+	if err != nil {
+		return metrics.TransferMetrics{}, err
+	}
+
+	tm := metrics.TransferMetrics{
+		M:             sumMet.M,
+		LeavesTouched: sumMet.LeavesTouched,
+		SummaryBytes:  sumMet.SummaryBytes,
+	}
+
+	// For each differing leaf parent, fetch both sides' children to know which child indexes differ
+	for _, pref := range diffs {
+		p := Prefix{Depth: uint8(len(pref)), Path: pref}
+		ca, errA := local.Children(p)
+		if errA != nil {
+			return tm, errA
+		}
+		cb, errB := fetchSummary(p)
+		if errB != nil {
+			return tm, errB
+		}
+
+		for i := range 16 {
+			if ca[i].Hash == cb[i].Hash {
+				continue
+			}
+
+			// Fetch leaf key lists (remote then local)
+			remoteKeys, err := fetchLeaf(p, uint8(i))
+			if err != nil {
+				return tm, err
+			}
+			localKeys, err := local.LeafOps(p, uint8(i))
+			if err != nil {
+				// If local leaf doesn't exist, treat as empty list
+				if err.Error() == "child not found" || err.Error() == "leaf not found" {
+					localKeys = []OpHash{}
+				} else {
+					return tm, err
+				}
+			}
+
+			// Account bytes for the remote reply with its key list
+			tm.LeafKeysBytes += int64(len(remoteKeys)) * 64
+
+			// Exact delta (one-way: B\A) via two-pointer diff
+			j, k := 0, 0
+			for j < len(remoteKeys) && k < len(localKeys) {
+				cmp := bytes.Compare(remoteKeys[j][:], localKeys[k][:])
+				switch {
+				case cmp == 0:
+					j++
+					k++
+				case cmp < 0:
+					tm.DeltaExact++
+					tm.OpsBytes += int64(avgOpBytes)
+					j++
+				default:
+					// A\B not needed for "B→A only"
+					k++
+				}
+			}
+			// tail in remote
+			if j < len(remoteKeys) {
+				remaining := len(remoteKeys) - j
+				tm.DeltaExact += remaining
+				tm.OpsBytes += int64(remaining * avgOpBytes)
+			}
+		}
+	}
+
+	tm.TotalBytes = tm.SummaryBytes + tm.LeafKeysBytes + tm.OpsBytes
+	return tm, nil
 }

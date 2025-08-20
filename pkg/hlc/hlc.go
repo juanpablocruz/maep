@@ -1,3 +1,4 @@
+// Package hlc implements an hybric logical clock
 package hlc
 
 import (

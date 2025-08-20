@@ -52,7 +52,7 @@ type OpCannonicalKey [64]byte
 func (o *Op) CanonicalKey() OpCannonicalKey {
 	var buf bytes.Buffer
 
-	// Encode HLC timestamp (8 bytes wall_ns + 8 bytes logical, big endian)
+	// Encode HLC timestamp (8 bytes ts + 8 bytes count, big endian)
 	binary.Write(&buf, binary.BigEndian, o.HLC.TS)
 	binary.Write(&buf, binary.BigEndian, o.HLC.Count)
 
@@ -70,15 +70,15 @@ func (o *Op) CanonicalKey() OpCannonicalKey {
 
 func (o *Op) Encode() []byte {
 	var buf bytes.Buffer
-	// Encode Actor (16 bytes)
-	buf.Write(o.Actor[:])
+	// Encode OpType (4 bytes)
+	binary.Write(&buf, binary.BigEndian, int32(o.Type))
 
-	// Encode HLC timestamp (8 bytes wall_ns + 4 bytes logical, big endian)
+	// Encode HLC timestamp (8 bytes ts + 8 bytes count, big endian)
 	binary.Write(&buf, binary.BigEndian, o.HLC.TS)
 	binary.Write(&buf, binary.BigEndian, o.HLC.Count)
 
-	// Encode OpType (4 bytes)
-	binary.Write(&buf, binary.BigEndian, int32(o.Type))
+	// Encode Actor (16 bytes)
+	buf.Write(o.Actor[:])
 
 	// Encode Key length and data
 	binary.Write(&buf, binary.BigEndian, int32(len(o.Key)))
@@ -97,23 +97,24 @@ func (o *Op) Encode() []byte {
 func DecodeOps(data []byte) (*Op, error) {
 	o := Op{}
 	buf := bytes.NewBuffer(data)
+
+	// Decode OpType (4 bytes)
+	o.Type = OpType(binary.BigEndian.Uint32(buf.Next(4)))
+
+	// Decode HLC timestamp (8 bytes ts + 8 bytes count, big endian)
+	ts := binary.BigEndian.Uint64(buf.Next(8))
+	count := binary.BigEndian.Uint64(buf.Next(8))
+
+	o.HLC = hlc.HLCTimestamp{
+		TS:    int64(ts),
+		Count: int64(count),
+	}
+
 	// Decode Actor (16 bytes)
 	_, err := buf.Read(o.Actor[:])
 	if err != nil {
 		return nil, err
 	}
-
-	// Decode HLC timestamp (8 bytes wall_ns + 8 bytes logical, big endian)
-	WallNS := binary.BigEndian.Uint64(buf.Next(8))
-	Logical := binary.BigEndian.Uint64(buf.Next(8))
-
-	o.HLC = hlc.HLCTimestamp{
-		TS:    int64(WallNS),
-		Count: int64(Logical),
-	}
-
-	// Decode OpType (4 bytes)
-	o.Type = OpType(binary.BigEndian.Uint32(buf.Next(4)))
 
 	// Decode Key length and data
 	lkey := binary.BigEndian.Uint32(buf.Next(4))
