@@ -70,11 +70,10 @@ type delivery struct {
 	targets []Subscriber
 }
 
-// New creates a Bus. If no options are provided, a sensible default is used.
+// New creates a Bus. If no options are provided, default is used.
 func New(opts ...Option) *Bus {
 	b := &Bus{
-		subs: make(map[Subscriber]struct{}),
-		// default internal publish queue size
+		subs:  make(map[Subscriber]struct{}),
 		pubCh: make(chan delivery, 1024),
 	}
 	for _, o := range opts {
@@ -150,9 +149,7 @@ func (b *Bus) Start() {
 		b.subsMu.RUnlock()
 
 		// Fanout loop.
-		b.fanoutWG.Add(1)
-		go func() {
-			defer b.fanoutWG.Done()
+		b.fanoutWG.Go(func() {
 			for d := range b.pubCh {
 				// Deliver to each target's channel. This blocks if
 				// the target channel is full/unbuffered.
@@ -169,7 +166,7 @@ func (b *Bus) Start() {
 					}
 				}
 			}
-		}()
+		})
 	})
 }
 
@@ -202,13 +199,9 @@ func (b *Bus) WaitForProcessing() {
 	b.procWG.Wait()
 }
 
-// --- internals ---
-
 func (b *Bus) startSubscriberWorker(s Subscriber) {
 	ch := s.GetChannel()
-	b.subsWG.Add(1)
-	go func() {
-		defer b.subsWG.Done()
+	b.subsWG.Go(func() {
 		for {
 			select {
 			case ev, ok := <-ch:
@@ -222,7 +215,7 @@ func (b *Bus) startSubscriberWorker(s Subscriber) {
 				return
 			}
 		}
-	}()
+	})
 }
 
 func (b *Bus) handleEvent(s Subscriber, ev Event) {
