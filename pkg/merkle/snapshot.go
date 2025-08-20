@@ -11,6 +11,14 @@ import (
 
 var (
 	ErrStaleSnapshot = errors.New("snapshot is stale")
+	ErrOpNotPresent  = errors.New("op not present")
+	ErrEmptyBucket   = errors.New("empty bucket")
+	ErrOpNotInBucket = errors.New("op not in bucket")
+	ErrInvalidPrefix = errors.New("invalid prefix")
+	ErrInvalidDigit  = errors.New("invalid prefix digit")
+	ErrPrefixDepth   = errors.New("prefix depth exceeds max depth")
+	ErrChildNotFound = errors.New("child not found")
+	ErrLeafNotFound  = errors.New("leaf not found")
 )
 
 type MerkleSnapshot struct {
@@ -30,11 +38,11 @@ func (s *MerkleSnapshot) Count() int    { return int(s.source.root.Count) }
 
 func (s *MerkleSnapshot) Children(p Prefix) ([]Summary, error) {
 	if int(p.Depth) != len(p.Path) {
-		return nil, fmt.Errorf("invalid prefix depth")
+		return nil, ErrInvalidPrefix
 	}
 
 	if int(p.Depth) > s.maxDepth {
-		return nil, fmt.Errorf("prefix depth exceeds max depth")
+		return nil, ErrPrefixDepth
 	}
 
 	m := s.source
@@ -51,7 +59,7 @@ func (s *MerkleSnapshot) Children(p Prefix) ([]Summary, error) {
 	for _, d := range p.Path[:p.Depth] {
 		i := int(d)
 		if i < 0 || i >= 16 {
-			return nil, fmt.Errorf("invalid prefix digit")
+			return nil, ErrInvalidDigit
 		}
 		if node.Child[i] == nil {
 			out := make([]Summary, 16)
@@ -95,7 +103,7 @@ func (s *MerkleSnapshot) ProofForKey(key OpHash) (Proof, error) {
 	for _, d := range digits {
 		i := int(d)
 		if node.Child[i] == nil {
-			return Proof{}, fmt.Errorf("op not present (missing child)")
+			return Proof{}, ErrOpNotPresent
 		}
 		node = node.Child[i]
 		path = append(path, node)
@@ -103,10 +111,10 @@ func (s *MerkleSnapshot) ProofForKey(key OpHash) (Proof, error) {
 	}
 
 	if node.Ops == nil {
-		return Proof{}, fmt.Errorf("op not present (empty bucket)")
+		return Proof{}, ErrEmptyBucket
 	}
 	if _, ok := node.Ops[key]; !ok {
-		return Proof{}, fmt.Errorf("op not present (not in bucket)")
+		return Proof{}, ErrOpNotInBucket
 	}
 
 	// Leaf set (sorted using the same hasher as tree construction)
@@ -156,27 +164,27 @@ func DiffDescent(
 	remoteRoot Hash,
 	remoteMaxDepth int,
 	fetcher ChildrenFetcher,
-	logger MetricLogger,
+	instrument MetricLogger,
 ) ([][]uint8, error) {
 
 	met := metrics.DescMetrics{
 		Fanout:   local.Fanout(),
 		MaxDepth: local.MaxDepth(),
 	}
-	logger(met)
+	instrument(met)
 
 	root := Prefix{Depth: 0, Path: nil}
 	caRoot, err := local.Children(root)
 	if err == ErrStaleSnapshot {
 		met.Restarts++
-		logger(met)
+		instrument(met)
 		return nil, ErrStaleSnapshot
 	}
 	if err != nil {
 		return nil, err
 	}
 	met.M = int(sumCounts(caRoot))
-	logger(met)
+	instrument(met)
 
 	if remoteMaxDepth != met.MaxDepth {
 		return nil, fmt.Errorf("remote max depth %d != local max depth %d", remoteMaxDepth, met.MaxDepth)
@@ -210,7 +218,7 @@ func DiffDescent(
 		ca, errA := local.Children(pref)
 		if errA == ErrStaleSnapshot {
 			met.Restarts++
-			logger(met)
+			instrument(met)
 			return nil, ErrStaleSnapshot
 		}
 
@@ -227,7 +235,7 @@ func DiffDescent(
 		depthSum += f.depth
 		met.HashComparisons += 16
 		met.SummaryBytes += metrics.RespBytesPerNode
-		logger(met)
+		instrument(met)
 
 		equal := true
 		for i := range 16 {
@@ -243,7 +251,7 @@ func DiffDescent(
 
 		if f.depth == local.MaxDepth()-1 {
 			met.LeavesTouched++
-			logger(met)
+			instrument(met)
 			diffs = append(diffs, append([]uint8(nil), f.pref...))
 
 			// delta := sum over differing children of |CountA - CountB|
@@ -259,7 +267,7 @@ func DiffDescent(
 				}
 			}
 			met.Delta += int(delta) // adjust type if your field is uint64
-			logger(met)
+			instrument(met)
 			continue
 		}
 		for i := range 16 {
@@ -274,7 +282,7 @@ func DiffDescent(
 	if met.NodesVisited > 0 {
 		met.AvgDepth = float64(depthSum) / float64(met.NodesVisited)
 	}
-	logger(met)
+	instrument(met)
 	return diffs, nil
 
 }
@@ -364,14 +372,14 @@ func (s *MerkleSnapshot) LeafOps(parent Prefix, child uint8) ([]OpHash, error) {
 	node := m.root
 	for _, d := range parent.Path {
 		if node.Child[int(d)] == nil {
-			return nil, fmt.Errorf("child not found")
+			return nil, ErrChildNotFound
 		}
 		node = node.Child[int(d)]
 	}
 
 	leaf := node.Child[int(child)]
 	if leaf == nil || leaf.Ops == nil {
-		return nil, fmt.Errorf("leaf not found")
+		return nil, ErrLeafNotFound
 	}
 
 	out := make([]OpHash, 0, len(leaf.Ops))
@@ -440,7 +448,7 @@ func DeltaBytes(
 			localKeys, err := local.LeafOps(p, uint8(i))
 			if err != nil {
 				// If local leaf doesn't exist, treat as empty list
-				if err.Error() == "child not found" || err.Error() == "leaf not found" {
+				if err == ErrChildNotFound || err == ErrLeafNotFound {
 					localKeys = []OpHash{}
 				} else {
 					logger(tm)
