@@ -149,35 +149,41 @@ func sumCounts(children []Summary) uint64 {
 	return s
 }
 
+type MetricLogger func(any)
+
 func DiffDescent(
 	local Snapshot,
 	remoteRoot Hash,
 	remoteMaxDepth int,
 	fetcher ChildrenFetcher,
-) ([][]uint8, metrics.DescMetrics, error) {
+	logger MetricLogger,
+) ([][]uint8, error) {
 
-	var met metrics.DescMetrics
-
-	met.Fanout = local.Fanout()
-	met.MaxDepth = local.MaxDepth()
+	met := metrics.DescMetrics{
+		Fanout:   local.Fanout(),
+		MaxDepth: local.MaxDepth(),
+	}
+	logger(met)
 
 	root := Prefix{Depth: 0, Path: nil}
 	caRoot, err := local.Children(root)
 	if err == ErrStaleSnapshot {
 		met.Restarts++
-		return nil, met, fmt.Errorf("snapshot restarted")
+		logger(met)
+		return nil, ErrStaleSnapshot
 	}
 	if err != nil {
-		return nil, met, err
+		return nil, err
 	}
 	met.M = int(sumCounts(caRoot))
+	logger(met)
 
 	if remoteMaxDepth != met.MaxDepth {
-		return nil, met, fmt.Errorf("remote max depth %d != local max depth %d", remoteMaxDepth, met.MaxDepth)
+		return nil, fmt.Errorf("remote max depth %d != local max depth %d", remoteMaxDepth, met.MaxDepth)
 	}
 
 	if local.Root() == remoteRoot {
-		return nil, met, nil
+		return nil, nil
 	}
 
 	type frame struct {
@@ -204,22 +210,24 @@ func DiffDescent(
 		ca, errA := local.Children(pref)
 		if errA == ErrStaleSnapshot {
 			met.Restarts++
-			return nil, met, fmt.Errorf("snapshot restarted")
+			logger(met)
+			return nil, ErrStaleSnapshot
 		}
 
 		if errA != nil {
-			return nil, met, errA
+			return nil, errA
 		}
 
 		cb, errB := fetcher(pref)
 		if errB != nil {
-			return nil, met, fmt.Errorf("error fetching children: %v", errB)
+			return nil, fmt.Errorf("error fetching children: %v", errB)
 		}
 
 		met.NodesVisited++
 		depthSum += f.depth
 		met.HashComparisons += 16
 		met.SummaryBytes += metrics.RespBytesPerNode
+		logger(met)
 
 		equal := true
 		for i := range 16 {
@@ -235,6 +243,7 @@ func DiffDescent(
 
 		if f.depth == local.MaxDepth()-1 {
 			met.LeavesTouched++
+			logger(met)
 			diffs = append(diffs, append([]uint8(nil), f.pref...))
 
 			// delta := sum over differing children of |CountA - CountB|
@@ -250,6 +259,7 @@ func DiffDescent(
 				}
 			}
 			met.Delta += int(delta) // adjust type if your field is uint64
+			logger(met)
 			continue
 		}
 		for i := range 16 {
@@ -264,7 +274,8 @@ func DiffDescent(
 	if met.NodesVisited > 0 {
 		met.AvgDepth = float64(depthSum) / float64(met.NodesVisited)
 	}
-	return diffs, met, nil
+	logger(met)
+	return diffs, nil
 
 }
 
@@ -374,19 +385,26 @@ func (s *MerkleSnapshot) LeafOps(parent Prefix, child uint8) ([]OpHash, error) {
 // DeltaBytes runs summary descent, then fetches leaf keys for differing children,
 // computes exact delta (remote -> local), and totals wire bytes.
 func DeltaBytes(
-	local *MerkleSnapshot,
+	local Snapshot,
 	remoteRoot Hash,
 	remoteMaxDepth int,
 	fetchSummary ChildrenFetcher, // remote Children()
 	fetchLeaf LeafKeysFetcher, // remote LeafOps()
 	avgOpBytes int,
-) (metrics.TransferMetrics, error) {
+	logger MetricLogger,
+) error {
+
+	metricsLogger := metrics.NewMetricsLogger()
+	metricsLogger.Start()
+	defer metricsLogger.Close()
 
 	// summary descent
-	diffs, sumMet, err := DiffDescent(local, remoteRoot, remoteMaxDepth, fetchSummary)
+	diffs, err := DiffDescent(local, remoteRoot, remoteMaxDepth, fetchSummary, metricsLogger.Log)
 	if err != nil {
-		return metrics.TransferMetrics{}, err
+		return err
 	}
+
+	sumMet := metricsLogger.ReadDesc()
 
 	tm := metrics.TransferMetrics{
 		M:             sumMet.M,
@@ -399,11 +417,13 @@ func DeltaBytes(
 		p := Prefix{Depth: uint8(len(pref)), Path: pref}
 		ca, errA := local.Children(p)
 		if errA != nil {
-			return tm, errA
+			logger(tm)
+			return errA
 		}
 		cb, errB := fetchSummary(p)
 		if errB != nil {
-			return tm, errB
+			logger(tm)
+			return errB
 		}
 
 		for i := range 16 {
@@ -414,7 +434,8 @@ func DeltaBytes(
 			// Fetch leaf key lists (remote then local)
 			remoteKeys, err := fetchLeaf(p, uint8(i))
 			if err != nil {
-				return tm, err
+				logger(tm)
+				return err
 			}
 			localKeys, err := local.LeafOps(p, uint8(i))
 			if err != nil {
@@ -422,7 +443,8 @@ func DeltaBytes(
 				if err.Error() == "child not found" || err.Error() == "leaf not found" {
 					localKeys = []OpHash{}
 				} else {
-					return tm, err
+					logger(tm)
+					return err
 				}
 			}
 
@@ -442,7 +464,6 @@ func DeltaBytes(
 					tm.OpsBytes += int64(avgOpBytes)
 					j++
 				default:
-					// A\B not needed for "B→A only"
 					k++
 				}
 			}
@@ -456,5 +477,6 @@ func DeltaBytes(
 	}
 
 	tm.TotalBytes = tm.SummaryBytes + tm.LeafKeysBytes + tm.OpsBytes
-	return tm, nil
+	logger(tm)
+	return nil
 }

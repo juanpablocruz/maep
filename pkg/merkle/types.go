@@ -45,6 +45,8 @@ type Snapshot interface {
 
 	ProofForKey(key OpHash) (Proof, error)
 	Epoch() uint64 // passive epoch tag for observability
+
+	LeafOps(parent Prefix, child uint8) ([]OpHash, error)
 }
 
 // Tree is the concurrency-safe, mutable structure

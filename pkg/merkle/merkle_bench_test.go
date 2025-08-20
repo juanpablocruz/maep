@@ -140,9 +140,16 @@ func Benchmark_SummaryDescent(b *testing.B) {
 
 			// --- Timed section ---
 			var last metrics.DescMetrics
+			ch := make(chan metrics.DescMetrics, 10)
+			logger := func(met any) {
+				if descMetrics, ok := met.(metrics.DescMetrics); ok {
+					ch <- descMetrics
+				}
+			}
 			b.ResetTimer()
+
 			for i := 0; b.Loop(); i++ {
-				_, met, err := merkle.DiffDescent(sA, sB.Root(), sB.MaxDepth(), fetchRemote)
+				_, err := merkle.DiffDescent(sA, sB.Root(), sB.MaxDepth(), fetchRemote, logger)
 				if err == merkle.ErrStaleSnapshot {
 					// Extremely rare here (no mutation during session). Resnap and retry the same i.
 					sA = mA.Snapshot()
@@ -153,7 +160,8 @@ func Benchmark_SummaryDescent(b *testing.B) {
 				if err != nil {
 					b.Fatalf("DiffDescent error: %v", err)
 				}
-				last = met
+
+				last = <-ch
 			}
 			b.StopTimer()
 
@@ -232,9 +240,15 @@ func Benchmark_DeltaBytes(b *testing.B) {
 			fetchLeaf := func(p merkle.Prefix, c uint8) ([]merkle.OpHash, error) { return sB.LeafOps(p, c) }
 
 			var last metrics.TransferMetrics
+			ch := make(chan metrics.TransferMetrics, 10)
+			logger := func(tm any) {
+				if transferMetrics, ok := tm.(metrics.TransferMetrics); ok {
+					ch <- transferMetrics
+				}
+			}
 			b.ResetTimer()
 			for i := 0; b.Loop(); i++ {
-				tm, err := merkle.DeltaBytes(sA, sB.Root(), sB.MaxDepth(), fetchSummary, fetchLeaf, sc.AvgOpB)
+				err := merkle.DeltaBytes(sA, sB.Root(), sB.MaxDepth(), fetchSummary, fetchLeaf, sc.AvgOpB, logger)
 				if err == merkle.ErrStaleSnapshot {
 					sA = mA.Snapshot().(*merkle.MerkleSnapshot)
 					sB = mB.Snapshot().(*merkle.MerkleSnapshot)
@@ -244,7 +258,7 @@ func Benchmark_DeltaBytes(b *testing.B) {
 				if err != nil {
 					b.Fatalf("DeltaBytes: %v", err)
 				}
-				last = tm
+				last = <-ch
 			}
 			b.StopTimer()
 
